@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.1] - 2026-04-26
+
+### Fixed
+- Bumped `required_ruby_version` floor from `>= 3.2.0` to `>= 3.3.0` to match actual transitive dependency reality (`protocol-http2 ~> 0.26` requires Ruby >= 3.3). Previously, installing on Ruby 3.2 produced an opaque dep-resolution error mentioning protocol-http2 instead of a clean Ruby-version mismatch.
+- CI matrix dropped `3.2.x` for the same reason.
+
 ## [1.0.0] - 2026-04-26
 
 First stable release. Same code as rc18; promoted from prerelease after smoke
