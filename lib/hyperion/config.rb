@@ -24,7 +24,8 @@ module Hyperion
       log_level: nil, # nil → Logger picks from env / default
       log_format: nil, # nil → Logger picks via auto rule
       log_requests: nil, # nil → Hyperion.log_requests? (default true)
-      fiber_local_shim: false
+      fiber_local_shim: false,
+      yjit: nil # nil → auto: enable on production/staging; true/false to force.
     }.freeze
 
     HOOKS = %i[before_fork on_worker_boot on_worker_shutdown].freeze

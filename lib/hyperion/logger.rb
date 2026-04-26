@@ -64,6 +64,18 @@ module Hyperion
       # Colorize when format is text AND the destination is a TTY. We only
       # check the regular stream here — colored text is for humans.
       @colorize = @format == :text && tty?(@out)
+      @c_access_available = nil # lazy-computed on first access — see below.
+    end
+
+    # Whether Hyperion::CParser.build_access_line is available. Probed lazily
+    # on first call (the C parser is required after Logger is required, so we
+    # can't cache this at constant-define time — it would always be false).
+    # Memoised per-instance to keep the hot path branchless.
+    def c_access_available?
+      return @c_access_available unless @c_access_available.nil?
+
+      @c_access_available = defined?(::Hyperion::CParser) &&
+                            ::Hyperion::CParser.respond_to?(:build_access_line)
     end
 
     LEVELS.each_key do |lvl|
@@ -106,7 +118,17 @@ module Hyperion
       return unless emit?(:info)
 
       ts = cached_timestamp
-      line = if @format == :json
+      # The C extension builds the line in a stack scratch buffer (~10× faster
+      # than the Ruby interpolation path). It only fires when colorization is
+      # off — a colored TTY line needs ANSI escapes around the level label,
+      # which the C builder doesn't emit. Production deploys (non-TTY,
+      # log-aggregator destinations) take the C path; local TTY runs keep the
+      # colored Ruby fallback.
+      line = if !@colorize && c_access_available?
+               ::Hyperion::CParser.build_access_line(@format, ts, method, path,
+                                                     query, status, duration_ms,
+                                                     remote_addr, http_version)
+             elsif @format == :json
                build_access_json(ts, method, path, query, status, duration_ms, remote_addr, http_version)
              else
                build_access_text(ts, method, path, query, status, duration_ms, remote_addr, http_version)

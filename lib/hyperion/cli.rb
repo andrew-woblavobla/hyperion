@@ -53,6 +53,10 @@ module Hyperion
         o.on('--fiber-local-shim', 'Patch Thread.current[] to be fiber-local (Rails-compat for older gems)') do
           cli_opts[:fiber_local_shim] = true
         end
+        o.on('--[no-]yjit',
+             'Enable Ruby YJIT (default: auto on RAILS_ENV/RACK_ENV=production/staging)') do |v|
+          cli_opts[:yjit] = v
+        end
         o.on('-h', '--help', 'show help') do
           puts o
           exit 0
@@ -78,6 +82,11 @@ module Hyperion
       # Server/ThreadPool/Master plumbing. Default is ON; nil means "don't
       # touch — fall through to the env/default chain in Hyperion.log_requests?".
       Hyperion.log_requests = config.log_requests unless config.log_requests.nil?
+
+      # Enable YJIT before workers fork / connections start. Auto-on in
+      # production/staging gives operators the perf bump for free; explicit
+      # config.yjit (true/false) overrides the env-based default.
+      maybe_enable_yjit(config)
 
       rackup = argv.first || 'config.ru'
       abort("[hyperion] no such rackup file: #{rackup}") unless File.exist?(rackup)
@@ -156,6 +165,32 @@ module Hyperion
       { cert: config.tls_cert, key: config.tls_key }
     end
     private_class_method :build_tls_from_config
+
+    # Decide whether to enable YJIT and flip the switch once at boot.
+    # Precedence:
+    #   1. config.yjit explicitly true/false  → honour exactly.
+    #   2. config.yjit nil (default)          → auto: on for production/staging.
+    # No-op on Rubies without YJIT (e.g. JRuby/TruffleRuby) and idempotent if
+    # the operator already passed `ruby --yjit` upstream.
+    def self.maybe_enable_yjit(config)
+      return unless defined?(::RubyVM::YJIT)
+      return if ::RubyVM::YJIT.enabled?
+
+      enable = if config.yjit.nil?
+                 env_name = ENV['HYPERION_ENV'] || ENV['RAILS_ENV'] || ENV['RACK_ENV']
+                 %w[production staging].include?(env_name)
+               else
+                 config.yjit
+               end
+
+      return unless enable
+
+      ::RubyVM::YJIT.enable
+      Hyperion.logger.info do
+        { message: 'YJIT enabled', mode: config.yjit.nil? ? 'auto' : 'explicit' }
+      end
+    end
+    private_class_method :maybe_enable_yjit
 
     # Warn loudly at boot if the C parser didn't load — operators running
     # production with the pure-Ruby fallback are paying ~2× CPU on parse-heavy

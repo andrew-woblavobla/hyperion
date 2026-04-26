@@ -25,6 +25,14 @@ module Hyperion
       metrics.snapshot
     end
 
+    # Whether YJIT is currently enabled in this Ruby process. False on Rubies
+    # that don't ship YJIT (JRuby, TruffleRuby) and on CRuby builds compiled
+    # without YJIT support. Cheap (no allocations) — safe to call from hot
+    # paths if needed for diagnostics.
+    def yjit_enabled?
+      defined?(::RubyVM::YJIT) && ::RubyVM::YJIT.enabled?
+    end
+
     # Whether the llhttp C extension loaded. False on JRuby/TruffleRuby and
     # any environment where extconf.rb / make failed at install time. The
     # pure-Ruby parser handles those cases correctly but is ~2× slower on

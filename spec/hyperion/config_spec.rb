@@ -15,6 +15,9 @@ RSpec.describe Hyperion::Config do
     expect(cfg.max_header_bytes).to eq(64 * 1024)
     expect(cfg.max_body_bytes).to eq(16 * 1024 * 1024)
     expect(cfg.fiber_local_shim).to be(false)
+    # nil means "auto" — let CLI.maybe_enable_yjit decide based on
+    # RAILS_ENV/RACK_ENV. Operators can force on/off with `yjit true|false`.
+    expect(cfg.yjit).to be_nil
     expect(cfg.before_fork).to eq([])
     expect(cfg.on_worker_boot).to eq([])
     expect(cfg.on_worker_shutdown).to eq([])
@@ -30,6 +33,7 @@ RSpec.describe Hyperion::Config do
         thread_count 16
         log_level :debug
         log_format :json
+        yjit true
       RUBY
       file.close
 
@@ -40,6 +44,7 @@ RSpec.describe Hyperion::Config do
       expect(cfg.thread_count).to eq(16)
       expect(cfg.log_level).to eq(:debug)
       expect(cfg.log_format).to eq(:json)
+      expect(cfg.yjit).to be(true)
     ensure
       file.unlink
     end

@@ -85,24 +85,17 @@ module Hyperion
       listen unless @server
       @thread_pool = ThreadPool.new(size: @thread_count) if @thread_count.positive?
 
-      Async do |task|
-        until @stopped
-          socket = accept_or_nil
-          next unless socket
-
-          apply_timeout(socket)
-          # Plain HTTP/1.1 with a pool: submit straight to the worker — no
-          # fiber wrap needed (submit_connection returns immediately and the
-          # worker thread owns the connection for its lifetime).
-          # TLS still goes through a fiber: ALPN negotiation determines h2
-          # vs http/1.1, and h2 needs the fiber because each stream is its
-          # own fiber inside Http2Handler.
-          if @thread_pool && !@tls
-            @thread_pool.submit_connection(socket, @app)
-          else
-            task.async { dispatch(socket) }
-          end
-        end
+      if @tls
+        # TLS path: ALPN may pick `h2`, and h2 spawns one fiber per stream
+        # inside Http2Handler. Keep the Async wrapper so the scheduler is
+        # available for those fibers and for handshake yields.
+        start_async_loop
+      else
+        # Plain HTTP/1.1: the worker thread owns each connection for its
+        # lifetime, so the Async wrapper adds zero value (no fibers ever
+        # run on this loop's task). Skip it — pure IO.select + accept_nonblock
+        # shaves measurable overhead off the accept hot path.
+        start_raw_loop
       end
     ensure
       @thread_pool&.shutdown
@@ -116,6 +109,39 @@ module Hyperion
     end
 
     private
+
+    # Plain HTTP/1.1 accept loop — no fiber wrap. Connections go straight to
+    # a worker via the thread pool, or are served inline when no pool is
+    # configured (thread_count: 0). Matches the dispatch contract used by
+    # the TLS path; just skips the irrelevant h2/ALPN branch.
+    def start_raw_loop
+      until @stopped
+        socket = accept_or_nil
+        next unless socket
+
+        apply_timeout(socket)
+        if @thread_pool
+          @thread_pool.submit_connection(socket, @app)
+        else
+          Connection.new.serve(socket, @app)
+        end
+      end
+    end
+
+    # TLS / h2-capable accept loop. The Async wrapper is required because
+    # h2 streams (inside Http2Handler) and the ALPN handshake yield
+    # cooperatively via the scheduler.
+    def start_async_loop
+      Async do |task|
+        until @stopped
+          socket = accept_or_nil
+          next unless socket
+
+          apply_timeout(socket)
+          task.async { dispatch(socket) }
+        end
+      end
+    end
 
     def dispatch(socket)
       if socket.is_a?(::OpenSSL::SSL::SSLSocket) && socket.alpn_protocol == 'h2'
