@@ -20,16 +20,35 @@ module Hyperion
     DEFAULT_READ_TIMEOUT_SECONDS = 30
     DEFAULT_THREAD_COUNT         = 5
 
+    # Pre-built minimal 503 response for the backpressure path. We bypass
+    # ResponseWriter / Rack entirely — no env build, no app dispatch, no
+    # access-log line. The bytes are frozen and reused across every
+    # rejection so the overload path stays allocation-free. Body is JSON
+    # so JSON-only API consumers don't have to special-case the format.
+    REJECT_503 = lambda {
+      body = +%({"error":"server_busy","retry_after_seconds":1}\n)
+      body.force_encoding(Encoding::ASCII_8BIT)
+      head = +"HTTP/1.1 503 Service Unavailable\r\n" \
+              "content-type: application/json\r\n" \
+              "content-length: #{body.bytesize}\r\n" \
+              "retry-after: 1\r\n" \
+              "connection: close\r\n" \
+              "\r\n"
+      head.force_encoding(Encoding::ASCII_8BIT)
+      (head + body).freeze
+    }.call
+
     attr_reader :host, :port
 
     def initialize(app:, host: '127.0.0.1', port: 9292, read_timeout: DEFAULT_READ_TIMEOUT_SECONDS,
-                   tls: nil, thread_count: DEFAULT_THREAD_COUNT)
+                   tls: nil, thread_count: DEFAULT_THREAD_COUNT, max_pending: nil)
       @host         = host
       @port         = port
       @app          = app
       @read_timeout = read_timeout
       @tls          = tls
       @thread_count = thread_count
+      @max_pending  = max_pending
       @thread_pool  = nil
       @stopped      = false
     end
@@ -83,7 +102,7 @@ module Hyperion
 
     def start
       listen unless @server
-      @thread_pool = ThreadPool.new(size: @thread_count) if @thread_count.positive?
+      @thread_pool = ThreadPool.new(size: @thread_count, max_pending: @max_pending) if @thread_count.positive?
 
       if @tls
         # TLS path: ALPN may pick `h2`, and h2 spawns one fiber per stream
@@ -121,7 +140,7 @@ module Hyperion
 
         apply_timeout(socket)
         if @thread_pool
-          @thread_pool.submit_connection(socket, @app)
+          reject_connection(socket) unless @thread_pool.submit_connection(socket, @app)
         else
           Connection.new.serve(socket, @app)
         end
@@ -152,11 +171,31 @@ module Hyperion
       elsif @thread_pool
         # HTTP/1.1 (e.g. TLS-wrapped after ALPN picked http/1.1): hand the
         # connection to a worker thread. The fiber that called dispatch
-        # returns immediately.
-        @thread_pool.submit_connection(socket, @app)
+        # returns immediately. On overflow, reject with 503 + close.
+        reject_connection(socket) unless @thread_pool.submit_connection(socket, @app)
       else
         # No pool (thread_count: 0): inline on the calling fiber.
         Connection.new.serve(socket, @app)
+      end
+    end
+
+    # Backpressure rejection. Emits a pre-built 503 + closes the socket.
+    # No Rack env, no app dispatch, no access-log line — the overload
+    # path must stay cheap so we don't pile rejection cost on top of the
+    # already-saturated workers. Bumps :rejected_connections so operators
+    # can alert on sustained overload.
+    def reject_connection(socket)
+      socket.write(REJECT_503)
+      Hyperion.metrics.increment(:rejected_connections)
+    rescue StandardError
+      # Client may have hung up between accept and our 503 write — that's
+      # the failure mode we're protecting them from anyway, so swallow.
+      nil
+    ensure
+      begin
+        socket.close
+      rescue StandardError
+        nil
       end
     end
 

@@ -149,7 +149,8 @@ module Hyperion
           host: @host, port: @port, app: @app,
           read_timeout: @read_timeout, tls: @tls,
           thread_count: @thread_count, config: @config,
-          worker_index: worker_index
+          worker_index: worker_index,
+          max_pending: @config.max_pending
         }
         # Hand the inherited socket to the worker in :share mode. In
         # :reuseport mode the worker binds its own with SO_REUSEPORT.

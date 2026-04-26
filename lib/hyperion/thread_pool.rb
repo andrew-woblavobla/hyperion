@@ -26,11 +26,12 @@ module Hyperion
   class ThreadPool
     SHUTDOWN = :__hyperion_thread_pool_shutdown__
 
-    attr_reader :size
+    attr_reader :size, :max_pending
 
-    def initialize(size:)
-      @size       = size
-      @inbox      = Queue.new # multiplexes both kinds of jobs
+    def initialize(size:, max_pending: nil)
+      @size        = size
+      @max_pending = max_pending
+      @inbox       = Queue.new # multiplexes both kinds of jobs
       # Pre-allocate one reply queue per in-flight slot for the legacy `#call`
       # path. Bounded by `size`: if all workers are busy, all reply queues are
       # checked out, and the next caller blocks on `@reply_pool.pop` until a
@@ -43,8 +44,23 @@ module Hyperion
     # HTTP/1.1 path: hand the whole socket to a worker thread. The worker
     # runs `Connection#serve(socket, app)` directly. No per-request hop.
     # Returns immediately — caller does not wait.
+    #
+    # Returns true on enqueue, false on rejection. When `max_pending` is set
+    # and the inbox already has at least that many entries, the connection
+    # is rejected up to the caller (Server emits a 503 and closes the
+    # socket). Without `max_pending` (default nil) the queue is unbounded
+    # and we always return true — preserves pre-1.2 behaviour.
+    #
+    # The check is inherently racy with worker drain — workers may pop
+    # between our `size` read and the `<<`. Backpressure is statistical,
+    # not strict. Off-by-one over the configured cap during a thundering
+    # accept burst is acceptable; the cost of stricter sync would be a
+    # mutex on every enqueue, which we won't pay on the hot path.
     def submit_connection(socket, app)
+      return false if @max_pending && @inbox.size >= @max_pending
+
       @inbox << [:connection, socket, app]
+      true
     end
 
     # HTTP/2 + sub-call path: hop one `app.call` from the calling fiber to a

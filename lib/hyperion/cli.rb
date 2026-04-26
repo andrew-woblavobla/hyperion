@@ -111,7 +111,8 @@ module Hyperion
       tls = build_tls_from_config(config)
       server = Server.new(host: config.host, port: config.port, app: app,
                           tls: tls, thread_count: config.thread_count,
-                          read_timeout: config.read_timeout)
+                          read_timeout: config.read_timeout,
+                          max_pending: config.max_pending)
       server.listen
       scheme = tls ? 'https' : 'http'
       Hyperion.logger.info { { message: 'listening', url: "#{scheme}://#{server.host}:#{server.port}" } }
