@@ -3,7 +3,7 @@
 require_relative 'lib/hyperion/version'
 
 Gem::Specification.new do |spec|
-  spec.name          = 'hyperion'
+  spec.name          = 'hyperion-rb'
   spec.version       = Hyperion::VERSION
   spec.authors       = ['Andrey Lobanov']
   spec.email         = ['woblavobla@gmail.com']
@@ -14,11 +14,10 @@ Gem::Specification.new do |spec|
   spec.required_ruby_version = '>= 3.2.0'
 
   spec.metadata = {
-    'homepage_uri'         => 'https://github.com/andrew-woblavobla/hyperion',
-    'source_code_uri'      => 'https://github.com/andrew-woblavobla/hyperion',
-    'bug_tracker_uri'      => 'https://github.com/andrew-woblavobla/hyperion/issues',
-    'changelog_uri'        => 'https://github.com/andrew-woblavobla/hyperion/blob/main/CHANGELOG.md',
-    'rubygems_mfa_required' => 'true'
+    'homepage_uri'    => 'https://github.com/andrew-woblavobla/hyperion',
+    'source_code_uri' => 'https://github.com/andrew-woblavobla/hyperion',
+    'bug_tracker_uri' => 'https://github.com/andrew-woblavobla/hyperion/issues',
+    'changelog_uri'   => 'https://github.com/andrew-woblavobla/hyperion/blob/main/CHANGELOG.md'
   }
 
   spec.files = Dir['lib/**/*.rb', 'bin/*', 'ext/**/*.{rb,c,h}', 'CHANGELOG.md', 'README.md', 'LICENSE']
