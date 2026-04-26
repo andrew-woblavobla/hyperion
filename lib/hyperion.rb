@@ -63,6 +63,44 @@ module Hyperion
         else true # default ON
         end
     end
+
+    # Pre-fork warmup. Run by Master and CLI single-mode BEFORE children are
+    # forked (or before the lone worker starts accepting). Pre-allocates the
+    # Rack adapter's object pools and eager-touches lazily-resolved constants
+    # so each forked child inherits warm memory via copy-on-write — the first
+    # N requests on a fresh worker no longer pay the allocation / autoload
+    # tax that would otherwise serialize behind the GVL on cold start.
+    #
+    # Idempotent — second and later calls are no-ops. Failures are swallowed
+    # with a warn log: warmup is an optimization, not a correctness gate.
+    # If, for instance, OpenSSL can't be required in some odd environment,
+    # we'd rather start cold than refuse to boot.
+    def warmup!
+      return if @warmed
+
+      @warmed = true
+
+      if defined?(::Hyperion::Adapter::Rack) && ::Hyperion::Adapter::Rack.respond_to?(:warmup_pool)
+        ::Hyperion::Adapter::Rack.warmup_pool(8)
+      end
+
+      # Touch the C extension's response-head builder so its lazily-initialized
+      # internal state runs in the master, not in every child after fork.
+      ::Hyperion::CParser.respond_to?(:build_response_head) if defined?(::Hyperion::CParser)
+
+      # Eager-load TLS / SSLSocket. The sendfile path's `is_a?` check would
+      # otherwise trigger autoload in the worker on the first TLS response.
+      require 'openssl'
+      defined?(::OpenSSL::SSL::SSLSocket) && ::OpenSSL::SSL::SSLSocket.name
+
+      # Force Ruby's tzinfo / strftime-cache load by emitting one httpdate.
+      # Subsequent calls hit the per-thread `cached_date` slot in response_writer.
+      Time.now.httpdate
+      nil
+    rescue StandardError => e
+      Hyperion.logger.warn { { message: 'warmup failed (non-fatal)', error: e.message } }
+      nil
+    end
   end
 end
 

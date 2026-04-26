@@ -117,6 +117,12 @@ module Hyperion
       Hyperion.logger.info { { message: 'listening', url: "#{scheme}://#{server.host}:#{server.port}" } }
       warn_c_parser_unavailable
 
+      # Pre-allocate Rack env-pool entries and eager-touch lazy constants.
+      # In single-mode there's no fork, but the warmup still pays for itself
+      # by frontloading the first-N-request allocation cost off the first
+      # real client. Idempotent — safe to call once per process.
+      Hyperion.warmup!
+
       # Single-worker mode reuses the lifecycle hooks: before_fork is a no-op
       # here (no fork happens), and on_worker_boot/on_worker_shutdown fire
       # for the lone in-process "worker" so app code that opens DB pools etc.

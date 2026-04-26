@@ -84,6 +84,12 @@ module Hyperion
         }
       end
 
+      # Pre-allocate Rack env-pool entries and eager-touch lazy constants
+      # BEFORE we fork. Children inherit the warm memory via copy-on-write
+      # so the first batch of requests on each fresh worker doesn't pay
+      # the allocation/autoload tax.
+      Hyperion.warmup!
+
       # `before_fork` runs ONCE in the master before any worker is forked.
       # Operators use it to close shared resources (DB pools, Redis sockets)
       # so each child gets fresh connections rather than inheriting the

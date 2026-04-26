@@ -49,6 +49,20 @@ module Hyperion
       )
 
       class << self
+        # Pre-allocate `n` env-hash and rack-input objects in master before
+        # fork. Children inherit the populated free-list via copy-on-write —
+        # the hash slots stay shared until a request mutates them. Eliminates
+        # the first-N-requests allocation tax that every fresh worker would
+        # otherwise pay on cold start. Idempotent: safe to call multiple
+        # times; the pool simply caps at its configured `max_size`.
+        def warmup_pool(count = 8)
+          warmed_envs = Array.new(count) { ENV_POOL.acquire }
+          warmed_inputs = Array.new(count) { INPUT_POOL.acquire }
+          warmed_envs.each { |e| ENV_POOL.release(e) }
+          warmed_inputs.each { |i| INPUT_POOL.release(i) }
+          nil
+        end
+
         def call(app, request)
           env, input = build_env(request)
           status, headers, body = app.call(env)
