@@ -47,6 +47,20 @@ module Hyperion
       end
     end
 
+    # Pulls the four configurable HTTP/2 SETTINGS values out of the Config
+    # and returns them as a Hash. Nils are stripped so an operator who
+    # explicitly sets one to `nil` (meaning "leave protocol-http2 default in
+    # place") doesn't accidentally send a SETTINGS entry with a nil value.
+    # Empty hash → no override → Http2Handler skips the SETTINGS push.
+    def self.build_h2_settings(config)
+      {
+        max_concurrent_streams: config.h2_max_concurrent_streams,
+        initial_window_size: config.h2_initial_window_size,
+        max_frame_size: config.h2_max_frame_size,
+        max_header_list_size: config.h2_max_header_list_size
+      }.compact
+    end
+
     def initialize(host:, port:, app:, workers: DEFAULT_WORKER_COUNT,
                    read_timeout: Server::DEFAULT_READ_TIMEOUT_SECONDS, tls: nil,
                    thread_count: Server::DEFAULT_THREAD_COUNT, config: nil)
@@ -151,7 +165,8 @@ module Hyperion
           thread_count: @thread_count, config: @config,
           worker_index: worker_index,
           max_pending: @config.max_pending,
-          max_request_read_seconds: @config.max_request_read_seconds
+          max_request_read_seconds: @config.max_request_read_seconds,
+          h2_settings: Master.build_h2_settings(@config)
         }
         # Hand the inherited socket to the worker in :share mode. In
         # :reuseport mode the worker binds its own with SO_REUSEPORT.

@@ -19,7 +19,8 @@ module Hyperion
     def initialize(host:, port:, app:, read_timeout:, tls: nil,
                    thread_count: Server::DEFAULT_THREAD_COUNT,
                    config: nil, worker_index: 0, listener: nil,
-                   max_pending: nil, max_request_read_seconds: 60)
+                   max_pending: nil, max_request_read_seconds: 60,
+                   h2_settings: nil)
       @host                     = host
       @port                     = port
       @app                      = app
@@ -31,6 +32,7 @@ module Hyperion
       @listener                 = listener
       @max_pending              = max_pending
       @max_request_read_seconds = max_request_read_seconds
+      @h2_settings              = h2_settings
     end
 
     def run
@@ -48,7 +50,8 @@ module Hyperion
                           read_timeout: @read_timeout, tls: @tls,
                           thread_count: @thread_count,
                           max_pending: @max_pending,
-                          max_request_read_seconds: @max_request_read_seconds)
+                          max_request_read_seconds: @max_request_read_seconds,
+                          h2_settings: @h2_settings)
       tcp_server = @listener || build_reuseport_listener
       server.adopt_listener(tcp_server)
 

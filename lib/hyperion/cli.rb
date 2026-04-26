@@ -113,7 +113,8 @@ module Hyperion
                           tls: tls, thread_count: config.thread_count,
                           read_timeout: config.read_timeout,
                           max_pending: config.max_pending,
-                          max_request_read_seconds: config.max_request_read_seconds)
+                          max_request_read_seconds: config.max_request_read_seconds,
+                          h2_settings: Master.build_h2_settings(config))
       server.listen
       scheme = tls ? 'https' : 'http'
       Hyperion.logger.info { { message: 'listening', url: "#{scheme}://#{server.host}:#{server.port}" } }

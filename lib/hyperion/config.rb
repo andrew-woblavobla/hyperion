@@ -30,7 +30,11 @@ module Hyperion
       worker_check_interval: 30, # Seconds between RSS polls. Tradeoff: tighter = faster recycle, more ps calls. 30s matches Puma WorkerKiller.
       admin_token: nil, # String. When set, exposes admin endpoints (POST /-/quit triggers graceful drain; GET /-/metrics returns Prometheus-format Hyperion.stats). Same token guards both. nil disables admin entirely (paths fall through to the app).
       max_pending: nil, # Integer, e.g. 256. When the per-worker accept inbox has this many queued connections, additional accepts are rejected with HTTP 503 + Retry-After:1 instead of being queued. nil disables (current behaviour: unbounded queue).
-      max_request_read_seconds: 60 # Numeric. Total wallclock budget (seconds) for reading the request line + headers + body for ONE request. Defends against slowloris-style drips that satisfy the per-recv read_timeout but never finish the request. Resets between requests on a keep-alive connection. nil disables.
+      max_request_read_seconds: 60, # Numeric. Total wallclock budget (seconds) for reading the request line + headers + body for ONE request. Defends against slowloris-style drips that satisfy the per-recv read_timeout but never finish the request. Resets between requests on a keep-alive connection. nil disables.
+      h2_max_concurrent_streams: 128, # HTTP/2 SETTINGS_MAX_CONCURRENT_STREAMS — cap on simultaneously-open streams per connection. Falcon: 64. nil leaves protocol-http2 default (0xFFFFFFFF).
+      h2_initial_window_size: 1_048_576, # HTTP/2 SETTINGS_INITIAL_WINDOW_SIZE (octets) — flow-control window per stream at open. Bigger = fewer WINDOW_UPDATE round-trips on large bodies. Spec default is 65535. nil → leave protocol default.
+      h2_max_frame_size: 1_048_576, # HTTP/2 SETTINGS_MAX_FRAME_SIZE (octets) — biggest DATA/HEADERS frame we'll accept. Spec floor 16384, ceiling 16777215. We pick 1 MiB to match common CDNs without unbounded buffer growth. nil → leave protocol default (16384).
+      h2_max_header_list_size: 65_536 # HTTP/2 SETTINGS_MAX_HEADER_LIST_SIZE (octets) — advisory cap on the decompressed header block. Bounds memory of pathological client headers. nil → leave protocol default (unbounded).
     }.freeze
 
     HOOKS = %i[before_fork on_worker_boot on_worker_shutdown].freeze

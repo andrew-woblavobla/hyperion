@@ -42,7 +42,7 @@ module Hyperion
 
     def initialize(app:, host: '127.0.0.1', port: 9292, read_timeout: DEFAULT_READ_TIMEOUT_SECONDS,
                    tls: nil, thread_count: DEFAULT_THREAD_COUNT, max_pending: nil,
-                   max_request_read_seconds: 60)
+                   max_request_read_seconds: 60, h2_settings: nil)
       @host                     = host
       @port                     = port
       @app                      = app
@@ -51,6 +51,7 @@ module Hyperion
       @thread_count             = thread_count
       @max_pending              = max_pending
       @max_request_read_seconds = max_request_read_seconds
+      @h2_settings              = h2_settings
       @thread_pool              = nil
       @stopped                  = false
     end
@@ -172,7 +173,7 @@ module Hyperion
         # HTTP/2: each stream runs on a fiber inside Http2Handler. The
         # handler still uses the pool's `#call` for app.call hops on each
         # stream (one per stream, not one per connection).
-        Http2Handler.new(app: @app, thread_pool: @thread_pool).serve(socket)
+        Http2Handler.new(app: @app, thread_pool: @thread_pool, h2_settings: @h2_settings).serve(socket)
       elsif @thread_pool
         # HTTP/1.1 (e.g. TLS-wrapped after ALPN picked http/1.1): hand the
         # connection to a worker thread. The fiber that called dispatch

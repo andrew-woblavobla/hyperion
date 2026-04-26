@@ -212,9 +212,34 @@ module Hyperion
       end
     end
 
-    def initialize(app:, thread_pool: nil)
+    # Maps Hyperion-friendly setting names to the integer SETTINGS_* identifiers
+    # protocol-http2 uses on the wire. See RFC 7540 §6.5.2 — these are the
+    # only four parameters Hyperion exposes; the rest of the SETTINGS frame
+    # (HEADER_TABLE_SIZE, ENABLE_PUSH, etc.) keeps protocol-http2's default.
+    SETTINGS_KEY_MAP = {
+      max_concurrent_streams: ::Protocol::HTTP2::Settings::MAXIMUM_CONCURRENT_STREAMS,
+      initial_window_size: ::Protocol::HTTP2::Settings::INITIAL_WINDOW_SIZE,
+      max_frame_size: ::Protocol::HTTP2::Settings::MAXIMUM_FRAME_SIZE,
+      max_header_list_size: ::Protocol::HTTP2::Settings::MAXIMUM_HEADER_LIST_SIZE
+    }.freeze
+
+    # RFC 7540 §6.5.2 floor for SETTINGS_MAX_FRAME_SIZE. protocol-http2 raises
+    # ProtocolError on values below this; we clamp + warn instead so a
+    # misconfigured operator gets a working server, not a boot-time crash.
+    H2_MIN_FRAME_SIZE = 0x4000 # 16384
+
+    # RFC 7540 §6.5.2 ceiling for SETTINGS_MAX_FRAME_SIZE.
+    H2_MAX_FRAME_SIZE = 0xFFFFFF # 16777215
+
+    # RFC 7540 §6.9.2 — INITIAL_WINDOW_SIZE has the same 31-bit max as the
+    # WINDOW_UPDATE frame's Window Size Increment (see protocol-http2's
+    # MAXIMUM_ALLOWED_WINDOW_SIZE).
+    H2_MAX_WINDOW_SIZE = 0x7FFFFFFF
+
+    def initialize(app:, thread_pool: nil, h2_settings: nil)
       @app         = app
       @thread_pool = thread_pool
+      @h2_settings = h2_settings
       @metrics     = Hyperion.metrics
       @logger      = Hyperion.logger
     end
@@ -224,7 +249,7 @@ module Hyperion
       @metrics.increment(:connections_active)
       framer = ::Protocol::HTTP2::Framer.new(socket)
       server = build_server(framer)
-      server.read_connection_preface
+      server.read_connection_preface(initial_settings_payload)
 
       # Extract once — the same TCP peer drives every stream on this conn.
       peer_addr = peer_address(socket)
@@ -289,6 +314,69 @@ module Hyperion
     end
 
     private
+
+    # Build the [setting_id, value] pairs that go in the connection-preface
+    # SETTINGS frame. protocol-http2's Server#read_connection_preface accepts
+    # this array and does the wire encoding for us. Empty array (no overrides
+    # configured) → SETTINGS frame still goes out, just with no entries
+    # (effectively an ack), which is what the spec allows.
+    #
+    # We clamp out-of-range values (max_frame_size below the spec floor or
+    # above its ceiling, initial_window_size above 31-bit max) instead of
+    # letting protocol-http2 raise ProtocolError at handshake time — a
+    # crashing handshake leaks the connection. Operator gets a warn so the
+    # misconfiguration surfaces in logs.
+    def initial_settings_payload
+      return [] unless @h2_settings
+
+      payload = []
+      @h2_settings.each do |key, value|
+        next if value.nil?
+
+        setting_id = SETTINGS_KEY_MAP[key]
+        unless setting_id
+          @logger.warn { { message: 'unknown h2 setting; skipping', setting: key } }
+          next
+        end
+
+        clamped = clamp_h2_setting(key, value)
+        payload << [setting_id, clamped]
+      end
+      payload
+    end
+
+    def clamp_h2_setting(key, value)
+      case key
+      when :max_frame_size
+        if value < H2_MIN_FRAME_SIZE
+          @logger.warn do
+            { message: 'h2 max_frame_size below spec minimum; clamping',
+              configured: value, clamped_to: H2_MIN_FRAME_SIZE }
+          end
+          H2_MIN_FRAME_SIZE
+        elsif value > H2_MAX_FRAME_SIZE
+          @logger.warn do
+            { message: 'h2 max_frame_size above spec maximum; clamping',
+              configured: value, clamped_to: H2_MAX_FRAME_SIZE }
+          end
+          H2_MAX_FRAME_SIZE
+        else
+          value
+        end
+      when :initial_window_size
+        if value > H2_MAX_WINDOW_SIZE
+          @logger.warn do
+            { message: 'h2 initial_window_size above spec maximum; clamping',
+              configured: value, clamped_to: H2_MAX_WINDOW_SIZE }
+          end
+          H2_MAX_WINDOW_SIZE
+        else
+          value
+        end
+      else
+        value
+      end
+    end
 
     def build_server(framer)
       server = ::Protocol::HTTP2::Server.new(framer)
