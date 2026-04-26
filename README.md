@@ -77,6 +77,35 @@ Health endpoint that traverses the full middleware chain (rack-attack, locale re
 
 On Grape and Rails-controller workloads Puma hits wrk's 2 s timeout cap on ~⅔ of requests — its real p99 is censored above 2 s. Hyperion serves all of its requests under 1.2 s with 0 to 16 timeouts. **1.14–1.48× Puma throughput** depending on endpoint.
 
+### Concurrency at scale (architectural advantages)
+
+These workloads demonstrate structural differences between Hyperion's fiber-per-connection / fiber-per-stream model and Puma's thread-pool model. Numbers are illustrative; the architecture is what matters. Run on Ubuntu 24.04 / Ruby 3.3.3, single worker, h2load `-c <conns> -n 100000 --rps 1000 --h1`.
+
+**5,000 concurrent keep-alive connections (50,000 requests):**
+
+| | succeeded | r/s | wall | master RSS |
+|---|---:|---:|---:|---:|
+| Hyperion `-w 1 -t 10` | 50,000 / 50,000 | 3,460 | 14.45 s | 53.5 MB |
+| Puma `-w 1 -t 10:10`  | 50,000 / 50,000 | 1,762 | 28.37 s | 36.9 MB |
+
+**10,000 concurrent keep-alive connections (100,000 requests):**
+
+| | succeeded | failed | r/s | wall |
+|---|---:|---:|---:|---:|
+| Hyperion `-w 1 -t 10` | 93,090 | 6,910 | 3,446 | 27.01 s |
+| Puma `-w 1 -t 10:10`  | 77,340 | 22,660 | 706 | 109.59 s |
+
+Hyperion holds each connection in a ~1 KB fiber stack; Puma needs an OS thread (~1–8 MB each, capped at `max_threads`). At 10k concurrent connections Hyperion serves **~5× the throughput** of Puma with **~20% fewer dropped requests**, while the per-connection bookkeeping cost is bounded by fiber size, not by `max_threads`.
+
+**HTTP/2 multiplexing — 1 connection × 100 concurrent streams (handler sleeps 50 ms):**
+
+| | wall time |
+|---|---:|
+| Hyperion (per-stream fiber dispatch) | **1.04 s** |
+| Serial baseline (100 × 50 ms) | 5.00 s |
+
+Hyperion fans 100 in-flight streams across separate fibers within a single TCP connection. A serial server would take 5 s; the fiber-multiplexed result (1.04 s, ~96 req/s on one socket) is bounded by single-handler sleep time plus framing overhead. Puma has no native HTTP/2 path — production deployments terminate h2 at nginx and forward h1 to the worker pool, which serializes again.
+
 ### Reproduce
 
 ```sh
