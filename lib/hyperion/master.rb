@@ -216,6 +216,11 @@ module Hyperion
       @children.clear
 
       Hyperion.logger.info { { message: 'master exiting' } }
+      # Drain per-thread access buffers + sync stdio so the 'master draining'
+      # / 'master exiting' lines (and any in-flight access-log lines from
+      # threads that never reached the 4-KiB flush threshold) actually reach
+      # the operator's log file before the process exits on SIGTERM.
+      Hyperion.logger.flush_all
     end
   end
 end

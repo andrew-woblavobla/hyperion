@@ -65,6 +65,13 @@ module Hyperion
       # check the regular stream here — colored text is for humans.
       @colorize = @format == :text && tty?(@out)
       @c_access_available = nil # lazy-computed on first access — see below.
+      # Registry of every per-thread access buffer ever allocated through
+      # this Logger instance. Walked by #flush_all on shutdown so SIGTERM
+      # doesn't strand buffered lines in dying threads. The Mutex guards
+      # registration on first allocation per thread (rare) and the shutdown
+      # walk; the hot #access path stays lock-free.
+      @access_buffers = []
+      @access_buffers_mutex = Mutex.new
     end
 
     # Whether Hyperion::CParser.build_access_line is available. Probed lazily
@@ -134,7 +141,7 @@ module Hyperion
                build_access_text(ts, method, path, query, status, duration_ms, remote_addr, http_version)
              end
 
-      buf = (Thread.current[:__hyperion_access_buf__] ||= +'')
+      buf = Thread.current[:__hyperion_access_buf__] || allocate_access_buffer
       buf << line
       return if buf.bytesize < ACCESS_FLUSH_BYTES
 
@@ -157,7 +164,60 @@ module Hyperion
       # Swallow logger failures — never let logging crash the server.
     end
 
+    # Flush every per-thread access-log buffer ever allocated through this
+    # Logger, then sync the underlying IOs.
+    #
+    # Why this exists: under SIGTERM, Master#shutdown_children logs the
+    # 'master draining' / 'master exiting' lines and then exits. The 'info'
+    # path doesn't go through the access buffer, but it does rely on glibc
+    # stdio buffering being flushed before the process dies — and per-thread
+    # access buffers (Thread.current[:__hyperion_access_buf__]) are *only*
+    # flushed when the buffer reaches ACCESS_FLUSH_BYTES or when the owning
+    # thread closes a connection. On a clean SIGTERM both can be missed and
+    # the operator sees nothing in the captured log. This method walks every
+    # registered per-thread buffer, writes any pending bytes, then calls
+    # IO#flush on @out / @err so the kernel sees them before exec_exit.
+    #
+    # Safe to call from any thread. Idempotent. Never raises.
+    def flush_all
+      buffers = @access_buffers_mutex.synchronize { @access_buffers.dup }
+      buffers.each do |buf|
+        next if buf.empty?
+
+        begin
+          @out.write(buf)
+          buf.clear
+        rescue StandardError
+          # Continue — one bad buffer must not block the rest.
+        end
+      end
+
+      flush_io(@out)
+      flush_io(@err) unless @err.equal?(@out)
+    rescue StandardError
+      # Swallow logger failures — never let logging crash the server.
+    end
+
     private
+
+    # First-touch path for a thread's access buffer. Allocates the String,
+    # stores it in the thread-local for lock-free access on subsequent calls,
+    # and registers it in @access_buffers so #flush_all can find it later.
+    # Mutex is taken once per thread (not per request).
+    def allocate_access_buffer
+      buf = +''
+      Thread.current[:__hyperion_access_buf__] = buf
+      @access_buffers_mutex.synchronize { @access_buffers << buf }
+      buf
+    end
+
+    def flush_io(io)
+      io.flush if io.respond_to?(:flush)
+    rescue StandardError
+      # Some IO destinations raise on flush (closed pipes during SIGPIPE,
+      # custom IO-likes that don't implement it cleanly). Logging must
+      # never crash the server, especially during shutdown.
+    end
 
     # Cached UTC iso8601(3) timestamp, refreshed at most once per millisecond
     # per thread. At 24k r/s with 16 threads we render ~1500 r/s/thread; only

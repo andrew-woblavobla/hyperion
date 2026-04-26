@@ -140,6 +140,11 @@ module Hyperion
       server.start
       shutdown_thread.join
       config.on_worker_shutdown.each { |h| h.call(0) }
+      # Drain per-thread access buffers + sync stdio. Single-worker mode
+      # doesn't go through Master#shutdown_children, so without this call
+      # buffered access lines + final shutdown messages can be lost on
+      # SIGTERM. See Hyperion::Logger#flush_all.
+      Hyperion.logger.flush_all
     end
 
     def self.run_cluster(config, app, workers)
