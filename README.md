@@ -107,6 +107,8 @@ curl --http2 -k https://127.0.0.1:9443/
 
 `bundle exec rake spec` (and the `default` task) auto-invoke `compile`, so a fresh checkout just needs `bundle install && bundle exec rake` to get a green run.
 
+**Migrating from Puma?** See [docs/MIGRATING_FROM_PUMA.md](docs/MIGRATING_FROM_PUMA.md).
+
 ## Configuration
 
 Three layers, in precedence order: explicit CLI flag > environment variable > `config/hyperion.rb` > built-in default.
