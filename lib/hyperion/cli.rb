@@ -206,13 +206,16 @@ module Hyperion
     private_class_method :maybe_enable_yjit
 
     # When admin_token is configured, wrap the app in AdminMiddleware so
-    # POST /-/quit becomes a token-protected drain endpoint. Skipped when
-    # the token is unset — the path falls through to the app, so apps may
-    # still own /-/anything if Hyperion's admin is off.
+    # POST /-/quit and GET /-/metrics become token-protected admin endpoints.
+    # Skipped when the token is unset — those paths fall through to the app,
+    # so apps may still own /-/anything if Hyperion's admin is off.
     def self.wrap_admin_middleware(app, config)
       return app if config.admin_token.nil? || config.admin_token.to_s.empty?
 
-      Hyperion.logger.info { { message: 'admin endpoint enabled', path: AdminMiddleware::PATH } }
+      Hyperion.logger.info do
+        { message: 'admin endpoint enabled',
+          paths: [AdminMiddleware::PATH_QUIT, AdminMiddleware::PATH_METRICS] }
+      end
       AdminMiddleware.new(app, token: config.admin_token)
     end
     private_class_method :wrap_admin_middleware

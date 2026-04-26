@@ -101,5 +101,62 @@ RSpec.describe Hyperion::AdminMiddleware do
       expect(headers['content-type']).to eq('application/json')
       expect(body.first).to include('signal_failed')
     end
+
+    describe 'GET /-/metrics' do
+      # Use a real fresh Metrics so we exercise the actual snapshot path
+      # (no stubs) — keeps this spec honest about the integration.
+      before do
+        @prev_metrics = Hyperion.instance_variable_get(:@metrics)
+        Hyperion.instance_variable_set(:@metrics, Hyperion::Metrics.new)
+      end
+
+      after { Hyperion.instance_variable_set(:@metrics, @prev_metrics) }
+
+      it 'returns 401 without the token header' do
+        env = env_for(method: 'GET', path: '/-/metrics')
+        status, headers, body = middleware.call(env)
+        expect(status).to eq(401)
+        expect(headers['content-type']).to eq('application/json')
+        expect(body.first).to include('unauthorized')
+      end
+
+      it 'returns 401 with the wrong token' do
+        env = env_for(method: 'GET', path: '/-/metrics',
+                      headers: { 'HTTP_X_HYPERION_ADMIN_TOKEN' => 'wrong-token-here-XYZ' })
+        status, = middleware.call(env)
+        expect(status).to eq(401)
+      end
+
+      it 'returns 200 with Prometheus body when authenticated' do
+        Hyperion.metrics.increment(:requests, 42)
+        Hyperion.metrics.increment_status(200)
+
+        env = env_for(method: 'GET', path: '/-/metrics',
+                      headers: { 'HTTP_X_HYPERION_ADMIN_TOKEN' => token })
+        status, headers, body = middleware.call(env)
+        expect(status).to eq(200)
+        expect(headers['content-type']).to eq('text/plain; version=0.0.4; charset=utf-8')
+        text = body.first
+        expect(text).to include('# TYPE hyperion_requests_total counter')
+        expect(text).to include('hyperion_requests_total 42')
+        expect(text).to include('hyperion_responses_status_total{status="200"} 1')
+      end
+
+      it 'returns empty body when no metrics have been recorded' do
+        env = env_for(method: 'GET', path: '/-/metrics',
+                      headers: { 'HTTP_X_HYPERION_ADMIN_TOKEN' => token })
+        status, _headers, body = middleware.call(env)
+        expect(status).to eq(200)
+        expect(body.first).to eq('')
+      end
+
+      it 'falls through to the app on POST /-/metrics (wrong method)' do
+        env = env_for(method: 'POST', path: '/-/metrics',
+                      headers: { 'HTTP_X_HYPERION_ADMIN_TOKEN' => token })
+        status, _headers, response_body = middleware.call(env)
+        expect(status).to eq(200)
+        expect(response_body).to eq(['hello'])
+      end
+    end
   end
 end
