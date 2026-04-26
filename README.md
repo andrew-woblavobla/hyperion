@@ -29,26 +29,27 @@ All numbers are real wrk runs against published Hyperion configs. Hyperion ships
 
 ### Hello-world Rack app
 
-`bench/hello.ru`, single worker, parity threads (`-t 16` vs Puma `-t 16:16`), 4 wrk threads / 50 connections / 10s, macOS arm64 / Ruby 3.3.3:
+`bench/hello.ru`, single worker, parity threads (`-t 5` vs Puma `-t 5:5`), 4 wrk threads / 100 connections / 15s, macOS arm64 / Ruby 3.3.3, Hyperion 1.2.0:
 
-| | r/s | p99 |
-|---|---:|---:|
-| **Hyperion default (logs ON)** | **23,885** | **1.05 ms** |
-| Hyperion `--no-log-requests` | 24,222 | 1.00 ms |
-| Puma `-t 16:16` | 18,794 | 30.89 ms |
+| | r/s | p99 | tail vs Hyperion |
+|---|---:|---:|---:|
+| **Hyperion 1.2.0** (default, logs ON) | **22,496** | **502 µs** | **1×** |
+| Falcon 0.55.3 `--count 1` | 22,199 | 5.36 ms | 11× worse |
+| Puma 7.1.0 `-t 5:5` | 20,400 | 422.85 ms | 845× worse |
 
-**1.27× Puma throughput, ~30× lower p99 — while emitting structured JSON access logs Puma doesn't.**
+**Hyperion: 1.10× Puma throughput, parity with Falcon on throughput, ~10× lower p99 than Falcon and ~845× lower than Puma — while emitting structured JSON access logs the others don't.**
 
 ### Production cluster config (`-w 4`)
 
-Same bench app, `-w 4` cluster, parity threads. macOS arm64:
+Same bench app, `-w 4` cluster, parity threads (`-t 5` everywhere), 4 wrk threads / 200 connections / 15s, macOS arm64:
 
-| | r/s | p99 |
-|---|---:|---:|
-| **Hyperion `-w 4 -t 10`** | **44,221** | **1.15 ms** |
-| Puma `-w 4 -t 10:10` | 37,929 | 17.06 ms |
+| | r/s | p99 | tail vs Hyperion |
+|---|---:|---:|---:|
+| Falcon `--count 4` | 48,197 | 4.84 ms | 5.9× worse |
+| **Hyperion `-w 4 -t 5`** | **40,137** | **825 µs** | **1×** |
+| Puma `-w 4 -t 5:5` | 34,793 | 177.76 ms | 215× worse (1 timeout) |
 
-**1.17× Puma throughput, ~15× lower p99.**
+Falcon edges Hyperion ~20% on raw rps at `-w 4` on macOS hello-world. **Hyperion still leads on tail latency by 5.9× over Falcon and 215× over Puma**, and beats Puma on throughput by 1.15×. On Linux production-config and DB-backed workloads (below) Hyperion takes the rps lead too — the macOS hello-world advantage to Falcon disappears once the workload includes any actual work or the kernel is Linux.
 
 ### Linux production-config (DB-backed Rack)
 
@@ -76,6 +77,25 @@ Health endpoint that traverses the full middleware chain (rack-attack, locale re
 | Rails `/api/v1/health` | Puma `-t 16:16` | 11.29 | (>2 s, censored) | **114** |
 
 On Grape and Rails-controller workloads Puma hits wrk's 2 s timeout cap on ~⅔ of requests — its real p99 is censored above 2 s. Hyperion serves all of its requests under 1.2 s with 0 to 16 timeouts. **1.14–1.48× Puma throughput** depending on endpoint.
+
+### Static-asset serving (sendfile zero-copy path, 1.2.0+)
+
+`bench/static.ru` (`Rack::Files` over a 1 MiB asset), `-w 1`, `wrk -t4 -c100 -d15s`, macOS arm64 / Ruby 3.3.3:
+
+| | r/s | p99 | transferred | tail vs winner |
+|---|---:|---:|---:|---:|
+| **Hyperion (sendfile path)** | **2,069** | **3.10 ms** | 30.4 GB | **1×** |
+| Puma `-w 1 -t 5:5` | 2,109 | 566.16 ms | 31.0 GB | 183× worse |
+| Falcon `--count 1` | 1,269 | 801.01 ms | 18.7 GB | 258× worse (28 timeouts) |
+
+Throughput is bandwidth-bound on localhost (≈2 GB/s = the loopback memory ceiling), so the throughput column looks like parity. The actual win is in the **tail latency** column: Hyperion's `IO.copy_stream` → `sendfile(2)` path skips userspace entirely, while Puma allocates a String per response and Falcon serializes more aggressively. On real network paths sendfile widens the gap further (kernel-to-NIC zero-copy).
+
+Reproduce:
+```sh
+ruby -e 'File.binwrite("/tmp/hyperion_bench_asset_1m.bin", "x" * (1024*1024))'
+bundle exec bin/hyperion -p 9292 bench/static.ru
+wrk --latency -t4 -c100 -d15s http://127.0.0.1:9292/hyperion_bench_asset_1m.bin
+```
 
 ### Concurrency at scale (architectural advantages)
 
