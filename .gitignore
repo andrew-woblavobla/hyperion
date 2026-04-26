@@ -1,0 +1,15 @@
+/.bundle/
+/coverage/
+/pkg/
+/tmp/
+*.gem
+Gemfile.lock
+.rspec_status
+
+# C extension build artifacts
+ext/**/*.o
+ext/**/*.bundle
+ext/**/*.so
+ext/**/Makefile
+ext/**/mkmf.log
+lib/hyperion_http/

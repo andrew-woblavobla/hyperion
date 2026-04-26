@@ -1,0 +1,428 @@
+#include <ruby.h>
+#include <ruby/encoding.h>
+#include <string.h>
+#include "llhttp.h"
+
+/* ----------------------------------------------------------------------
+ * Hyperion::CParser — C extension wrapping llhttp.
+ *
+ * Public surface matches Hyperion::Parser:
+ *   parser.parse(buffer) -> [Request, end_offset]
+ *
+ * On parse error: raise Hyperion::ParseError.
+ * On unsupported: raise Hyperion::UnsupportedError.
+ * On success: returns [Request, end_offset] where end_offset is the
+ *   number of bytes consumed from `buffer`.
+ *
+ * Implementation: each #parse call instantiates a fresh llhttp_t state
+ * on the stack; pooling comes in Phase 5. Callbacks accumulate fields
+ * into a parser_state_t struct. When llhttp signals message-complete,
+ * we build the Ruby Request and return.
+ * ---------------------------------------------------------------------- */
+
+static VALUE rb_mHyperion;
+static VALUE rb_cCParser;
+static VALUE rb_cRequest;
+static VALUE rb_eParseError;
+static VALUE rb_eUnsupportedError;
+
+static ID id_new;
+static ID id_downcase;
+static ID id_method_kw;
+static ID id_path_kw;
+static ID id_query_string_kw;
+static ID id_http_version_kw;
+static ID id_headers_kw;
+static ID id_body_kw;
+
+typedef struct {
+    /* Request line + headers */
+    VALUE method;
+    VALUE path;
+    VALUE query_string;
+    VALUE http_version;
+    VALUE headers;       /* Hash, lowercase keys */
+    VALUE body;          /* String */
+
+    /* Header parsing scratch */
+    VALUE current_header_name;
+    VALUE current_header_value;
+
+    /* Flags */
+    int message_complete;
+    int has_content_length;
+    int has_transfer_encoding;
+    int chunked_transfer_encoding;
+    int parse_error;     /* 1 = parse, 2 = unsupported */
+    const char *error_message;
+} parser_state_t;
+
+static void state_init(parser_state_t *s) {
+    s->method                    = Qnil;
+    s->path                      = rb_str_new_cstr("");
+    s->query_string              = rb_str_new_cstr("");
+    s->http_version              = rb_str_new_cstr("HTTP/1.1");
+    s->headers                   = rb_hash_new();
+    s->body                      = rb_str_new_cstr("");
+    s->current_header_name       = rb_str_new_cstr("");
+    s->current_header_value      = rb_str_new_cstr("");
+    s->message_complete          = 0;
+    s->has_content_length        = 0;
+    s->has_transfer_encoding     = 0;
+    s->chunked_transfer_encoding = 0;
+    s->parse_error               = 0;
+    s->error_message             = NULL;
+}
+
+/* Cap each individual field so we don't OOM on adversarial input. */
+#define MAX_FIELD_BYTES (64 * 1024)
+#define MAX_BODY_BYTES  (16 * 1024 * 1024)
+
+#define APPEND_OR_FAIL(dst, at, length, cap, who) do {     \
+    if (RSTRING_LEN(dst) + (long)(length) > (long)(cap)) { \
+        s->parse_error = 1;                                \
+        s->error_message = (who " too large");             \
+        return -1;                                         \
+    }                                                      \
+    rb_str_cat(dst, at, length);                           \
+} while (0)
+
+static void stash_pending_header(parser_state_t *s) {
+    if (RSTRING_LEN(s->current_header_name) > 0) {
+        VALUE downcased = rb_funcall(s->current_header_name, id_downcase, 0);
+        rb_hash_aset(s->headers, downcased, s->current_header_value);
+        s->current_header_name  = rb_str_new_cstr("");
+        s->current_header_value = rb_str_new_cstr("");
+    }
+}
+
+static int on_url(llhttp_t *p, const char *at, size_t length) {
+    parser_state_t *s = (parser_state_t *)p->data;
+    APPEND_OR_FAIL(s->path, at, length, MAX_FIELD_BYTES, "url");
+    return 0;
+}
+
+static int on_url_complete(llhttp_t *p) {
+    parser_state_t *s = (parser_state_t *)p->data;
+    /* Split path?query. */
+    char *full = RSTRING_PTR(s->path);
+    long full_len = RSTRING_LEN(s->path);
+    long q_idx = -1;
+    for (long i = 0; i < full_len; i++) {
+        if (full[i] == '?') { q_idx = i; break; }
+    }
+    if (q_idx >= 0) {
+        s->query_string = rb_str_new(full + q_idx + 1, full_len - q_idx - 1);
+        rb_str_set_len(s->path, q_idx);
+    }
+    return 0;
+}
+
+static int on_method(llhttp_t *p, const char *at, size_t length) {
+    parser_state_t *s = (parser_state_t *)p->data;
+    if (NIL_P(s->method)) {
+        s->method = rb_str_new(at, length);
+    } else {
+        APPEND_OR_FAIL(s->method, at, length, 32, "method");
+    }
+    return 0;
+}
+
+static int on_version(llhttp_t *p, const char *at, size_t length) {
+    /* llhttp gives us "1.1"; we prepend "HTTP/" ourselves. */
+    parser_state_t *s = (parser_state_t *)p->data;
+    s->http_version = rb_str_new_cstr("HTTP/");
+    rb_str_cat(s->http_version, at, length);
+    return 0;
+}
+
+static int on_header_field(llhttp_t *p, const char *at, size_t length) {
+    parser_state_t *s = (parser_state_t *)p->data;
+    /* If current_header_value is non-empty, we just finished a header. */
+    if (RSTRING_LEN(s->current_header_value) > 0) {
+        stash_pending_header(s);
+    }
+    if (RSTRING_LEN(s->current_header_name) == 0) {
+        s->current_header_name = rb_str_new(at, length);
+    } else {
+        APPEND_OR_FAIL(s->current_header_name, at, length, MAX_FIELD_BYTES, "header name");
+    }
+    return 0;
+}
+
+static int on_header_value(llhttp_t *p, const char *at, size_t length) {
+    parser_state_t *s = (parser_state_t *)p->data;
+    if (RSTRING_LEN(s->current_header_value) == 0) {
+        s->current_header_value = rb_str_new(at, length);
+    } else {
+        APPEND_OR_FAIL(s->current_header_value, at, length, MAX_FIELD_BYTES, "header value");
+    }
+    return 0;
+}
+
+static int on_headers_complete(llhttp_t *p) {
+    parser_state_t *s = (parser_state_t *)p->data;
+    stash_pending_header(s);
+
+    /* Smuggling defense: both Content-Length and Transfer-Encoding present. */
+    VALUE cl_key = rb_str_new_cstr("content-length");
+    VALUE te_key = rb_str_new_cstr("transfer-encoding");
+    VALUE cl = rb_hash_aref(s->headers, cl_key);
+    VALUE te = rb_hash_aref(s->headers, te_key);
+    s->has_content_length    = !NIL_P(cl);
+    s->has_transfer_encoding = !NIL_P(te);
+    if (s->has_content_length && s->has_transfer_encoding) {
+        s->parse_error   = 1;
+        s->error_message = "both Content-Length and Transfer-Encoding present (smuggling defense)";
+        return -1;
+    }
+
+    /* Verify TE: only chunked (or comma-list ending in chunked) is supported. */
+    if (s->has_transfer_encoding) {
+        VALUE te_lower = rb_funcall(te, id_downcase, 0);
+        const char *te_str = RSTRING_PTR(te_lower);
+        long te_len = RSTRING_LEN(te_lower);
+        /* Trim trailing whitespace. */
+        while (te_len > 0 && (te_str[te_len - 1] == ' ' || te_str[te_len - 1] == '\t')) {
+            te_len--;
+        }
+        if (te_len < 7 || strncmp(te_str + te_len - 7, "chunked", 7) != 0) {
+            s->parse_error   = 2;
+            s->error_message = "Transfer-Encoding not supported (only chunked)";
+            return -1;
+        }
+        s->chunked_transfer_encoding = 1;
+    }
+
+    return 0;
+}
+
+static int on_body(llhttp_t *p, const char *at, size_t length) {
+    parser_state_t *s = (parser_state_t *)p->data;
+    APPEND_OR_FAIL(s->body, at, length, MAX_BODY_BYTES, "body");
+    return 0;
+}
+
+static int on_message_complete(llhttp_t *p) {
+    parser_state_t *s = (parser_state_t *)p->data;
+    s->message_complete = 1;
+    /* Returning HPE_PAUSED halts llhttp_execute immediately at the message
+     * boundary; llhttp_get_error_pos then points to the next byte (start of
+     * the next pipelined request, if any). Without this, llhttp continues
+     * parsing the second message in-place, smearing method/path/etc. */
+    (void)p;
+    return HPE_PAUSED;
+}
+
+static llhttp_settings_t settings;
+
+static void install_settings(void) {
+    llhttp_settings_init(&settings);
+    settings.on_url              = on_url;
+    settings.on_url_complete     = on_url_complete;
+    settings.on_method           = on_method;
+    settings.on_version          = on_version;
+    settings.on_header_field     = on_header_field;
+    settings.on_header_value     = on_header_value;
+    settings.on_headers_complete = on_headers_complete;
+    settings.on_body             = on_body;
+    settings.on_message_complete = on_message_complete;
+}
+
+/* parse(buffer) -> [Request, end_offset]
+ *
+ * Parse one complete HTTP/1.1 request from `buffer`. If buffer doesn't yet
+ * contain a complete request, raise ParseError("incomplete"). For pipelined
+ * input, end_offset is the byte boundary of the first request — Connection
+ * carries the rest forward.
+ */
+static VALUE cparser_parse(VALUE self, VALUE buffer) {
+    Check_Type(buffer, T_STRING);
+    (void)self;
+
+    parser_state_t s;
+    state_init(&s);
+
+    llhttp_t parser;
+    llhttp_init(&parser, HTTP_REQUEST, &settings);
+    parser.data = &s;
+
+    const char *data = RSTRING_PTR(buffer);
+    size_t len = (size_t)RSTRING_LEN(buffer);
+
+    enum llhttp_errno err = llhttp_execute(&parser, data, len);
+
+    /* Custom error flags (set inside callbacks) take precedence. */
+    if (s.parse_error == 2) {
+        rb_raise(rb_eUnsupportedError, "%s", s.error_message);
+    }
+    if (s.parse_error == 1) {
+        rb_raise(rb_eParseError, "%s", s.error_message);
+    }
+
+    if (err == HPE_PAUSED_UPGRADE) {
+        rb_raise(rb_eUnsupportedError, "Upgrade not supported");
+    }
+    if (err != HPE_OK && err != HPE_PAUSED) {
+        const char *reason = llhttp_get_error_reason(&parser);
+        rb_raise(rb_eParseError, "llhttp: %s",
+                 (reason && *reason) ? reason : llhttp_errno_name(err));
+    }
+
+    if (!s.message_complete) {
+        rb_raise(rb_eParseError, "incomplete request");
+    }
+
+    /* Compute end_offset. We pause inside on_message_complete, so
+     * llhttp_get_error_pos returns the byte just after the message
+     * boundary — exactly the carry-over offset we want. */
+    size_t consumed;
+    if (err == HPE_PAUSED) {
+        const char *epos = llhttp_get_error_pos(&parser);
+        consumed = epos ? (size_t)(epos - data) : len;
+    } else {
+        consumed = len;
+    }
+
+    /* Build the Request. */
+    VALUE kwargs = rb_hash_new();
+    rb_hash_aset(kwargs, ID2SYM(id_method_kw),       s.method);
+    rb_hash_aset(kwargs, ID2SYM(id_path_kw),         s.path);
+    rb_hash_aset(kwargs, ID2SYM(id_query_string_kw), s.query_string);
+    rb_hash_aset(kwargs, ID2SYM(id_http_version_kw), s.http_version);
+    rb_hash_aset(kwargs, ID2SYM(id_headers_kw),      s.headers);
+    rb_hash_aset(kwargs, ID2SYM(id_body_kw),         s.body);
+
+    VALUE args[1] = { kwargs };
+    VALUE request = rb_funcallv_kw(rb_cRequest, id_new, 1, args, RB_PASS_KEYWORDS);
+
+    return rb_ary_new_from_args(2, request, ULONG2NUM((unsigned long)consumed));
+}
+
+/* Hyperion::CParser.build_response_head(status, reason, headers, body_size,
+ *                                        keep_alive, date_str) -> String
+ *
+ * Builds the HTTP/1.1 response head:
+ *   "HTTP/1.1 <status> <reason>\r\n"
+ *   "<lowercased-key>: <value>\r\n" for each user header (except
+ *     content-length / connection — we always set these from the framing
+ *     args below, mirroring the rc16 Ruby behaviour where the normalized
+ *     hash is overridden in place).
+ *   "content-length: <body_size>\r\n"
+ *   "connection: <close|keep-alive>\r\n"
+ *   "date: <date_str>\r\n"  (only if user headers didn't include 'date')
+ *   "\r\n"
+ *
+ * Header values containing CR/LF raise ArgumentError (response-splitting
+ * guard). Bypasses Ruby Hash#each + per-line String#<< allocation; the
+ * status line, framing headers, and join slices live in C buffers.
+ */
+static VALUE cbuild_response_head(VALUE self, VALUE rb_status, VALUE rb_reason,
+                                  VALUE rb_headers, VALUE rb_body_size,
+                                  VALUE rb_keep_alive, VALUE rb_date) {
+    (void)self;
+    Check_Type(rb_headers, T_HASH);
+    Check_Type(rb_reason, T_STRING);
+    Check_Type(rb_date, T_STRING);
+
+    int status     = NUM2INT(rb_status);
+    long body_size = NUM2LONG(rb_body_size);
+    int keep_alive = RTEST(rb_keep_alive);
+
+    /* Most heads fit in 1 KiB; rb_str_cat grows on demand. */
+    VALUE buf = rb_str_buf_new(1024);
+
+    /* Status line: "HTTP/1.1 <status> <reason>\r\n" */
+    char status_line[48];
+    int n = snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d ", status);
+    rb_str_cat(buf, status_line, n);
+    rb_str_cat(buf, RSTRING_PTR(rb_reason), RSTRING_LEN(rb_reason));
+    rb_str_cat(buf, "\r\n", 2);
+
+    /* Iterate user headers — lowercase key, validate value, skip framing. */
+    int has_date = 0;
+
+    VALUE keys = rb_funcall(rb_headers, rb_intern("keys"), 0);
+    long n_keys = RARRAY_LEN(keys);
+    for (long i = 0; i < n_keys; i++) {
+        VALUE k = rb_ary_entry(keys, i);
+        VALUE v = rb_hash_aref(rb_headers, k);
+
+        VALUE k_s     = rb_obj_as_string(k);
+        VALUE v_s     = rb_obj_as_string(v);
+        VALUE k_lower = rb_funcall(k_s, id_downcase, 0);
+
+        const char *k_ptr = RSTRING_PTR(k_lower);
+        long k_len        = RSTRING_LEN(k_lower);
+        const char *v_ptr = RSTRING_PTR(v_s);
+        long v_len        = RSTRING_LEN(v_s);
+
+        /* CRLF injection guard on value. */
+        for (long j = 0; j < v_len; j++) {
+            if (v_ptr[j] == '\r' || v_ptr[j] == '\n') {
+                rb_raise(rb_eArgError, "header %s contains CR/LF",
+                         RSTRING_PTR(rb_inspect(k_lower)));
+            }
+        }
+
+        /* Drop user-supplied content-length / connection — we always set
+         * these unconditionally below (matches rc16 Ruby behaviour where
+         * the normalized hash overwrites in place). */
+        if (k_len == 14 && memcmp(k_ptr, "content-length", 14) == 0) continue;
+        if (k_len == 10 && memcmp(k_ptr, "connection", 10) == 0)     continue;
+
+        if (k_len == 4 && memcmp(k_ptr, "date", 4) == 0) {
+            has_date = 1;
+        }
+
+        rb_str_cat(buf, k_ptr, k_len);
+        rb_str_cat(buf, ": ", 2);
+        rb_str_cat(buf, v_ptr, v_len);
+        rb_str_cat(buf, "\r\n", 2);
+    }
+
+    /* Framing headers — always emitted. */
+    char cl_buf[48];
+    n = snprintf(cl_buf, sizeof(cl_buf), "content-length: %ld\r\n", body_size);
+    rb_str_cat(buf, cl_buf, n);
+
+    if (keep_alive) {
+        rb_str_cat(buf, "connection: keep-alive\r\n", 24);
+    } else {
+        rb_str_cat(buf, "connection: close\r\n", 19);
+    }
+
+    if (!has_date) {
+        rb_str_cat(buf, "date: ", 6);
+        rb_str_cat(buf, RSTRING_PTR(rb_date), RSTRING_LEN(rb_date));
+        rb_str_cat(buf, "\r\n", 2);
+    }
+
+    /* End of head */
+    rb_str_cat(buf, "\r\n", 2);
+
+    return buf;
+}
+
+void Init_hyperion_http(void) {
+    install_settings();
+
+    rb_mHyperion         = rb_const_get(rb_cObject, rb_intern("Hyperion"));
+    rb_cRequest          = rb_const_get(rb_mHyperion, rb_intern("Request"));
+    rb_eParseError       = rb_const_get(rb_mHyperion, rb_intern("ParseError"));
+    rb_eUnsupportedError = rb_const_get(rb_mHyperion, rb_intern("UnsupportedError"));
+
+    rb_cCParser = rb_define_class_under(rb_mHyperion, "CParser", rb_cObject);
+    rb_define_method(rb_cCParser, "parse", cparser_parse, 1);
+    rb_define_singleton_method(rb_cCParser, "build_response_head",
+                               cbuild_response_head, 6);
+
+    id_new             = rb_intern("new");
+    id_downcase        = rb_intern("downcase");
+    id_method_kw       = rb_intern("method");
+    id_path_kw         = rb_intern("path");
+    id_query_string_kw = rb_intern("query_string");
+    id_http_version_kw = rb_intern("http_version");
+    id_headers_kw      = rb_intern("headers");
+    id_body_kw         = rb_intern("body");
+}

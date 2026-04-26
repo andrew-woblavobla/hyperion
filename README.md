@@ -1,0 +1,260 @@
+# Hyperion
+
+High-performance Ruby HTTP server. Falcon-class fiber concurrency, Puma-class compatibility.
+
+[![Specs](https://img.shields.io/badge/specs-114%20passing-brightgreen)]()
+[![Ruby](https://img.shields.io/badge/ruby-%3E%3D%203.2-red)]()
+[![License](https://img.shields.io/badge/license-MIT-blue)]()
+
+```sh
+gem install hyperion
+bundle exec hyperion config.ru
+```
+
+## Highlights
+
+- **HTTP/1.1 + HTTP/2 + TLS** out of the box (HTTP/2 with per-stream fiber multiplexing, WINDOW_UPDATE-aware flow control, ALPN auto-negotiation).
+- **Pre-fork cluster** with per-OS worker model: `SO_REUSEPORT` on Linux, master-bind + worker-fd-share on macOS/BSD (Darwin's `SO_REUSEPORT` doesn't load-balance).
+- **Hybrid concurrency**: fiber-per-connection for I/O, OS-thread pool for `app.call(env)` — synchronous Rack handlers (Rails, ActiveRecord, anything holding a global mutex) get true OS-thread concurrency.
+- **Vendored llhttp 9.3.0** C parser; pure-Ruby fallback for non-MRI runtimes.
+- **Default-ON structured access logs** (one JSON or text line per request) with hot-path optimisations: per-thread cached timestamp, hand-rolled line builder, lock-free per-thread write buffer.
+- **12-factor logger split**: info/debug → stdout, warn/error/fatal → stderr.
+- **Ruby DSL config file** (`config/hyperion.rb`) with lifecycle hooks (`before_fork`, `on_worker_boot`, `on_worker_shutdown`).
+- **Object pooling** for the Rack `env` hash and `rack.input` IO — amortizes per-request allocations across the worker's lifetime.
+- **`Hyperion::FiberLocal`** opt-in shim for older Rails idioms that store request-scoped data via `Thread.current.thread_variable_*`.
+
+## Benchmarks
+
+All numbers are real wrk runs against published Hyperion configs. Hyperion ships **with default-ON structured access logs**; Puma comparisons use Puma defaults (no per-request log emission).
+
+### Hello-world Rack app
+
+`bench/hello.ru`, single worker, parity threads (`-t 16` vs Puma `-t 16:16`), 4 wrk threads / 50 connections / 10s, macOS arm64 / Ruby 3.3.3:
+
+| | r/s | p99 |
+|---|---:|---:|
+| **Hyperion default (logs ON)** | **23,885** | **1.05 ms** |
+| Hyperion `--no-log-requests` | 24,222 | 1.00 ms |
+| Puma `-t 16:16` | 18,794 | 30.89 ms |
+
+**1.27× Puma throughput, ~30× lower p99 — while emitting structured JSON access logs Puma doesn't.**
+
+### Production cluster config (`-w 4`)
+
+Same bench app, `-w 4` cluster, parity threads. macOS arm64:
+
+| | r/s | p99 |
+|---|---:|---:|
+| **Hyperion `-w 4 -t 10`** | **44,221** | **1.15 ms** |
+| Puma `-w 4 -t 10:10` | 37,929 | 17.06 ms |
+
+**1.17× Puma throughput, ~15× lower p99.**
+
+### Linux production-config (DB-backed Rack)
+
+`-w 4 -t 10` on Ubuntu 24.04 / Ruby 3.3.3. Rack app does one Postgres `SELECT 1` + one Redis `GET` per request, real network round-trip. wrk `-t4 -c50 -d10s` × 3 runs (median):
+
+| | r/s (median) | vs Puma default |
+|---|---:|---:|
+| **Hyperion default (rc17, logs ON)** | **5,786** | **1.012×** |
+| Hyperion `--no-log-requests` | 6,364 | 1.114× |
+| Puma `-w 4 -t 10:10` (no per-req logs) | 5,715 | 1.000× |
+
+Bench is network-bound (~3-4 ms median is the PG + Redis round-trip). Hyperion's lead comes from cheaper per-request CPU: lock-free per-thread metrics, per-thread cached iso8601 timestamps in the access log, hand-rolled single-interpolation log line builder, no logger mutex (POSIX `write(2)` atomicity), C-extension response-head builder.
+
+### Real Rails 8.1 app (single worker, parity threads `-t 16`)
+
+Health endpoint that traverses the full middleware chain (rack-attack, locale redirect, structured tagger, geo-location, etc.). Plus a Grape API endpoint reading cached data, and a Rails controller doing a Redis GET + an ActiveRecord query.
+
+| endpoint | server | r/s | p99 | wrk timeouts |
+|---|---|---:|---:|---:|
+| `/up` (health) | **Hyperion** | **19.03** | **1.12 s** | **0** |
+| `/up` (health) | Puma `-t 16:16` | 16.64 | 1.95 s | **138** |
+| Grape `/api/v1/cached_data` | **Hyperion** | **16.15** | **779 ms** | 16 |
+| Grape `/api/v1/cached_data` | Puma `-t 16:16` | 10.90 | (>2 s, censored) | **110** |
+| Rails `/api/v1/health` | **Hyperion** | **15.95** | **992 ms** | 16 |
+| Rails `/api/v1/health` | Puma `-t 16:16` | 11.29 | (>2 s, censored) | **114** |
+
+On Grape and Rails-controller workloads Puma hits wrk's 2 s timeout cap on ~⅔ of requests — its real p99 is censored above 2 s. Hyperion serves all of its requests under 1.2 s with 0 to 16 timeouts. **1.14–1.48× Puma throughput** depending on endpoint.
+
+### Reproduce
+
+```sh
+# hello-world
+bundle exec ruby bench/compare.rb
+HYPERION_WORKERS=4 PUMA_WORKERS=4 FALCON_COUNT=4 bundle exec ruby bench/compare.rb
+
+# Real Rails / Grape: see bench/db.ru for the schema
+```
+
+## Quick start
+
+```sh
+bundle install
+bundle exec rake compile                              # build the llhttp C ext
+bundle exec hyperion config.ru                        # single-process default
+bundle exec hyperion -w 4 -t 10 config.ru             # 4-worker cluster, 10 threads each
+bundle exec hyperion -w 0 config.ru                   # 1 worker per CPU
+bundle exec hyperion --tls-cert cert.pem --tls-key key.pem -p 9443 config.ru   # HTTPS
+curl http://127.0.0.1:9292/                            # => hello
+
+# Chunked POST works:
+curl -X POST -H "Transfer-Encoding: chunked" --data-binary @file http://127.0.0.1:9292/
+
+# HTTP/2 (over TLS, ALPN-negotiated):
+curl --http2 -k https://127.0.0.1:9443/
+```
+
+`bundle exec rake spec` (and the `default` task) auto-invoke `compile`, so a fresh checkout just needs `bundle install && bundle exec rake` to get a green run.
+
+## Configuration
+
+Three layers, in precedence order: explicit CLI flag > environment variable > `config/hyperion.rb` > built-in default.
+
+### CLI flags
+
+| Flag | Default | Notes |
+|---|---|---|
+| `-b, --bind HOST` | `127.0.0.1` | |
+| `-p, --port PORT` | `9292` | |
+| `-w, --workers N` | `1` | `0` → `Etc.nprocessors` |
+| `-t, --threads N` | `5` | OS-thread Rack handler pool per worker. `0` → run inline (no pool, debugging only). |
+| `-C, --config PATH` | `config/hyperion.rb` if present | Ruby DSL file. |
+| `--tls-cert PATH` | nil | PEM certificate. |
+| `--tls-key PATH` | nil | PEM private key. |
+| `--log-level LEVEL` | `info` | `debug` / `info` / `warn` / `error` / `fatal`. |
+| `--log-format FORMAT` | `auto` | `text` / `json` / `auto`. Auto: JSON when `RAILS_ENV`/`RACK_ENV` is `production`/`staging`, colored text on TTY, JSON otherwise. |
+| `--[no-]log-requests` | ON | Per-request access log. |
+| `--fiber-local-shim` | off | Patches `Thread#thread_variable_*` to fiber storage for older Rails idioms. |
+
+### Environment variables
+
+`HYPERION_LOG_LEVEL`, `HYPERION_LOG_FORMAT`, `HYPERION_LOG_REQUESTS` (`0|1|true|false|yes|no|on|off`), `HYPERION_ENV`, `HYPERION_WORKER_MODEL` (`share|reuseport`).
+
+### Config file
+
+`config/hyperion.rb` — same shape as Puma's `puma.rb`. Auto-loaded if present.
+
+```ruby
+# config/hyperion.rb
+bind '0.0.0.0'
+port 9292
+
+workers      4
+thread_count 10
+
+# tls_cert_path 'config/cert.pem'
+# tls_key_path  'config/key.pem'
+
+read_timeout      30
+idle_keepalive     5
+graceful_timeout  30
+
+max_header_bytes  64 * 1024
+max_body_bytes    16 * 1024 * 1024
+
+log_level    :info
+log_format   :auto
+log_requests true
+
+fiber_local_shim false
+
+before_fork do
+  ActiveRecord::Base.connection_handler.clear_all_connections! if defined?(ActiveRecord)
+end
+
+on_worker_boot do |worker_index|
+  ActiveRecord::Base.establish_connection if defined?(ActiveRecord)
+end
+
+on_worker_shutdown do |worker_index|
+  ActiveRecord::Base.connection_handler.clear_all_connections! if defined?(ActiveRecord)
+end
+```
+
+Strict DSL: unknown methods raise `NoMethodError` at boot — typos surface immediately rather than getting silently ignored.
+
+A documented sample lives at [`config/hyperion.example.rb`](config/hyperion.example.rb).
+
+## Logging
+
+Default behaviour (rc16+):
+
+- **`info` / `debug` → stdout**, **`warn` / `error` / `fatal` → stderr** (12-factor).
+- **One structured access-log line per response**, info level, on stdout. Disable with `--no-log-requests` or `HYPERION_LOG_REQUESTS=0`.
+- **Format auto-selects**: production envs → JSON (line-delimited, parseable by every log aggregator); TTY → coloured text; piped output without env hint → JSON.
+
+### Sample access log lines
+
+Text format (TTY default):
+
+```
+2026-04-26T18:40:04.112Z INFO  [hyperion] message=request method=GET path=/api/v1/health status=200 duration_ms=46.63 remote_addr=127.0.0.1 http_version=HTTP/1.1
+2026-04-26T18:40:04.123Z INFO  [hyperion] message=request method=GET path=/api/v1/cached_data query="currency=USD" status=200 duration_ms=43.87 remote_addr=127.0.0.1 http_version=HTTP/1.1
+```
+
+JSON format (auto-selected on `RAILS_ENV=production`/`staging` or piped output):
+
+```json
+{"ts":"2026-04-26T18:38:49.405Z","level":"info","source":"hyperion","message":"request","method":"GET","path":"/api/v1/health","status":200,"duration_ms":46.63,"remote_addr":"127.0.0.1","http_version":"HTTP/1.1"}
+{"ts":"2026-04-26T18:38:49.411Z","level":"info","source":"hyperion","message":"request","method":"GET","path":"/api/v1/cached_data","query":"currency=USD","status":200,"duration_ms":40.64,"remote_addr":"127.0.0.1","http_version":"HTTP/1.1"}
+```
+
+### Hot-path optimisations
+
+The default-ON access log path is engineered to stay near-zero cost:
+
+- **Per-thread cached `iso8601(3)` timestamp** — one allocation per millisecond per thread, reused across all requests in that millisecond.
+- **Hand-rolled single-interpolation line builder** — bypasses generic `Hash#map.join`.
+- **Per-thread 4 KiB write buffer** — flushes to stdout when full or on connection close. Cuts ~32× the syscalls under load.
+- **Lock-free emit** — POSIX `write(2)` is atomic for writes ≤ PIPE_BUF (4096 B); a log line is ~200 B. No logger mutex.
+
+## Metrics
+
+`Hyperion.stats` returns a snapshot Hash with the following counters (lock-free per-thread aggregation):
+
+| Counter | Meaning |
+|---|---|
+| `connections_accepted` | Lifetime accept count. |
+| `connections_active` | Currently in-flight connections. |
+| `requests_total` | Lifetime request count. |
+| `requests_in_flight` | Currently in-flight requests. |
+| `responses_<code>` | One counter per status code emitted (`responses_200`, `responses_400`, …). |
+| `parse_errors` | HTTP parse failures → 400. |
+| `app_errors` | Rack app raised → 500. |
+| `read_timeouts` | Per-connection read deadline hit. |
+
+```ruby
+require 'hyperion'
+Hyperion.stats
+# => {connections_accepted: 1234, connections_active: 7, requests_total: 8910, …}
+```
+
+## TLS + HTTP/2
+
+Provide a PEM cert + key:
+
+```sh
+bundle exec hyperion --tls-cert config/cert.pem --tls-key config/key.pem -p 9443 config.ru
+```
+
+ALPN auto-negotiates `h2` (HTTP/2) or `http/1.1` per connection. HTTP/2 multiplexes streams onto fibers within a single connection — slow handlers don't head-of-line-block other streams. Cluster-mode TLS works (`-w N` + `--tls-cert` / `--tls-key`).
+
+Smuggling defenses for HTTP/1.1: `Content-Length` + `Transfer-Encoding` together → 400; non-chunked `Transfer-Encoding` → 501; CRLF in response header values → `ArgumentError` (response-splitting guard).
+
+## Compatibility
+
+- **Ruby 3.2+** required.
+- **Rack 3** (auto-sets `SERVER_SOFTWARE`, `rack.version`, `REMOTE_ADDR`, IPv6-safe `Host` parsing, CRLF guard).
+- **`Hyperion::FiberLocal.install!`** opt-in shim for older Rails apps that store request-scoped data via `Thread.current.thread_variable_*` (modern Rails 7.1+ already uses Fiber storage natively; the shim handles the residual footgun).
+- **`Hyperion::FiberLocal.verify_environment!`** runtime check that `Thread.current[:k]` is fiber-local on the current Ruby (it is on 3.2+).
+
+## Credits
+
+- Vendored [llhttp](https://github.com/nodejs/llhttp) (Node.js's HTTP parser, MIT) under `ext/hyperion_http/llhttp/`.
+- HTTP/2 framing and HPACK via [`protocol-http2`](https://github.com/socketry/protocol-http2).
+- Fiber scheduler via [`async`](https://github.com/socketry/async).
+
+## License
+
+MIT.
