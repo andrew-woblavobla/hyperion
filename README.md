@@ -2,12 +2,12 @@
 
 High-performance Ruby HTTP server. Falcon-class fiber concurrency, Puma-class compatibility.
 
-[![Specs](https://img.shields.io/badge/specs-114%20passing-brightgreen)]()
-[![Ruby](https://img.shields.io/badge/ruby-%3E%3D%203.2-red)]()
-[![License](https://img.shields.io/badge/license-MIT-blue)]()
+[![CI](https://github.com/andrew-woblavobla/hyperion/actions/workflows/ci.yml/badge.svg)](https://github.com/andrew-woblavobla/hyperion/actions/workflows/ci.yml)
+[![Gem Version](https://img.shields.io/gem/v/hyperion-rb.svg)](https://rubygems.org/gems/hyperion-rb)
+[![License: MIT](https://img.shields.io/github/license/andrew-woblavobla/hyperion.svg)](https://github.com/andrew-woblavobla/hyperion/blob/master/LICENSE)
 
 ```sh
-gem install hyperion
+gem install hyperion-rb --pre
 bundle exec hyperion config.ru
 ```
 
