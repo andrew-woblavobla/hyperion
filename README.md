@@ -7,7 +7,7 @@ High-performance Ruby HTTP server. Falcon-class fiber concurrency, Puma-class co
 [![License: MIT](https://img.shields.io/github/license/andrew-woblavobla/hyperion.svg)](https://github.com/andrew-woblavobla/hyperion/blob/master/LICENSE)
 
 ```sh
-gem install hyperion-rb --pre
+gem install hyperion-rb
 bundle exec hyperion config.ru
 ```
 
