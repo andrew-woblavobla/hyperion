@@ -72,6 +72,15 @@ module Hyperion
       # walk; the hot #access path stays lock-free.
       @access_buffers = []
       @access_buffers_mutex = Mutex.new
+      # Per-instance thread-local key. A globally-shared key (e.g. a frozen
+      # Symbol constant) lets a buffer created by an earlier Logger in this
+      # thread be picked up by a later Logger — but the buffer is registered
+      # against the *earlier* Logger's @access_buffers, so the new Logger's
+      # #flush_all can't see it. Namespacing the key per-instance fixes that:
+      # each Logger gets its own per-thread buffer, and the registry it
+      # walks at shutdown matches the one #access wrote to. The Symbol is
+      # allocated once at construction; the hot path just reads it.
+      @buffer_key = :"__hyperion_access_buf_#{object_id}__"
     end
 
     # Whether Hyperion::CParser.build_access_line is available. Probed lazily
@@ -141,7 +150,7 @@ module Hyperion
                build_access_text(ts, method, path, query, status, duration_ms, remote_addr, http_version)
              end
 
-      buf = Thread.current[:__hyperion_access_buf__] || allocate_access_buffer
+      buf = Thread.current[@buffer_key] || allocate_access_buffer
       buf << line
       return if buf.bytesize < ACCESS_FLUSH_BYTES
 
@@ -155,7 +164,7 @@ module Hyperion
     # loop when a connection closes (so log lines from a closing keep-alive
     # session don't get stuck behind the buffer until the next connection).
     def flush_access_buffer
-      buf = Thread.current[:__hyperion_access_buf__]
+      buf = Thread.current[@buffer_key]
       return if buf.nil? || buf.empty?
 
       @out.write(buf)
@@ -206,7 +215,7 @@ module Hyperion
     # Mutex is taken once per thread (not per request).
     def allocate_access_buffer
       buf = +''
-      Thread.current[:__hyperion_access_buf__] = buf
+      Thread.current[@buffer_key] = buf
       @access_buffers_mutex.synchronize { @access_buffers << buf }
       buf
     end
