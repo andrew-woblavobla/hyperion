@@ -64,6 +64,10 @@ module Hyperion
       @stopping     = false
       @worker_model = self.class.detect_worker_model
       @listener     = nil # populated only in :share mode
+      @worker_max_rss_mb     = @config.worker_max_rss_mb
+      @worker_check_interval = @config.worker_check_interval || 30
+      @last_health_check     = 0  # monotonic seconds
+      @cycling               = {} # pid => true while we wait for it to exit
     end
 
     def run
@@ -165,6 +169,7 @@ module Hyperion
         end
 
         reap_and_respawn
+        maybe_cycle_workers
       end
 
       shutdown_children
@@ -177,10 +182,45 @@ module Hyperion
 
         Hyperion.logger.warn { { message: 'worker died, respawning', worker_pid: pid } }
         @children.delete(pid)
+        @cycling.delete(pid)
         spawn_worker unless @stopping
       end
     rescue Errno::ECHILD
       # No children — happens during shutdown.
+    end
+
+    # Periodically poll worker RSS and SIGTERM any that exceed the configured
+    # cap. The dying worker is reaped by `reap_and_respawn` on the next tick,
+    # which also clears the @cycling guard so the slot can be replaced.
+    # Skips entirely when no cap is configured — zero overhead by default.
+    def maybe_cycle_workers
+      return unless @worker_max_rss_mb
+
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      return if now - @last_health_check < @worker_check_interval
+
+      @last_health_check = now
+      @children.each_key do |pid|
+        next if @cycling.key?(pid)
+
+        rss = WorkerHealth.rss_mb(pid)
+        next unless rss && rss > @worker_max_rss_mb
+
+        Hyperion.logger.warn do
+          {
+            message: 'cycling worker for memory',
+            worker_pid: pid,
+            rss_mb: rss,
+            limit_mb: @worker_max_rss_mb
+          }
+        end
+        @cycling[pid] = true
+        begin
+          Process.kill('TERM', pid)
+        rescue StandardError
+          # process already gone — reap_and_respawn will handle it
+        end
+      end
     end
 
     def shutdown_children

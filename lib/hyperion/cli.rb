@@ -97,6 +97,7 @@ module Hyperion
       end
 
       app = load_rack_app(rackup)
+      app = wrap_admin_middleware(app, config)
       workers = config.workers.zero? ? Etc.nprocessors : config.workers
 
       if workers <= 1
@@ -196,6 +197,18 @@ module Hyperion
       end
     end
     private_class_method :maybe_enable_yjit
+
+    # When admin_token is configured, wrap the app in AdminMiddleware so
+    # POST /-/quit becomes a token-protected drain endpoint. Skipped when
+    # the token is unset — the path falls through to the app, so apps may
+    # still own /-/anything if Hyperion's admin is off.
+    def self.wrap_admin_middleware(app, config)
+      return app if config.admin_token.nil? || config.admin_token.to_s.empty?
+
+      Hyperion.logger.info { { message: 'admin endpoint enabled', path: AdminMiddleware::PATH } }
+      AdminMiddleware.new(app, token: config.admin_token)
+    end
+    private_class_method :wrap_admin_middleware
 
     # Warn loudly at boot if the C parser didn't load — operators running
     # production with the pure-Ruby fallback are paying ~2× CPU on parse-heavy

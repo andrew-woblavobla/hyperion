@@ -25,7 +25,10 @@ module Hyperion
       log_format: nil, # nil → Logger picks via auto rule
       log_requests: nil, # nil → Hyperion.log_requests? (default true)
       fiber_local_shim: false,
-      yjit: nil # nil → auto: enable on production/staging; true/false to force.
+      yjit: nil, # nil → auto: enable on production/staging; true/false to force.
+      worker_max_rss_mb: nil, # Integer, e.g. 1024. When a worker exceeds this RSS in MB, master gracefully cycles it. nil disables.
+      worker_check_interval: 30, # Seconds between RSS polls. Tradeoff: tighter = faster recycle, more ps calls. 30s matches Puma WorkerKiller.
+      admin_token: nil # String. When set, POST /-/quit triggers graceful drain. nil disables endpoint entirely (returns 404).
     }.freeze
 
     HOOKS = %i[before_fork on_worker_boot on_worker_shutdown].freeze
