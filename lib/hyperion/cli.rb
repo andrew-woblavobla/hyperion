@@ -25,8 +25,16 @@ module Hyperion
         o.on('-t', '--threads N', Integer, 'Rack handler thread pool size (0 disables)') do |t|
           cli_opts[:thread_count] = t
         end
-        o.on('--tls-cert PATH', 'TLS certificate (PEM)') do |p|
-          cli_opts[:tls_cert] = OpenSSL::X509::Certificate.new(File.read(p))
+        o.on('--tls-cert PATH', 'TLS certificate (PEM; chained intermediates supported)') do |p|
+          # Parse every BEGIN/END block in the file — production certs ship
+          # as leaf+intermediate(s) bundled together. `OpenSSL::X509::Certificate.new`
+          # only reads the first block, so loading via that single call would
+          # silently drop the chain. See Hyperion::TLS.parse_pem_chain.
+          certs = Hyperion::TLS.parse_pem_chain(File.read(p))
+          abort("[hyperion] no certificates found in #{p}") if certs.empty?
+
+          cli_opts[:tls_cert]  = certs.first
+          cli_opts[:tls_chain] = certs[1..]
         end
         o.on('--tls-key PATH', 'TLS private key (PEM)') do |p|
           cli_opts[:tls_key] = OpenSSL::PKey.read(File.read(p))

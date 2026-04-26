@@ -39,7 +39,7 @@ module Hyperion
       @port = tcp.addr[1]
 
       if @tls
-        @ssl_ctx = TLS.context(cert: @tls[:cert], key: @tls[:key])
+        @ssl_ctx = TLS.context(cert: @tls[:cert], key: @tls[:key], chain: @tls[:chain])
         ssl_server = ::OpenSSL::SSL::SSLServer.new(tcp, @ssl_ctx)
         ssl_server.start_immediately = false
         @server = ssl_server
@@ -67,7 +67,7 @@ module Hyperion
               else
                 sock.local_address.ip_port
               end
-      @ssl_ctx = TLS.context(cert: @tls[:cert], key: @tls[:key]) if @tls
+      @ssl_ctx = TLS.context(cert: @tls[:cert], key: @tls[:key], chain: @tls[:chain]) if @tls
       self
     end
 

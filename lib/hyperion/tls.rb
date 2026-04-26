@@ -11,12 +11,18 @@ module Hyperion
   module TLS
     SUPPORTED_PROTOCOLS = %w[h2 http/1.1].freeze
 
+    PEM_CERT_RE = /-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----/m
+
     module_function
 
-    def context(cert:, key:)
+    def context(cert:, key:, chain: nil)
       ctx = OpenSSL::SSL::SSLContext.new
       ctx.cert = cert
       ctx.key = key
+      # NB: do NOT switch to `chain.present?` — that's ActiveSupport, which
+      # this gem does not depend on (would NameError at runtime). The
+      # explicit guard below is the plain-Ruby equivalent.
+      ctx.extra_chain_cert = chain unless chain.nil? || chain.empty?
       ctx.min_version = OpenSSL::SSL::TLS1_2_VERSION
       ctx.alpn_protocols = SUPPORTED_PROTOCOLS
       ctx.alpn_select_cb = lambda do |client_protocols|
@@ -24,6 +30,15 @@ module Hyperion
         SUPPORTED_PROTOCOLS.find { |p| client_protocols.include?(p) }
       end
       ctx
+    end
+
+    # Split a PEM blob into one OpenSSL::X509::Certificate per BEGIN/END
+    # block. Production cert files commonly bundle leaf + intermediate(s) in
+    # a single file, but `OpenSSL::X509::Certificate.new(pem)` only parses
+    # the FIRST block — so if we don't split here the intermediates are
+    # silently dropped and clients see an incomplete chain.
+    def parse_pem_chain(pem)
+      pem.scan(PEM_CERT_RE).map { |block| OpenSSL::X509::Certificate.new(block) }
     end
   end
 end

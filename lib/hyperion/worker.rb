@@ -77,7 +77,7 @@ module Hyperion
       sock.listen(::Socket::SOMAXCONN)
 
       if @tls
-        ctx = Hyperion::TLS.context(cert: @tls[:cert], key: @tls[:key])
+        ctx = Hyperion::TLS.context(cert: @tls[:cert], key: @tls[:key], chain: @tls[:chain])
         ssl = ::OpenSSL::SSL::SSLServer.new(sock, ctx)
         ssl.start_immediately = false
         ssl

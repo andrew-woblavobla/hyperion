@@ -51,6 +51,13 @@ module Hyperion
       # routes both streams to the same target (e.g. a StringIO in specs).
       @out = io || out
       @err = io || err
+      # Force line-immediate mode on real IO destinations. When stdout is
+      # redirected (piped, journald, kubectl logs), Ruby/glibc default to
+      # 4-KiB block buffering and small log lines never reach the consumer
+      # until the buffer fills or the process exits. Operators expect to see
+      # boot lines + access logs in real time. Match Puma's behaviour.
+      @out.sync = true if @out.is_a?(::IO) && @out.respond_to?(:sync=)
+      @err.sync = true if @err.is_a?(::IO) && @err.respond_to?(:sync=)
       @level = parse_level(level || ENV.fetch('HYPERION_LOG_LEVEL', 'info'))
       requested = format || ENV['HYPERION_LOG_FORMAT']
       @format = pick_format(requested)
