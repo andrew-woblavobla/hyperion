@@ -25,6 +25,15 @@ module Hyperion
       metrics.snapshot
     end
 
+    # Whether the llhttp C extension loaded. False on JRuby/TruffleRuby and
+    # any environment where extconf.rb / make failed at install time. The
+    # pure-Ruby parser handles those cases correctly but is ~2× slower on
+    # parse-heavy workloads. Operators running production should confirm this
+    # returns true; CLI emits a startup banner if it doesn't.
+    def c_parser_available?
+      defined?(::Hyperion::CParser) && ::Hyperion::CParser.respond_to?(:build_response_head)
+    end
+
     # Per-request access logging is ON by default — matches Puma/Rails operator
     # expectations (Rails::Rack::Logger emits one line per request out of the
     # box). Operators can disable it via `--no-log-requests`,

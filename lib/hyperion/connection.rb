@@ -69,6 +69,7 @@ module Hyperion
         carry = +(buffer.byteslice(body_end, buffer.bytesize - body_end) || '')
         request = enrich_with_peer(request, peer_addr) if peer_addr && request.peer_address.nil?
 
+        @metrics.increment(:bytes_read, body_end)
         @metrics.increment(:requests_total)
         @metrics.increment(:requests_in_flight)
         request_started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) if @log_requests

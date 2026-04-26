@@ -33,6 +33,10 @@ Open an issue at https://github.com/andrew-woblavobla/hyperion/issues. Include:
 - Keep commits focused; squash WIP commits before review.
 - Match existing style: `# frozen_string_literal: true` at the top of
   every Ruby file, two-space indent, no trailing whitespace.
+- PRs from forks: CI runs but secrets aren't passed to fork workflows by
+  GitHub default policy. The `bundler-cache` step is slower (no shared cache),
+  but specs still run on the matrix. If your PR's CI fails on a fork-only
+  step, mention it in the PR and a maintainer will re-run from a branch.
 
 ## Architecture cheat-sheet
 

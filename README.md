@@ -246,7 +246,7 @@ Smuggling defenses for HTTP/1.1: `Content-Length` + `Transfer-Encoding` together
 
 ## Compatibility
 
-- **Ruby 3.2+** required.
+- **Ruby 3.3+** required (the `protocol-http2 ~> 0.26` transitive dep imposes this floor; older Ruby installs error at `bundle install`).
 - **Rack 3** (auto-sets `SERVER_SOFTWARE`, `rack.version`, `REMOTE_ADDR`, IPv6-safe `Host` parsing, CRLF guard).
 - **`Hyperion::FiberLocal.install!`** opt-in shim for older Rails apps that store request-scoped data via `Thread.current.thread_variable_*` (modern Rails 7.1+ already uses Fiber storage natively; the shim handles the residual footgun).
 - **`Hyperion::FiberLocal.verify_environment!`** runtime check that `Thread.current[:k]` is fiber-local on the current Ruby (it is on 3.2+).

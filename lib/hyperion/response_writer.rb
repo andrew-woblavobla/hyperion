@@ -51,14 +51,18 @@ module Hyperion
       # SINGLE io.write call. Each syscall round-trip is ~1 usec on macOS
       # kqueue; before this change we issued (1 status) + (N headers) + (1 blank)
       # + (1 body) = 8+ syscalls per response. Now: 1 syscall.
-      if buffered.empty?
-        io.write(head)
-      else
-        # Concatenate into the head buffer (which is already a fresh +'' from
-        # the C builder or the Ruby fallback) so we still emit a single write.
-        head << buffered
-        io.write(head)
-      end
+      bytes_out = if buffered.empty?
+                    io.write(head)
+                    head.bytesize
+                  else
+                    # Concatenate into the head buffer (which is already a fresh +''
+                    # from the C builder or the Ruby fallback) so we still emit a
+                    # single write.
+                    head << buffered
+                    io.write(head)
+                    head.bytesize
+                  end
+      Hyperion.metrics.increment(:bytes_written, bytes_out)
     ensure
       body.close if body.respond_to?(:close)
     end
@@ -74,6 +78,19 @@ module Hyperion
       else
         build_head_ruby(status, reason, headers, body_size, keep_alive, date_str)
       end
+    end
+
+    # Cached HTTP `Date:` header at second resolution. `Time.now.httpdate`
+    # allocates several strings; at high r/s the cache reuses one String per
+    # second per thread instead of allocating per response.
+    def cached_date
+      now_s = Process.clock_gettime(Process::CLOCK_REALTIME, :second)
+      cache = (Thread.current[:__hyperion_date_cache__] ||= [-1, ''])
+      return cache[1] if cache[0] == now_s
+
+      cache[0] = now_s
+      cache[1] = Time.now.httpdate
+      cache[1]
     end
 
     def build_head_ruby(status, reason, headers, body_size, keep_alive, date_str)

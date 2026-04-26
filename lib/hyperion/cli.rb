@@ -105,6 +105,7 @@ module Hyperion
       server.listen
       scheme = tls ? 'https' : 'http'
       Hyperion.logger.info { { message: 'listening', url: "#{scheme}://#{server.host}:#{server.port}" } }
+      warn_c_parser_unavailable
 
       # Single-worker mode reuses the lifecycle hooks: before_fork is a no-op
       # here (no fork happens), and on_worker_boot/on_worker_shutdown fire
@@ -155,5 +156,20 @@ module Hyperion
       { cert: config.tls_cert, key: config.tls_key }
     end
     private_class_method :build_tls_from_config
+
+    # Warn loudly at boot if the C parser didn't load — operators running
+    # production with the pure-Ruby fallback are paying ~2× CPU on parse-heavy
+    # workloads and probably don't know it.
+    def self.warn_c_parser_unavailable
+      return if Hyperion.c_parser_available?
+
+      Hyperion.logger.warn do
+        {
+          message: 'llhttp C parser not loaded — using pure-Ruby fallback (slower)',
+          remediation: 'rebuild the gem with `bundle exec rake compile` or check your OpenSSL/build-essential install'
+        }
+      end
+    end
+    private_class_method :warn_c_parser_unavailable
   end
 end
