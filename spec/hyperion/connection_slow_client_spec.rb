@@ -73,28 +73,25 @@ RSpec.describe Hyperion::Connection do
 
   it 'resets the deadline between keep-alive requests so a fast first request leaves a fresh budget for the second' do
     a, b = ::Socket.pair(:UNIX, :STREAM)
-    # First request: fast and complete in one write.
+    # Test design: inter-request gap (0.4s) is deliberately LONGER than the
+    # per-request budget (0.25s). Each request itself is sent in one fast
+    # write. If the deadline were per-connection, by the time the second
+    # request arrives the cumulative wallclock would already exceed the
+    # budget and the read would 408. If the deadline correctly resets per
+    # request, each gets a fresh 0.25s budget — both succeed.
+    #
+    # This shape is robust against macOS thread-scheduling noise (no
+    # byte-by-byte drip race vs sleep-jitter); the only timing constraint
+    # is `gap > budget + small_overhead`.
     a.write("GET /first HTTP/1.1\r\nHost: x\r\n\r\n")
-    # Second request: slow drip that would trip a connection-wide deadline
-    # but should complete within a *fresh* per-request 0.5s budget.
     feeder = Thread.new do
-      sleep 0.1 # let the first request land
-      "GET /second HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".each_char do |c|
-        begin
-          a.write(c)
-        rescue StandardError
-          break
-        end
-        sleep 0.005
-      end
+      sleep 0.4
+      a.write("GET /second HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     end
 
-    described_class.new.serve(b, app, max_request_read_seconds: 0.5)
+    described_class.new.serve(b, app, max_request_read_seconds: 0.25)
 
     response = a.read
-    # Both requests should have completed normally (200 OK twice). If the
-    # deadline had been per-connection (not per-request), the second request
-    # would have been aborted with 408.
     expect(response.scan(%r{HTTP/1\.1 200 OK}).size).to eq(2)
     expect(response).to include('seen /first')
     expect(response).to include('seen /second')
