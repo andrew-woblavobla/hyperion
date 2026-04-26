@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.0.0] - 2026-04-26
+
+First stable release. Same code as rc18; promoted from prerelease after smoke
+install + memory profile + cross-platform CI verification.
+
+## [1.0.0.rc18] - 2026-04-26
+
+### Fixed
+- **Silent stdout when redirected** — `Logger#initialize` now sets `@out.sync = @err.sync = true` on real `IO` destinations so log lines reach the consumer immediately even when stdout is piped (Docker, systemd, kubectl logs). Without this, Ruby/glibc 4-KiB block-buffered short writes and operators saw nothing until the buffer filled.
+- **Bundler auto-require footgun** — added `lib/hyperion-rb.rb` 1-line shim so `gem 'hyperion-rb'` in a Gemfile (with implicit auto-require) works without `require: 'hyperion'`. The canonical `require 'hyperion'` continues to work.
+
+### Added
+- **TLS chain support** — `--tls-cert PATH` now parses a multi-cert PEM (leaf + intermediate). The leaf is presented as the server cert; subsequent certs become `extra_chain_cert` so production deployments with intermediate CAs work without manual config gymnastics. New spec covers the 2-cert chain handshake.
+
 ## [1.0.0.rc17] - 2026-04-26
 
 ### Performance
