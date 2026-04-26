@@ -36,31 +36,141 @@ module Hyperion
     # Also exposes a `window_available` notification fan-out so the
     # response-writer fiber can sleep until WINDOW_UPDATE arrives.
     class RequestStream < ::Protocol::HTTP2::Stream
-      attr_reader :request_headers, :request_body, :request_complete
+      # RFC 7540 §8.1.2.1 — the only pseudo-headers a server MUST accept on a
+      # request. Anything else (notably `:status`, which is response-only, or
+      # an unknown `:foo`) is a malformed request that we reject with
+      # PROTOCOL_ERROR.
+      VALID_REQUEST_PSEUDO_HEADERS = %w[:method :path :scheme :authority].freeze
+
+      # RFC 7540 §8.1.2.2 — these connection-specific headers MUST NOT appear
+      # in HTTP/2 requests; their semantics are folded into HTTP/2 framing.
+      FORBIDDEN_HEADERS = %w[connection transfer-encoding keep-alive upgrade proxy-connection].freeze
+
+      attr_reader :request_headers, :request_body, :request_complete, :protocol_error_reason
 
       def initialize(*)
         super
         @request_headers = []
         @request_body = +''
+        @request_body_bytes = 0
         @request_complete = false
         @window_available = ::Async::Notification.new
+        @protocol_error_reason = nil
+        @declared_content_length = nil
+      end
+
+      # Used by the dispatch loop to decide whether to invoke the app or
+      # send RST_STREAM PROTOCOL_ERROR. Set by `validate_request_headers!`
+      # and `validate_body_length!`.
+      def protocol_error?
+        !@protocol_error_reason.nil?
       end
 
       def process_headers(frame)
         decoded = super
+        # First HEADERS frame on a stream carries the request header block;
+        # any later HEADERS frame is trailers (§8.1) and we deliberately do
+        # not re-validate (re-running the validator would see the original
+        # request pseudo-headers plus the new trailer block and falsely flag
+        # them as misordered).
+        first_block = @request_headers.empty?
         # decoded is an Array of [name, value] pairs (HPACK output).
         decoded.each { |pair| @request_headers << pair }
-        @request_complete = true if frame.end_stream?
+        # Run RFC 7540 §8.1.2 validation as soon as we have a complete header
+        # block. We do it here (not at end_stream) so the dispatcher sees the
+        # error flag before it spawns a fiber for the request.
+        validate_request_headers! if first_block && !protocol_error?
+        if frame.end_stream?
+          validate_body_length! unless protocol_error?
+          @request_complete = true
+        end
         decoded
       end
 
       def process_data(frame)
         data = super
         # rubocop:disable Rails/Present
-        @request_body << data if data && !data.empty?
+        if data && !data.empty?
+          @request_body << data
+          @request_body_bytes += data.bytesize
+        end
         # rubocop:enable Rails/Present
-        @request_complete = true if frame.end_stream?
+        if frame.end_stream?
+          validate_body_length! unless protocol_error?
+          @request_complete = true
+        end
         data
+      end
+
+      # RFC 7540 §8.1.2 — request header validation. Sets
+      # `@protocol_error_reason` on the first violation we hit; the dispatch
+      # loop turns that into RST_STREAM PROTOCOL_ERROR.
+      def validate_request_headers!
+        seen_regular = false
+        pseudo_counts = Hash.new(0)
+        @request_headers.each do |pair|
+          name, value = pair
+          name = name.to_s
+          if name.start_with?(':')
+            # §8.1.2.1: pseudo-headers MUST precede regular headers.
+            return fail_validation!('pseudo-header after regular header') if seen_regular
+            # §8.1.2.1: only the four request pseudo-headers are valid; in
+            # particular, `:status` is response-only.
+            unless VALID_REQUEST_PSEUDO_HEADERS.include?(name)
+              return fail_validation!("invalid request pseudo-header: #{name}")
+            end
+
+            pseudo_counts[name] += 1
+          else
+            seen_regular = true
+            # §8.1.2: header names must be lowercase in HTTP/2.
+            return fail_validation!('uppercase header name') if /[A-Z]/.match?(name)
+            # §8.1.2.2: connection-specific headers are forbidden.
+            return fail_validation!("forbidden connection-specific header: #{name}") if FORBIDDEN_HEADERS.include?(name)
+            # §8.1.2.2: TE may only carry the value `trailers`.
+            if name == 'te' && value.to_s.downcase.strip != 'trailers'
+              return fail_validation!('TE header with non-trailers value')
+            end
+
+            # Track declared content-length for later body-byte cross-check.
+            @declared_content_length = value.to_s.to_i if name == 'content-length'
+          end
+        end
+
+        # §8.1.2.3: every pseudo-header may appear at most once.
+        pseudo_counts.each do |name, count|
+          return fail_validation!("duplicated pseudo-header: #{name}") if count > 1
+        end
+
+        method = pseudo_value(':method')
+        # CONNECT (§8.3) has its own rules; everything else MUST carry
+        # :method, :scheme and a non-empty :path.
+        if method == 'CONNECT'
+          return fail_validation!('CONNECT with :scheme') if pseudo_value(':scheme')
+          return fail_validation!('CONNECT with :path') if pseudo_value(':path')
+          return fail_validation!('CONNECT without :authority') unless pseudo_value(':authority')
+        else
+          return fail_validation!('missing :method') if method.nil? || method.empty?
+
+          scheme = pseudo_value(':scheme')
+          return fail_validation!('missing :scheme') if scheme.nil? || scheme.empty?
+
+          path = pseudo_value(':path')
+          return fail_validation!('missing or empty :path') if path.nil? || path.empty?
+        end
+
+        nil
+      end
+
+      # RFC 7540 §8.1.2.6 — if `content-length` was advertised, the actual
+      # number of DATA bytes received (across all DATA frames) MUST match.
+      def validate_body_length!
+        return if @declared_content_length.nil?
+        return if @declared_content_length == @request_body_bytes
+
+        fail_validation!(
+          "content-length mismatch: declared #{@declared_content_length}, received #{@request_body_bytes}"
+        )
       end
 
       # Called by protocol-http2 whenever the remote peer's flow-control
@@ -77,6 +187,28 @@ module Hyperion
       # available_frame_size in a loop.
       def wait_for_window
         @window_available.wait
+      end
+
+      private
+
+      # Look up a pseudo-header by name (e.g. `:method`) by scanning the raw
+      # collected pairs. Returns nil if absent. We don't pre-build a hash
+      # because the validator needs to detect duplicates first.
+      def pseudo_value(name)
+        @request_headers.each do |pair|
+          return pair[1].to_s if pair[0].to_s == name
+        end
+        nil
+      end
+
+      # Record the first protocol-error reason and short-circuit further
+      # validation. Returns nil so callers can `return fail_validation!(...)`.
+      def fail_validation!(reason)
+        @protocol_error_reason ||= reason
+        # As soon as a header-block violation is detected we treat the request
+        # as "complete" so the dispatch loop wakes up and emits RST_STREAM.
+        @request_complete = true
+        nil
       end
     end
 
@@ -175,6 +307,23 @@ module Hyperion
     end
 
     def dispatch_stream(stream, send_mutex, peer_addr = nil)
+      # RFC 7540 §8.1.2 — header validation flagged this stream as malformed.
+      # Send RST_STREAM PROTOCOL_ERROR instead of invoking the app.
+      if stream.protocol_error?
+        @logger.debug do
+          { message: 'h2 request rejected', reason: stream.protocol_error_reason, stream_id: stream.id }
+        end
+        @metrics.increment(:requests_rejected)
+        begin
+          send_mutex.synchronize do
+            stream.send_reset_stream(::Protocol::HTTP2::Error::PROTOCOL_ERROR) unless stream.closed?
+          end
+        rescue StandardError
+          nil
+        end
+        return
+      end
+
       pseudo, regular = partition_pseudo(stream.request_headers)
 
       method    = pseudo[':method'] || 'GET'
