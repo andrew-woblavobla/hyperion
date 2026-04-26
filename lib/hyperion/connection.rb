@@ -17,6 +17,7 @@ module Hyperion
     MAX_BODY_BYTES                  = 16 * 1024 * 1024 # 16 MB cap. Phase 5 introduces streaming bodies.
     HEADER_TERM                     = "\r\n\r\n"
     TIMEOUT_SENTINEL                = :__hyperion_read_timeout__
+    DEADLINE_SENTINEL               = :__hyperion_request_deadline__
     IDLE_KEEPALIVE_TIMEOUT_SECONDS  = 5
 
     # Default parser is the C-extension `CParser` when the extension built;
@@ -44,14 +45,20 @@ module Hyperion
       @log_requests = log_requests.nil? ? Hyperion.log_requests? : log_requests
     end
 
-    def serve(socket, app)
+    def serve(socket, app, max_request_read_seconds: 60)
       request_count = 0
       carry = +'' # bytes already pulled off the socket but past the prev request boundary
       peer_addr = peer_address(socket)
       @metrics.increment(:connections_accepted)
       @metrics.increment(:connections_active)
       loop do
-        buffer = read_request(socket, carry)
+        # Per-request wallclock deadline. Captured fresh for every request so
+        # long-lived keep-alive sessions with many small requests don't
+        # falsely trip after the cumulative budget elapses.
+        request_started_clock = Process.clock_gettime(Process::CLOCK_MONOTONIC) if max_request_read_seconds
+        buffer = read_request(socket, carry, deadline_started_at: request_started_clock,
+                                             max_request_read_seconds: max_request_read_seconds,
+                                             peer_addr: peer_addr)
         return unless buffer
 
         if buffer == TIMEOUT_SENTINEL
@@ -64,6 +71,10 @@ module Hyperion
           @metrics.increment_status(408)
           return
         end
+
+        # Slowloris-style abort: deadline tripped during read. We've already
+        # written the 408 (best-effort) inside read_request; close out here.
+        return if buffer == DEADLINE_SENTINEL
 
         request, body_end = @parser.parse(buffer)
         carry = +(buffer.byteslice(body_end, buffer.bytesize - body_end) || '')
@@ -193,10 +204,16 @@ module Hyperion
     # pipelining). Returns the full buffer (with any trailing pipelined
     # bytes intact); the parser's returned end_offset tells the caller
     # where this request ends. On EOF returns nil; on read timeout returns
-    # TIMEOUT_SENTINEL.
-    def read_request(socket, carry = +'')
+    # TIMEOUT_SENTINEL; on per-request wallclock deadline trip returns
+    # DEADLINE_SENTINEL (and emits a best-effort 408 + close).
+    def read_request(socket, carry = +'', deadline_started_at: nil, max_request_read_seconds: nil,
+                     peer_addr: nil)
       buffer = carry
       until buffer.include?(HEADER_TERM)
+        if deadline_exceeded?(deadline_started_at, max_request_read_seconds)
+          return abort_for_deadline(socket, deadline_started_at, peer_addr)
+        end
+
         chunk = read_chunk(socket)
         return chunk if chunk.nil? || chunk == TIMEOUT_SENTINEL
         return nil if chunk.empty?
@@ -211,6 +228,9 @@ module Hyperion
       if chunked?(headers_part)
         until chunked_body_complete?(buffer, header_end)
           raise ParseError, 'chunked body exceeds limit' if buffer.bytesize - header_end > MAX_BODY_BYTES
+          if deadline_exceeded?(deadline_started_at, max_request_read_seconds)
+            return abort_for_deadline(socket, deadline_started_at, peer_addr)
+          end
 
           chunk = read_chunk(socket)
           break if chunk.nil? || chunk.empty? || chunk == TIMEOUT_SENTINEL
@@ -220,6 +240,10 @@ module Hyperion
       else
         content_length = headers_part[/^content-length:\s*(\d+)/i, 1].to_i
         while buffer.bytesize < header_end + content_length
+          if deadline_exceeded?(deadline_started_at, max_request_read_seconds)
+            return abort_for_deadline(socket, deadline_started_at, peer_addr)
+          end
+
           chunk = read_chunk(socket)
           break if chunk.nil? || chunk.empty? || chunk == TIMEOUT_SENTINEL
 
@@ -228,6 +252,33 @@ module Hyperion
       end
 
       buffer
+    end
+
+    # nil-disabled or budget-untripped → false. Otherwise the wallclock cap
+    # has been exceeded and the caller should abort.
+    def deadline_exceeded?(started_at, max_seconds)
+      return false unless started_at && max_seconds
+
+      (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at) > max_seconds
+    end
+
+    # Slowloris fallback: log a structured warn, bump :slow_request_aborts,
+    # write a best-effort 408, and let the caller close the socket. We don't
+    # wait on the 408 write — a dribbling client may never read it, and
+    # that's the failure mode we're protecting against anyway.
+    def abort_for_deadline(socket, started_at, peer_addr)
+      elapsed = started_at ? (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at).round(3) : nil
+      @metrics.increment(:slow_request_aborts)
+      @logger.warn do
+        { message: 'request read deadline exceeded', remote_addr: peer_addr, elapsed_seconds: elapsed }
+      end
+      begin
+        socket.write("HTTP/1.1 408 Request Timeout\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+      rescue StandardError
+        # Peer may have already gone — nothing to do.
+      end
+      @metrics.increment_status(408)
+      DEADLINE_SENTINEL
     end
 
     def chunked?(headers_part)

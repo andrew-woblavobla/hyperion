@@ -41,16 +41,18 @@ module Hyperion
     attr_reader :host, :port
 
     def initialize(app:, host: '127.0.0.1', port: 9292, read_timeout: DEFAULT_READ_TIMEOUT_SECONDS,
-                   tls: nil, thread_count: DEFAULT_THREAD_COUNT, max_pending: nil)
-      @host         = host
-      @port         = port
-      @app          = app
-      @read_timeout = read_timeout
-      @tls          = tls
-      @thread_count = thread_count
-      @max_pending  = max_pending
-      @thread_pool  = nil
-      @stopped      = false
+                   tls: nil, thread_count: DEFAULT_THREAD_COUNT, max_pending: nil,
+                   max_request_read_seconds: 60)
+      @host                     = host
+      @port                     = port
+      @app                      = app
+      @read_timeout             = read_timeout
+      @tls                      = tls
+      @thread_count             = thread_count
+      @max_pending              = max_pending
+      @max_request_read_seconds = max_request_read_seconds
+      @thread_pool              = nil
+      @stopped                  = false
     end
 
     def listen
@@ -140,9 +142,12 @@ module Hyperion
 
         apply_timeout(socket)
         if @thread_pool
-          reject_connection(socket) unless @thread_pool.submit_connection(socket, @app)
+          unless @thread_pool.submit_connection(socket, @app,
+                                                max_request_read_seconds: @max_request_read_seconds)
+            reject_connection(socket)
+          end
         else
-          Connection.new.serve(socket, @app)
+          Connection.new.serve(socket, @app, max_request_read_seconds: @max_request_read_seconds)
         end
       end
     end
@@ -172,10 +177,13 @@ module Hyperion
         # HTTP/1.1 (e.g. TLS-wrapped after ALPN picked http/1.1): hand the
         # connection to a worker thread. The fiber that called dispatch
         # returns immediately. On overflow, reject with 503 + close.
-        reject_connection(socket) unless @thread_pool.submit_connection(socket, @app)
+        unless @thread_pool.submit_connection(socket, @app,
+                                              max_request_read_seconds: @max_request_read_seconds)
+          reject_connection(socket)
+        end
       else
         # No pool (thread_count: 0): inline on the calling fiber.
-        Connection.new.serve(socket, @app)
+        Connection.new.serve(socket, @app, max_request_read_seconds: @max_request_read_seconds)
       end
     end
 

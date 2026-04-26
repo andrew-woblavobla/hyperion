@@ -112,7 +112,8 @@ module Hyperion
       server = Server.new(host: config.host, port: config.port, app: app,
                           tls: tls, thread_count: config.thread_count,
                           read_timeout: config.read_timeout,
-                          max_pending: config.max_pending)
+                          max_pending: config.max_pending,
+                          max_request_read_seconds: config.max_request_read_seconds)
       server.listen
       scheme = tls ? 'https' : 'http'
       Hyperion.logger.info { { message: 'listening', url: "#{scheme}://#{server.host}:#{server.port}" } }

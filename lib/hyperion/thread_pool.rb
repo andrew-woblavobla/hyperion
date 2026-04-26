@@ -56,10 +56,10 @@ module Hyperion
     # not strict. Off-by-one over the configured cap during a thundering
     # accept burst is acceptable; the cost of stricter sync would be a
     # mutex on every enqueue, which we won't pay on the hot path.
-    def submit_connection(socket, app)
+    def submit_connection(socket, app, max_request_read_seconds: 60)
       return false if @max_pending && @inbox.size >= @max_pending
 
-      @inbox << [:connection, socket, app]
+      @inbox << [:connection, socket, app, max_request_read_seconds]
       true
     end
 
@@ -94,12 +94,12 @@ module Hyperion
 
           case job[0]
           when :connection
-            _, socket, app = job
+            _, socket, app, max_request_read_seconds = job
             # Worker thread owns the connection for its full lifetime. Pass
             # thread_pool: nil so Connection#call_app inlines Adapter::Rack.call
             # — the worker IS the pool, no further hop required.
             begin
-              Hyperion::Connection.new.serve(socket, app)
+              Hyperion::Connection.new.serve(socket, app, max_request_read_seconds: max_request_read_seconds)
             rescue StandardError => e
               Hyperion.logger.error do
                 {

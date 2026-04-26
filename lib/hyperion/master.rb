@@ -150,7 +150,8 @@ module Hyperion
           read_timeout: @read_timeout, tls: @tls,
           thread_count: @thread_count, config: @config,
           worker_index: worker_index,
-          max_pending: @config.max_pending
+          max_pending: @config.max_pending,
+          max_request_read_seconds: @config.max_request_read_seconds
         }
         # Hand the inherited socket to the worker in :share mode. In
         # :reuseport mode the worker binds its own with SO_REUSEPORT.
