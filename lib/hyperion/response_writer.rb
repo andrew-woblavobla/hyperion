@@ -58,7 +58,7 @@ module Hyperion
       body.each { |chunk| buffered << chunk }
 
       reason = REASONS[status] || 'Unknown'
-      date_str = Time.now.httpdate
+      date_str = cached_date
 
       head = build_head(status, reason, headers, buffered.bytesize, keep_alive, date_str)
 
@@ -93,7 +93,7 @@ module Hyperion
       content_length = explicit_content_length(headers) || file_size
 
       reason = REASONS[status] || 'Unknown'
-      date_str = Time.now.httpdate
+      date_str = cached_date
       head = build_head(status, reason, headers, content_length, keep_alive, date_str)
 
       io.write(head)
