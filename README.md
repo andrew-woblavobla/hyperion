@@ -264,6 +264,8 @@ log_requests true
 
 fiber_local_shim false
 
+async_io false  # When true, the plain HTTP/1.1 accept loop runs each connection on a fiber under Async::Scheduler instead of handing it to a worker thread. Required for fiber-cooperative I/O (e.g. hyperion-async-pg). ~5% throughput hit on hello-world; in exchange one OS thread serves N concurrent in-flight DB queries on wait-bound workloads. TLS / HTTP/2 paths always use the async loop and ignore this flag.
+
 before_fork do
   ActiveRecord::Base.connection_handler.clear_all_connections! if defined?(ActiveRecord)
 end
@@ -328,6 +330,8 @@ The default-ON access log path is engineered to stay near-zero cost:
 | `parse_errors` | HTTP parse failures → 400. |
 | `app_errors` | Rack app raised → 500. |
 | `read_timeouts` | Per-connection read deadline hit. |
+| `requests_threadpool_dispatched` | HTTP/1.1 connection handed to the worker pool (or served inline in `start_raw_loop` when `thread_count: 0`). The default dispatch path. |
+| `requests_async_dispatched` | HTTP/1.1 connection served inline on the accept-loop fiber under `--async-io`. Operators can use the ratio against `requests_threadpool_dispatched` to verify fiber-cooperative I/O is actually engaged. |
 
 ```ruby
 require 'hyperion'

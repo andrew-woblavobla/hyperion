@@ -75,6 +75,49 @@ RSpec.describe Hyperion::Server, 'async_io flag' do
       expect(scheduler_probe[:saw_scheduler]).to be(true)
     end
 
+    it 'boots cleanly with thread_count: 0 (no worker pool spawned)' do
+      # Under async_io the pool is bypassed anyway — verify thread_count: 0
+      # actually skips the ThreadPool#new path and the request still serves.
+      server = described_class.new(app: probe_app, host: '127.0.0.1', port: port,
+                                   thread_count: 0, async_io: true)
+      server.listen
+      response = serve_one_request(server, port)
+      expect(response.code).to eq('200')
+      expect(response.body).to eq('ok')
+      expect(scheduler_probe[:saw_scheduler]).to be(true)
+    end
+
+    it 'serves multiple concurrent requests on a single OS thread under async_io' do
+      # Handler sleeps 200ms (via Async::Task#sleep so it yields) before
+      # responding. With async_io: true and thread_count: 0, multiple
+      # in-flight requests should overlap rather than serializing.
+      app = lambda do |_env|
+        # Use Async::Task#sleep so the fiber yields the OS thread.
+        ::Async::Task.current.sleep(0.2)
+        [200, {}, ['ok']]
+      end
+      server = described_class.new(app: app, host: '127.0.0.1', port: port,
+                                   thread_count: 0, async_io: true)
+      server.listen
+      thr = Thread.new { server.start }
+      begin
+        until_listening(server.port)
+        t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        threads = 5.times.map do
+          Thread.new { Net::HTTP.get_response(URI("http://127.0.0.1:#{server.port}/")) }
+        end
+        threads.each(&:join)
+        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
+        # 5 requests x 200ms serialized would be ~1.0 s. Under fiber concurrency
+        # they overlap and the wall is closer to 200ms (one round of the sleep).
+        # Tolerate 600ms ceiling for CI noise.
+        expect(elapsed).to be < 0.6
+      ensure
+        server.stop
+        thr.join(2)
+      end
+    end
+
     it 'bypasses the thread pool: handler runs on the accept-loop thread under a scheduler' do
       seen = { thread: nil, scheduler: nil }
       app = lambda do |_env|

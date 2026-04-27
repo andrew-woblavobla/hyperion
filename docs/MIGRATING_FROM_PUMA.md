@@ -16,6 +16,21 @@ A practical guide for Rails operators. Most apps need ~10 lines of config change
 
 Then translate `config/puma.rb` → `config/hyperion.rb` per the table below.
 
+## Fiber-cooperative I/O for PG-bound apps
+
+If your app is bottlenecked on Postgres / external HTTP / Redis (not CPU), Hyperion 1.3.0 ships an opt-in mode that decouples concurrency from threads. Set `async_io: true` in your config (or pass `--async-io` on the CLI) and pair with the [hyperion-async-pg](https://github.com/andrew-woblavobla/hyperion-async-pg) companion gem.
+
+The bench picture (Ubuntu 24.04, 50 ms `pg_sleep`, 200 concurrent wrk conns):
+
+- Puma `-t 5` + plain pg pool=5: 56 r/s, p99 3.88 s
+- Puma `-t 30` + plain pg pool=30: 402 r/s, p99 880 ms
+- Puma `-t 100` + plain pg pool=100: 1067 r/s, p99 557 ms
+- Hyperion `--async-io -t 5` + hyperion-async-pg pool=200: **2381 r/s, p99 471 ms**
+
+That's 5.9× Puma's tuned `-t 30` config. The trick: under `--async-io`, the OS-thread count is decoupled from in-flight-query count. Each fiber yields the OS thread on `recv()`; one accept-loop thread serves N concurrent in-flight queries (capped by your DB pool, not by `max_threads`).
+
+Default is **off** so fiber-unaware apps keep 1.2.0's raw-loop fast path. Flip it on only when you've installed `hyperion-async-pg` (or another Async-aware driver) AND a fiber-aware connection pool — see the companion gem's README for the full matrix.
+
 ## Why migrate
 
 - **Same throughput or better** at parity threads on every Rails workload tested. With access logs default-ON, Hyperion still beats Puma on hello-world (1.27×), production-cluster (1.17×), and Linux DB-backed (~1.02×). With `--no-log-requests` the lead widens.
