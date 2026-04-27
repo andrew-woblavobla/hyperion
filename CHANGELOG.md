@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.4.2] - 2026-04-27
+
+Audit-driven cleanup. No behaviour changes; fiber-correctness + docs polish.
+
+### Fixed
+- **`Hyperion::Logger` access buffer was fiber-local, not thread-local** — pre-1.4.2 the access-log write buffer was stored via `Thread.current[@buffer_key]`. Under an `Async::Scheduler` (TLS / h2 / `--async-io` plain HTTP/1.1) every handler fiber got its own private buffer, so the 4 KiB `ACCESS_FLUSH_BYTES` batching never fired — each fiber's buffer accumulated 1-3 lines before its connection closed and `flush_access_buffer` wrote them. At 24k r/s this meant ~12-24k `write(2)` syscalls/sec instead of the designed ~750/sec. Switched to `Thread#thread_variable_*` so all fibers on the same OS thread share one buffer and the batching actually fires. Same root cause as the 1.4.1 Metrics fix; surfaced by a code-audit grep for residual `Thread.current[:key]` patterns.
+- **`Logger#cached_timestamp` and `ResponseWriter#cached_date`** — same fix. Pre-1.4.2 the per-second / per-millisecond Time-formatting caches were per-fiber, so under Async every fiber rebuilt the iso8601 / httpdate String on its first call after a tick. Now per-OS-thread, shared across fibers; one allocation per second per thread total.
+
+### Added
+- **Prometheus exporter example output** in the README's Metrics section — shows what `curl -H 'X-Hyperion-Admin-Token: ...' /-/metrics` actually returns (HELP/TYPE lines, status-code labels, auto-export of unknown counters), plus the Prometheus scraper config sketch.
+- **Regression spec** for the access-buffer cross-fiber bug — two fibers on the same OS thread write through one logger; verifies a single buffer is registered (not one per fiber) and both lines land via `flush_all`.
+- **4 new Metrics specs** (already shipped in 1.4.1; called out here for coverage tracking) — cross-fiber on same thread, cross-thread, cross-fiber-on-different-thread, many-fibers-on-same-thread.
+
+### Changed
+- **README benchmark section** version-stamped: clarifies that the headline numbers were measured against the noted Hyperion version (most are 1.2.0 hello-world / 1.3.0 PG-bound) and that 1.3.0+ `--async-io` + 1.4.0+ TLS-inline + 1.4.1+ Metrics fix preserve or improve these numbers. We re-run the headline configs each release.
+
 ## [1.4.1] - 2026-04-27
 
 ### Fixed

@@ -142,10 +142,19 @@ module Hyperion
 
     # Cached HTTP `Date:` header at second resolution. `Time.now.httpdate`
     # allocates several strings; at high r/s the cache reuses one String per
-    # second per thread instead of allocating per response.
+    # second per OS thread instead of allocating per response. Stored as a
+    # thread variable (truly thread-local across fibers) so under Async
+    # every fiber on this thread shares the same cache — otherwise each
+    # fiber would rebuild the httpdate String on its first response after
+    # a second tick.
     def cached_date
       now_s = Process.clock_gettime(Process::CLOCK_REALTIME, :second)
-      cache = (Thread.current[:__hyperion_date_cache__] ||= [-1, ''])
+      thread = Thread.current
+      cache = thread.thread_variable_get(:__hyperion_date_cache__)
+      if cache.nil?
+        cache = [-1, '']
+        thread.thread_variable_set(:__hyperion_date_cache__, cache)
+      end
       return cache[1] if cache[0] == now_s
 
       cache[0] = now_s

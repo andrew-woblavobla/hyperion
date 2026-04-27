@@ -150,7 +150,7 @@ module Hyperion
                build_access_text(ts, method, path, query, status, duration_ms, remote_addr, http_version)
              end
 
-      buf = Thread.current[@buffer_key] || allocate_access_buffer
+      buf = Thread.current.thread_variable_get(@buffer_key) || allocate_access_buffer
       buf << line
       return if buf.bytesize < ACCESS_FLUSH_BYTES
 
@@ -164,7 +164,7 @@ module Hyperion
     # loop when a connection closes (so log lines from a closing keep-alive
     # session don't get stuck behind the buffer until the next connection).
     def flush_access_buffer
-      buf = Thread.current[@buffer_key]
+      buf = Thread.current.thread_variable_get(@buffer_key)
       return if buf.nil? || buf.empty?
 
       @out.write(buf)
@@ -215,7 +215,7 @@ module Hyperion
     # Mutex is taken once per thread (not per request).
     def allocate_access_buffer
       buf = +''
-      Thread.current[@buffer_key] = buf
+      Thread.current.thread_variable_set(@buffer_key, buf)
       @access_buffers_mutex.synchronize { @access_buffers << buf }
       buf
     end
@@ -229,11 +229,21 @@ module Hyperion
     end
 
     # Cached UTC iso8601(3) timestamp, refreshed at most once per millisecond
-    # per thread. At 24k r/s with 16 threads we render ~1500 r/s/thread; only
-    # ~1000 of those allocate a new String. The other 500 reuse the cached one.
+    # per OS thread. At 24k r/s with 16 threads we render ~1500 r/s/thread;
+    # only ~1000 of those allocate a new String. The other 500 reuse the
+    # cached one. Stored as a thread variable (truly thread-local across
+    # fibers) so under Async every fiber on this thread shares the same
+    # cache and the per-second amortisation actually fires; with the prior
+    # `Thread.current[:k]` storage each fiber would re-build the iso8601
+    # String on its first call after a millisecond tick.
     def cached_timestamp
       now_ms = Process.clock_gettime(Process::CLOCK_REALTIME, :millisecond)
-      cache = (Thread.current[:__hyperion_ts_cache__] ||= [-1, ''])
+      thread = Thread.current
+      cache = thread.thread_variable_get(:__hyperion_ts_cache__)
+      if cache.nil?
+        cache = [-1, '']
+        thread.thread_variable_set(:__hyperion_ts_cache__, cache)
+      end
       return cache[1] if cache[0] == now_ms
 
       cache[0] = now_ms

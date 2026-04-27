@@ -93,6 +93,27 @@ RSpec.describe Hyperion::Logger do
       expect(io.string.scan(%r{path=/single}).size).to eq(1)
     end
 
+    # Regression: pre-1.4.2 the access buffer was stored via
+    # `Thread.current[@buffer_key]`, which is FIBER-local. Under Async every
+    # fiber on the same OS thread got its own buffer, so the 4 KiB
+    # ACCESS_FLUSH_BYTES batching never kicked in (each fiber's buffer
+    # accumulated 1-3 lines before the connection closed and flush_access_buffer
+    # wrote them). 1.4.2 switches to thread_variable_* (truly thread-local
+    # across fibers) so all fibers on the same thread share one buffer and
+    # the batching actually fires.
+    it 'shares a single buffer across multiple fibers on the same OS thread' do
+      Fiber.new { logger.access('GET', '/from_fiber_a', nil, 200, 1, '127.0.0.1', '1.1') }.resume
+      Fiber.new { logger.access('GET', '/from_fiber_b', nil, 200, 1, '127.0.0.1', '1.1') }.resume
+
+      logger.flush_all
+      output = logger.instance_variable_get(:@out).string
+      expect(output).to include('path=/from_fiber_a')
+      expect(output).to include('path=/from_fiber_b')
+      # Both lines came from one buffer (registered once on this thread):
+      buffers = logger.instance_variable_get(:@access_buffers)
+      expect(buffers.size).to eq(1)
+    end
+
     # Helper variant for the flaky-IO case — must spawn the writer against
     # a different logger instance than the main `subject(:logger)`.
     def spawn_writer_for(target_logger, call_count: 1)

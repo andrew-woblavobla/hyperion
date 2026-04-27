@@ -25,7 +25,7 @@ bundle exec hyperion config.ru
 
 ## Benchmarks
 
-All numbers are real wrk runs against published Hyperion configs. Hyperion ships **with default-ON structured access logs**; Puma comparisons use Puma defaults (no per-request log emission).
+All numbers are real wrk runs against published Hyperion configs. Hyperion ships **with default-ON structured access logs**; Puma comparisons use Puma defaults (no per-request log emission). Each section is stamped with the Hyperion version it was measured against — newer versions (1.3.0+ `--async-io`, 1.4.0+ TLS h1 inline, 1.4.1+ Metrics fiber-key fix) preserve or improve these numbers; we re-run the headline configs each release and have not seen regressions on these workloads.
 
 ### Hello-world Rack app
 
@@ -362,6 +362,31 @@ require 'hyperion'
 Hyperion.stats
 # => {connections_accepted: 1234, connections_active: 7, requests_total: 8910, …}
 ```
+
+### Prometheus exporter
+
+When `admin_token` is set in your config, Hyperion mounts a `/-/metrics` endpoint that emits Prometheus text-format v0.0.4. Same token guards both `/-/metrics` (GET) and `/-/quit` (POST); auth is via the `X-Hyperion-Admin-Token` header.
+
+```sh
+$ curl -s -H 'X-Hyperion-Admin-Token: secret' http://127.0.0.1:9292/-/metrics
+# HELP hyperion_requests_total Total HTTP requests handled
+# TYPE hyperion_requests_total counter
+hyperion_requests_total 8910
+# HELP hyperion_bytes_written_total Total bytes written to response sockets
+# TYPE hyperion_bytes_written_total counter
+hyperion_bytes_written_total 2351023
+# HELP hyperion_responses_status_total Responses by HTTP status code
+# TYPE hyperion_responses_status_total counter
+hyperion_responses_status_total{status="200"} 8521
+hyperion_responses_status_total{status="404"} 12
+hyperion_responses_status_total{status="500"} 3
+# … and so on for sendfile_responses_total, rejected_connections_total,
+# slow_request_aborts_total, requests_async_dispatched_total, etc.
+```
+
+Any counter not in the known set (added by app middleware via `Hyperion.metrics.increment(:custom_thing)`) is auto-exported as `hyperion_custom_thing` with a generic HELP line — no Hyperion config change required.
+
+Point your scraper at it: in Prometheus' `scrape_configs`, set `metrics_path: /-/metrics` and `bearer_token` (or use a custom header relabel — Prometheus 2.42+ supports `authorization.credentials_file` paired with a custom `header` block). Network-isolate the admin endpoints if the listener is internet-facing — see [docs/REVERSE_PROXY.md](docs/REVERSE_PROXY.md) for the nginx `location /-/ { return 404; }` recipe.
 
 ## TLS + HTTP/2
 
