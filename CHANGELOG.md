@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.5.0] - 2026-04-27
+
+Audit-driven CLI + adapter polish. No breaking changes; pure additions to the operator surface and a hardening of the host-header parser.
+
+### Added
+- **CLI flag coverage for 8 Config DSL settings.** Pre-1.5.0 these settings could only be reached by writing a `config/hyperion.rb` file; operators who don't keep one in their repo had no way to flip them without authoring one. They now flow through the same CLI > config-file > default precedence as the rest of the flags:
+  - `--max-body-bytes BYTES` (Integer, default 16 MiB)
+  - `--max-header-bytes BYTES` (Integer, default 64 KiB)
+  - `--max-pending COUNT` (Integer, default unbounded)
+  - `--max-request-read-seconds SECONDS` (Float, default 60)
+  - `--admin-token TOKEN` (String, default unset) — gates `POST /-/quit` and `GET /-/metrics`
+  - `--admin-token-file PATH` — sibling that reads the token from disk; refuses to load if the file is missing, unreadable, world-readable (perms must mask `0o007`), or empty. Production deployments should prefer this over `--admin-token` because argv is visible via `ps`.
+  - `--worker-max-rss-mb MB` (Integer, default unset) — RSS-based worker recycling
+  - `--idle-keepalive SECONDS` (Float, default 5)
+  - `--graceful-timeout SECONDS` (Integer, default 30)
+- **`Hyperion::CLI.parse_argv!` extracted as a public class method** so the flag-to-`cli_opts` mapping is unit-testable without booting a server. `CLI.run` is now a thin wrapper around it.
+- **README CLI flags table** extended with the 8 new flags plus `--[no-]yjit` / `--[no-]async-io` (already wired but previously undocumented in the table).
+- **17 new specs**:
+  - 14 in `spec/hyperion/cli_flags_spec.rb` cover per-flag parsing, the `merge_cli!` handoff for all 8 new flags, the CLI-wins precedence rule, and the four `--admin-token-file` abort paths (missing / unreadable / world-readable / empty).
+  - 3 in `spec/hyperion/adapter/rack_spec.rb` cover plain IPv4-with-port, bare hostname (no port), and the malformed-bracket regression below.
+
+### Fixed
+- **`Hyperion::Adapter::Rack#split_host` accepted malformed bracketed IPv6.** Pre-1.5.0 a `Host: [::1` header (no closing bracket) was returned as-is in `SERVER_NAME`, leaking attacker-controlled bytes into Rack env where downstream URL generators / SSRF allow-lists / audit logs would trust them. The adapter now fails closed to `localhost:80` and bumps a `:malformed_host_header` counter so operators can alert on attack-pattern volume. No raise — Rack apps don't expect a server adapter to throw on header-parse failures, so we degrade gracefully instead.
+
+### Security
+- `--admin-token` help text warns that argv is visible via `ps` and points operators at `--admin-token-file` for production. The token value is never echoed back in any log line.
+
 ## [1.4.2] - 2026-04-27
 
 Audit-driven cleanup. No behaviour changes; fiber-correctness + docs polish.
