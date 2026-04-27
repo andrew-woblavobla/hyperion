@@ -101,9 +101,11 @@ Ubuntu 24.04 / 16 vCPU / Ruby 3.3.3, Postgres 17 over WAN, `wrk -t4 -c200 -d20s`
 Three things must all be true to get this win:
 1. **`async_io: true`** in your Hyperion config (or `--async-io` CLI flag). Default is off to keep 1.2.0's raw-loop perf for fiber-unaware apps.
 2. **`hyperion-async-pg`** installed: `gem 'hyperion-async-pg', require: 'hyperion/async_pg'` + `Hyperion::AsyncPg.install!` at boot.
-3. **Fiber-aware connection pool.** The popular `connection_pool` gem is NOT — its Mutex blocks the OS thread. Use [`async-pool`](https://github.com/socketry/async-pool), `Async::Semaphore`, or hand-roll one (see `bench/pg_concurrent.ru` for a ~30-line FiberPool example).
+3. **Fiber-aware connection pool.** The popular `connection_pool` gem is NOT — its Mutex blocks the OS thread. Use `Hyperion::AsyncPg::FiberPool` (ships with hyperion-async-pg 0.3.0+), [`async-pool`](https://github.com/socketry/async-pool), or `Async::Semaphore`.
 
 Skip any of these and you get parity with Puma at the same `-t`. Run the bench yourself: `MODE=async DATABASE_URL=... PG_POOL_SIZE=200 bundle exec hyperion --async-io -t 5 bench/pg_concurrent.ru` (in the [hyperion-async-pg](https://github.com/andrew-woblavobla/hyperion-async-pg) repo).
+
+> **TLS + async-pg note.** TLS / HTTPS already runs each connection on a fiber under `Async::Scheduler` (the TLS path always uses `start_async_loop` for the ALPN handshake). But the post-handshake `app.call` for HTTP/1.1-over-TLS still hops through the worker thread pool by default. To get fiber-cooperative I/O on the TLS h1 path too — i.e. async-pg yielding while the PG socket is parked — pair `--tls-cert/--tls-key` with `--async-io`. h2 streams are always fiber-dispatched and benefit from async-pg without the flag.
 
 ### CPU-bound JSON workload
 
