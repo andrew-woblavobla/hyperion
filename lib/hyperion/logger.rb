@@ -65,6 +65,7 @@ module Hyperion
       # check the regular stream here — colored text is for humans.
       @colorize = @format == :text && tty?(@out)
       @c_access_available = nil # lazy-computed on first access — see below.
+      @c_access_colored_available = nil # ditto for the coloured TTY variant.
       # Registry of every per-thread access buffer ever allocated through
       # this Logger instance. Walked by #flush_all on shutdown so SIGTERM
       # doesn't strand buffered lines in dying threads. The Mutex guards
@@ -92,6 +93,16 @@ module Hyperion
 
       @c_access_available = defined?(::Hyperion::CParser) &&
                             ::Hyperion::CParser.respond_to?(:build_access_line)
+    end
+
+    # Whether Hyperion::CParser.build_access_line_colored is available. Same
+    # lazy-probe pattern as #c_access_available?; lets a colored-TTY run pick
+    # up the C path instead of the Ruby fallback.
+    def c_access_colored_available?
+      return @c_access_colored_available unless @c_access_colored_available.nil?
+
+      @c_access_colored_available = defined?(::Hyperion::CParser) &&
+                                    ::Hyperion::CParser.respond_to?(:build_access_line_colored)
     end
 
     LEVELS.each_key do |lvl|
@@ -140,7 +151,12 @@ module Hyperion
       # which the C builder doesn't emit. Production deploys (non-TTY,
       # log-aggregator destinations) take the C path; local TTY runs keep the
       # colored Ruby fallback.
-      line = if !@colorize && c_access_available?
+      line = if @colorize && c_access_colored_available?
+               # Colored TTY path: green INFO label baked into the C builder.
+               ::Hyperion::CParser.build_access_line_colored(@format, ts, method, path,
+                                                             query, status, duration_ms,
+                                                             remote_addr, http_version)
+             elsif !@colorize && c_access_available?
                ::Hyperion::CParser.build_access_line(@format, ts, method, path,
                                                      query, status, duration_ms,
                                                      remote_addr, http_version)

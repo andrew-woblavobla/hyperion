@@ -543,6 +543,131 @@ static VALUE cbuild_access_line(VALUE self,
 }
 #undef CAT_LIT
 
+/* Hyperion::CParser.build_access_line_colored(format, ts, method, path, query,
+ *                                              status, duration_ms, remote_addr,
+ *                                              http_version) -> String
+ *
+ * TTY-coloured variant of build_access_line. The text path wraps the level
+ * label with ANSI escape "\e[32mINFO \e[0m" so a developer running Hyperion
+ * in a terminal sees a green INFO tag. The :json branch is identical to the
+ * non-coloured builder — JSON access lines are machine-readable and never
+ * carry ANSI escapes.
+ *
+ * Lifted from cbuild_access_line above; the only divergence is the level
+ * label injection in the text branch. We deliberately duplicate the text
+ * format rather than templating, because the text body is short and a
+ * single function with a colour flag would compile to the same code with an
+ * extra branch in the hot loop.
+ */
+static VALUE cbuild_access_line_colored(VALUE self,
+                                        VALUE format_sym, VALUE rb_ts,
+                                        VALUE rb_method, VALUE rb_path,
+                                        VALUE rb_query, VALUE rb_status,
+                                        VALUE rb_duration, VALUE rb_remote,
+                                        VALUE rb_http_version) {
+    (void)self;
+    Check_Type(rb_ts, T_STRING);
+    Check_Type(rb_method, T_STRING);
+    Check_Type(rb_path, T_STRING);
+    Check_Type(rb_http_version, T_STRING);
+
+    int is_json = (TYPE(format_sym) == T_SYMBOL) &&
+                  (SYM2ID(format_sym) == rb_intern("json"));
+
+    int status     = NUM2INT(rb_status);
+    double dur_ms  = NUM2DBL(rb_duration);
+
+    int has_query  = !NIL_P(rb_query) && RSTRING_LEN(rb_query) > 0;
+    int has_remote = !NIL_P(rb_remote) && RSTRING_LEN(rb_remote) > 0;
+
+#define CAT_LIT(b, s) rb_str_cat((b), (s), (long)(sizeof(s) - 1))
+
+    VALUE buf = rb_str_buf_new(512);
+
+    if (is_json) {
+        /* JSON output is identical to the non-coloured path — ANSI escapes
+         * have no place in a structured log record. */
+        CAT_LIT(buf, "{\"ts\":\"");
+        rb_str_cat(buf, RSTRING_PTR(rb_ts), RSTRING_LEN(rb_ts));
+        CAT_LIT(buf, "\",\"level\":\"info\",\"source\":\"hyperion\",\"message\":\"request\",");
+        CAT_LIT(buf, "\"method\":\"");
+        rb_str_cat(buf, RSTRING_PTR(rb_method), RSTRING_LEN(rb_method));
+        CAT_LIT(buf, "\",\"path\":\"");
+        rb_str_cat(buf, RSTRING_PTR(rb_path), RSTRING_LEN(rb_path));
+        CAT_LIT(buf, "\"");
+
+        if (has_query) {
+            CAT_LIT(buf, ",\"query\":\"");
+            rb_str_cat(buf, RSTRING_PTR(rb_query), RSTRING_LEN(rb_query));
+            CAT_LIT(buf, "\"");
+        }
+
+        char num[64];
+        int n = snprintf(num, sizeof(num), ",\"status\":%d,\"duration_ms\":%g,",
+                         status, dur_ms);
+        rb_str_cat(buf, num, n);
+
+        if (has_remote) {
+            CAT_LIT(buf, "\"remote_addr\":\"");
+            rb_str_cat(buf, RSTRING_PTR(rb_remote), RSTRING_LEN(rb_remote));
+            CAT_LIT(buf, "\",");
+        } else {
+            CAT_LIT(buf, "\"remote_addr\":null,");
+        }
+
+        CAT_LIT(buf, "\"http_version\":\"");
+        rb_str_cat(buf, RSTRING_PTR(rb_http_version), RSTRING_LEN(rb_http_version));
+        CAT_LIT(buf, "\"}\n");
+    } else {
+        /* text: "<ts> \e[32mINFO \e[0m [hyperion] message=request method=..." */
+        rb_str_cat(buf, RSTRING_PTR(rb_ts), RSTRING_LEN(rb_ts));
+        CAT_LIT(buf, " \x1b[32mINFO \x1b[0m [hyperion] message=request method=");
+        rb_str_cat(buf, RSTRING_PTR(rb_method), RSTRING_LEN(rb_method));
+        CAT_LIT(buf, " path=");
+        rb_str_cat(buf, RSTRING_PTR(rb_path), RSTRING_LEN(rb_path));
+
+        if (has_query) {
+            const char *q_ptr = RSTRING_PTR(rb_query);
+            long q_len = RSTRING_LEN(rb_query);
+            int need_quote = 0;
+            for (long j = 0; j < q_len; j++) {
+                char c = q_ptr[j];
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+                    c == '"' || c == '=') {
+                    need_quote = 1;
+                    break;
+                }
+            }
+            if (need_quote) {
+                VALUE quoted = rb_funcall(rb_query, rb_intern("inspect"), 0);
+                CAT_LIT(buf, " query=");
+                rb_str_cat(buf, RSTRING_PTR(quoted), RSTRING_LEN(quoted));
+            } else {
+                CAT_LIT(buf, " query=");
+                rb_str_cat(buf, q_ptr, q_len);
+            }
+        }
+
+        char num[80];
+        int n = snprintf(num, sizeof(num), " status=%d duration_ms=%g remote_addr=",
+                         status, dur_ms);
+        rb_str_cat(buf, num, n);
+
+        if (has_remote) {
+            rb_str_cat(buf, RSTRING_PTR(rb_remote), RSTRING_LEN(rb_remote));
+        } else {
+            CAT_LIT(buf, "nil");
+        }
+
+        CAT_LIT(buf, " http_version=");
+        rb_str_cat(buf, RSTRING_PTR(rb_http_version), RSTRING_LEN(rb_http_version));
+        CAT_LIT(buf, "\n");
+    }
+
+    return buf;
+}
+#undef CAT_LIT
+
 /* Hyperion::CParser.upcase_underscore(name) -> "HTTP_<UPCASED_UNDERSCORED>"
  *
  * Single-allocation replacement for `"HTTP_#{name.upcase.tr('-', '_')}"`.
@@ -748,6 +873,8 @@ void Init_hyperion_http(void) {
                                cbuild_response_head, 6);
     rb_define_singleton_method(rb_cCParser, "build_access_line",
                                cbuild_access_line, 9);
+    rb_define_singleton_method(rb_cCParser, "build_access_line_colored",
+                               cbuild_access_line_colored, 9);
     rb_define_singleton_method(rb_cCParser, "upcase_underscore",
                                cupcase_underscore, 1);
     rb_define_singleton_method(rb_cCParser, "chunked_body_complete?",
