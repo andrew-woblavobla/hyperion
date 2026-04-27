@@ -25,7 +25,9 @@ bundle exec hyperion config.ru
 
 ## Benchmarks
 
-All numbers are real wrk runs against published Hyperion configs. Hyperion ships **with default-ON structured access logs**; Puma comparisons use Puma defaults (no per-request log emission). Each section is stamped with the Hyperion version it was measured against — newer versions (1.3.0+ `--async-io`, 1.4.0+ TLS h1 inline, 1.4.1+ Metrics fiber-key fix) preserve or improve these numbers; we re-run the headline configs each release and have not seen regressions on these workloads.
+All numbers are real wrk runs against published Hyperion configs. Hyperion ships **with default-ON structured access logs**; Puma comparisons use Puma defaults (no per-request log emission). Each section is stamped with the Hyperion version it was measured against — newer versions (1.3.0+ `--async-io`, 1.4.0+ TLS h1 inline, 1.4.1+ Metrics fiber-key fix, 1.6.0+ HTTP/2 writer fiber + 3 C-ext additions) preserve or improve these numbers; we re-run the headline configs each release and have not seen regressions on these workloads.
+
+> **Comprehensive matrix for 1.6.0 + hyperion-async-pg 0.5.0 (16-vCPU Linux, 9 workloads × 25+ configs)**: see [`docs/BENCH_2026_04_27.md`](docs/BENCH_2026_04_27.md). Headline: 98,818 r/s on hello `-w 16`, 21,215 r/s `-w 4` at p99 < 2 ms, 2,180 r/s on a 50 ms-waiting PG workload (4.1× the best Puma), 1,667 req/s HTTP/2 multiplexed at 0 errors, 155 MB RSS for 10k idle keep-alive connections.
 
 ### Hello-world Rack app
 
