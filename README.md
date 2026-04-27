@@ -61,7 +61,19 @@ Falcon edges Hyperion ~20% on raw rps at `-w 4` on macOS hello-world. **Hyperion
 | Hyperion `--no-log-requests` | 6,364 | 1.114× |
 | Puma `-w 4 -t 10:10` (no per-req logs) | 5,715 | 1.000× |
 
-Bench is network-bound (~3-4 ms median is the PG + Redis round-trip). Hyperion's lead comes from cheaper per-request CPU: lock-free per-thread metrics, per-thread cached iso8601 timestamps in the access log, hand-rolled single-interpolation log line builder, no logger mutex (POSIX `write(2)` atomicity), C-extension response-head builder.
+Bench is **wait-bound** — ~3-4 ms median is the PG + Redis round-trip, dwarfing the per-request CPU work where Hyperion's optimisations live. With a synchronous `pg` driver, fibers don't help: every in-flight DB call still parks an OS thread, and both servers max out at `workers × threads` concurrent queries. To widen this gap requires either an async PG driver (lets one OS thread serve N concurrent in-flight queries via fiber yields — see [hyperion-async-pg](#) when it ships) or a CPU-bound workload, where Hyperion's lead becomes visible (next section).
+
+### CPU-bound JSON workload
+
+`bench/work.ru` — handler builds a 50-key fixture, JSON-encodes a fresh response per request (~8 KB body), processes a 6-cookie header chain. wrk `-t4 -c200 -d15s`, macOS arm64 / Ruby 3.3.3, 1.2.0:
+
+| | r/s | p99 | tail vs Hyperion |
+|---|---:|---:|---:|
+| Falcon `--count 4` | 46,166 | 20.17 ms | 24× worse |
+| **Hyperion `-w 4 -t 5`** | **43,924** | **824 µs** | **1×** |
+| Puma `-w 4 -t 5:5` | 36,383 | 166.30 ms (47 socket errors) | 200× worse |
+
+**1.21× Puma throughput, 200× lower p99.** This is the gap that hides behind PG-round-trip noise on the DB bench. Hyperion's per-request CPU savings (lock-free per-thread metrics, frozen header keys in the Rack adapter, C-ext response head builder, cached iso8601 timestamps, cached HTTP Date header) land on the wire when the workload is CPU-bound. Falcon edges us 5% on raw r/s but with 24× worse tail — a different tradeoff curve. Reproduce: `bundle exec bin/hyperion -w 4 -t 5 -p 9292 bench/work.ru`.
 
 ### Real Rails 8.1 app (single worker, parity threads `-t 16`)
 
