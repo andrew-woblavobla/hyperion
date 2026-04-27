@@ -151,11 +151,14 @@ module Hyperion
 
         apply_timeout(socket)
         if @thread_pool
-          unless @thread_pool.submit_connection(socket, @app,
-                                                max_request_read_seconds: @max_request_read_seconds)
+          if @thread_pool.submit_connection(socket, @app,
+                                            max_request_read_seconds: @max_request_read_seconds)
+            Hyperion.metrics.increment(:requests_threadpool_dispatched)
+          else
             reject_connection(socket)
           end
         else
+          Hyperion.metrics.increment(:requests_threadpool_dispatched)
           Connection.new.serve(socket, @app, max_request_read_seconds: @max_request_read_seconds)
         end
       end
@@ -180,7 +183,9 @@ module Hyperion
       if socket.is_a?(::OpenSSL::SSL::SSLSocket) && socket.alpn_protocol == 'h2'
         # HTTP/2: each stream runs on a fiber inside Http2Handler. The
         # handler still uses the pool's `#call` for app.call hops on each
-        # stream (one per stream, not one per connection).
+        # stream (one per stream, not one per connection). Per-stream
+        # counters live inside Http2Handler; we don't bump either of the
+        # H1 dispatch buckets here — neither fits the h2 model cleanly.
         Http2Handler.new(app: @app, thread_pool: @thread_pool, h2_settings: @h2_settings).serve(socket)
       elsif @async_io
         # async_io plain HTTP/1.1: serve inline on the calling fiber so the
@@ -190,17 +195,23 @@ module Hyperion
         # one thread can serve N concurrent in-flight DB queries. The
         # thread pool is intentionally bypassed here: handing the socket
         # to a worker thread strips the scheduler context.
+        Hyperion.metrics.increment(:requests_async_dispatched)
         Connection.new.serve(socket, @app, max_request_read_seconds: @max_request_read_seconds)
       elsif @thread_pool
         # HTTP/1.1 (e.g. TLS-wrapped after ALPN picked http/1.1): hand the
         # connection to a worker thread. The fiber that called dispatch
         # returns immediately. On overflow, reject with 503 + close.
-        unless @thread_pool.submit_connection(socket, @app,
-                                              max_request_read_seconds: @max_request_read_seconds)
+        if @thread_pool.submit_connection(socket, @app,
+                                          max_request_read_seconds: @max_request_read_seconds)
+          Hyperion.metrics.increment(:requests_threadpool_dispatched)
+        else
           reject_connection(socket)
         end
       else
-        # No pool (thread_count: 0): inline on the calling fiber.
+        # No pool (thread_count: 0) on the TLS / async-wrap path. Rare
+        # config — neither dispatch bucket fits cleanly. Leave un-counted
+        # rather than misclassify; the request still shows up in
+        # :requests_total via Connection.
         Connection.new.serve(socket, @app, max_request_read_seconds: @max_request_read_seconds)
       end
     end
