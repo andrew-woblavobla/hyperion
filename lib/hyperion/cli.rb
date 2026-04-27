@@ -11,6 +11,55 @@ module Hyperion
     DEFAULT_CONFIG_PATH = 'config/hyperion.rb'
 
     def self.run(argv)
+      cli_opts, config_path = parse_argv!(argv)
+
+      # Precedence: CLI > config file > built-in default. We auto-load
+      # config/hyperion.rb if present so operators can drop a file in their
+      # repo and have it take effect without having to remember -C.
+      config_path ||= DEFAULT_CONFIG_PATH if File.exist?(DEFAULT_CONFIG_PATH)
+      config = config_path ? Hyperion::Config.load(config_path) : Hyperion::Config.new
+      config.merge_cli!(cli_opts)
+
+      # Install logger early so every subsequent log call honours the operator's
+      # chosen format/level (config file or CLI) before anything else logs.
+      if config.log_level || config.log_format
+        Hyperion.logger = Hyperion::Logger.new(level: config.log_level, format: config.log_format)
+      end
+
+      # Propagate log_requests so every Connection picks it up via
+      # `Hyperion.log_requests?` without needing to thread it through
+      # Server/ThreadPool/Master plumbing. Default is ON; nil means "don't
+      # touch — fall through to the env/default chain in Hyperion.log_requests?".
+      Hyperion.log_requests = config.log_requests unless config.log_requests.nil?
+
+      # Enable YJIT before workers fork / connections start. Auto-on in
+      # production/staging gives operators the perf bump for free; explicit
+      # config.yjit (true/false) overrides the env-based default.
+      maybe_enable_yjit(config)
+
+      rackup = argv.first || 'config.ru'
+      abort("[hyperion] no such rackup file: #{rackup}") unless File.exist?(rackup)
+
+      if config.fiber_local_shim
+        Hyperion::FiberLocal.install!
+        Hyperion.logger.info { { message: 'FiberLocal shim installed' } }
+      end
+
+      app = load_rack_app(rackup)
+      app = wrap_admin_middleware(app, config)
+      workers = config.workers.zero? ? Etc.nprocessors : config.workers
+
+      if workers <= 1
+        run_single(config, app)
+      else
+        run_cluster(config, app, workers)
+      end
+    end
+
+    # Extracted from #run so the flag-to-cli_opts mapping can be unit-tested
+    # without booting a server. Returns [cli_opts, config_path]. Mutates argv
+    # in place (consumes flags, leaves the rackup path for the caller).
+    def self.parse_argv!(argv)
       cli_opts    = {}
       config_path = nil
 
@@ -61,6 +110,46 @@ module Hyperion
              'Run plain HTTP/1.1 connections under Async::Scheduler (required for hyperion-async-pg and other fiber-cooperative I/O; default off)') do |v|
           cli_opts[:async_io] = v
         end
+        o.on('--max-body-bytes BYTES', Integer,
+             'Maximum request body size in bytes (default 16777216 = 16 MiB)') do |n|
+          cli_opts[:max_body_bytes] = n
+        end
+        o.on('--max-header-bytes BYTES', Integer,
+             'Maximum total request-header size in bytes (default 65536 = 64 KiB)') do |n|
+          cli_opts[:max_header_bytes] = n
+        end
+        o.on('--max-pending COUNT', Integer,
+             'Maximum queued connections per worker before new accepts are rejected with 503 (default unbounded)') do |n|
+          cli_opts[:max_pending] = n
+        end
+        o.on('--max-request-read-seconds SECONDS', Float,
+             'Total wallclock budget for reading request line + headers + body (default 60.0; 0 disables)') do |n|
+          cli_opts[:max_request_read_seconds] = n
+        end
+        # Security-sensitive: read the token verbatim and never echo it back
+        # in any subsequent log/help line. argv is visible via `ps` on most
+        # systems; production deployments should prefer --admin-token-file.
+        o.on('--admin-token TOKEN',
+             "Bearer token for the /-/quit and /-/metrics admin endpoints. \
+WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production.") do |t|
+          cli_opts[:admin_token] = t
+        end
+        o.on('--admin-token-file PATH',
+             'Read the admin token from a file. File must NOT be world-readable (perms must mask 0o007).') do |p|
+          cli_opts[:admin_token] = read_admin_token_file(p)
+        end
+        o.on('--worker-max-rss-mb MB', Integer,
+             'Recycle a worker when its RSS exceeds MB megabytes (default unset; nil disables)') do |n|
+          cli_opts[:worker_max_rss_mb] = n
+        end
+        o.on('--idle-keepalive SECONDS', Float,
+             'Idle keep-alive timeout in seconds (default 5.0)') do |n|
+          cli_opts[:idle_keepalive] = n
+        end
+        o.on('--graceful-timeout SECONDS', Integer,
+             'Graceful shutdown deadline in seconds before SIGKILL (default 30)') do |n|
+          cli_opts[:graceful_timeout] = n
+        end
         o.on('-h', '--help', 'show help') do
           puts o
           exit 0
@@ -68,47 +157,7 @@ module Hyperion
       end
       parser.parse!(argv)
 
-      # Precedence: CLI > config file > built-in default. We auto-load
-      # config/hyperion.rb if present so operators can drop a file in their
-      # repo and have it take effect without having to remember -C.
-      config_path ||= DEFAULT_CONFIG_PATH if File.exist?(DEFAULT_CONFIG_PATH)
-      config = config_path ? Hyperion::Config.load(config_path) : Hyperion::Config.new
-      config.merge_cli!(cli_opts)
-
-      # Install logger early so every subsequent log call honours the operator's
-      # chosen format/level (config file or CLI) before anything else logs.
-      if config.log_level || config.log_format
-        Hyperion.logger = Hyperion::Logger.new(level: config.log_level, format: config.log_format)
-      end
-
-      # Propagate log_requests so every Connection picks it up via
-      # `Hyperion.log_requests?` without needing to thread it through
-      # Server/ThreadPool/Master plumbing. Default is ON; nil means "don't
-      # touch — fall through to the env/default chain in Hyperion.log_requests?".
-      Hyperion.log_requests = config.log_requests unless config.log_requests.nil?
-
-      # Enable YJIT before workers fork / connections start. Auto-on in
-      # production/staging gives operators the perf bump for free; explicit
-      # config.yjit (true/false) overrides the env-based default.
-      maybe_enable_yjit(config)
-
-      rackup = argv.first || 'config.ru'
-      abort("[hyperion] no such rackup file: #{rackup}") unless File.exist?(rackup)
-
-      if config.fiber_local_shim
-        Hyperion::FiberLocal.install!
-        Hyperion.logger.info { { message: 'FiberLocal shim installed' } }
-      end
-
-      app = load_rack_app(rackup)
-      app = wrap_admin_middleware(app, config)
-      workers = config.workers.zero? ? Etc.nprocessors : config.workers
-
-      if workers <= 1
-        run_single(config, app)
-      else
-        run_cluster(config, app, workers)
-      end
+      [cli_opts, config_path]
     end
 
     def self.run_single(config, app)
@@ -226,6 +275,28 @@ module Hyperion
       AdminMiddleware.new(app, token: config.admin_token)
     end
     private_class_method :wrap_admin_middleware
+
+    # Read the admin token from a file on disk. Refuses to load if the file
+    # is missing, unreadable, or world-readable — the whole point of using a
+    # file instead of `--admin-token` is to keep the token off argv (which
+    # `ps` exposes) and off other-user-readable storage. Trailing whitespace
+    # is stripped so operators can use `echo "$TOKEN" > /etc/hyperion-token`
+    # without inadvertently embedding a newline. Empty files abort.
+    def self.read_admin_token_file(path)
+      abort("[hyperion] admin token file not found: #{path}") unless File.file?(path)
+      abort("[hyperion] admin token file not readable: #{path}") unless File.readable?(path)
+
+      mode = File.stat(path).mode & 0o777
+      if (mode & 0o007).positive?
+        abort("[hyperion] admin token file #{path} is world-readable (mode #{format('%04o', mode)}); chmod 600")
+      end
+
+      token = File.read(path).strip
+      abort("[hyperion] admin token file is empty: #{path}") if token.empty?
+
+      token
+    end
+    private_class_method :read_admin_token_file
 
     # Warn loudly at boot if the C parser didn't load — operators running
     # production with the pure-Ruby fallback are paying ~2× CPU on parse-heavy

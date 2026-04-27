@@ -255,6 +255,17 @@ Three layers, in precedence order: explicit CLI flag > environment variable > `c
 | `--log-format FORMAT` | `auto` | `text` / `json` / `auto`. Auto: JSON when `RAILS_ENV`/`RACK_ENV` is `production`/`staging`, colored text on TTY, JSON otherwise. |
 | `--[no-]log-requests` | ON | Per-request access log. |
 | `--fiber-local-shim` | off | Patches `Thread#thread_variable_*` to fiber storage for older Rails idioms. |
+| `--[no-]yjit` | auto | Force YJIT on/off. Default: auto-on under `RAILS_ENV`/`RACK_ENV` = `production`/`staging`. |
+| `--[no-]async-io` | off | Run plain HTTP/1.1 connections under `Async::Scheduler`. Required for `hyperion-async-pg` on plain HTTP. TLS h1 / HTTP/2 always run under the scheduler regardless. |
+| `--max-body-bytes BYTES` | `16777216` (16 MiB) | Maximum request body size. |
+| `--max-header-bytes BYTES` | `65536` (64 KiB) | Maximum total request-header size. |
+| `--max-pending COUNT` | unbounded | Per-worker accept-queue cap before new connections are rejected with HTTP 503 + `Retry-After: 1`. |
+| `--max-request-read-seconds SECONDS` | `60` | Total wallclock budget for reading request line + headers + body for ONE request. Slowloris defence. |
+| `--admin-token TOKEN` | unset | Bearer token for `POST /-/quit` and `GET /-/metrics`. **Production: prefer `--admin-token-file` — argv is visible via `ps`.** |
+| `--admin-token-file PATH` | unset | Read the admin token from a file. Refuses to load if the file is missing or world-readable (mode must mask `0o007`). |
+| `--worker-max-rss-mb MB` | unset | Master gracefully recycles a worker once its RSS exceeds this many megabytes. nil = disabled. |
+| `--idle-keepalive SECONDS` | `5` | Keep-alive idle timeout. Connection closes after this many seconds of inactivity. |
+| `--graceful-timeout SECONDS` | `30` | Shutdown deadline before SIGKILL is delivered to a worker that hasn't drained. |
 
 ### Environment variables
 
