@@ -543,6 +543,60 @@ static VALUE cbuild_access_line(VALUE self,
 }
 #undef CAT_LIT
 
+/* Hyperion::CParser.upcase_underscore(name) -> "HTTP_<UPCASED_UNDERSCORED>"
+ *
+ * Single-allocation replacement for `"HTTP_#{name.upcase.tr('-', '_')}"`.
+ * Hot path on the Rack adapter: every uncached request header (any
+ * `X-*` custom header) hits this on every request, and the Ruby version
+ * spawns three String allocations (the upcase result, the tr result, and the
+ * "HTTP_..." interpolation) plus a per-byte loop in tr.
+ *
+ * We allocate one Ruby String of length 5 + name.bytesize, fill it in a
+ * single byte loop, return it. ASCII letters get OR'd with 0x20 inverted
+ * (i.e. cleared bit 5 to upcase 'a'..'z'); '-' becomes '_'; everything else
+ * passes through (header names are ASCII per RFC 9110, but multi-byte UTF-8
+ * bytes pass through bytewise unmolested rather than crashing).
+ *
+ * Encoding is set to US-ASCII because Ruby's String#upcase on an ASCII-only
+ * input returns a US-ASCII string, and the env-key lookup downstream is
+ * encoding-agnostic anyway.
+ */
+static VALUE cupcase_underscore(VALUE self, VALUE rb_name) {
+    (void)self;
+    Check_Type(rb_name, T_STRING);
+
+    const char *src = RSTRING_PTR(rb_name);
+    long src_len    = RSTRING_LEN(rb_name);
+
+    /* Single allocation: 5 prefix bytes + N source bytes. */
+    VALUE out = rb_str_new(NULL, 5 + src_len);
+    char *dst = RSTRING_PTR(out);
+
+    dst[0] = 'H';
+    dst[1] = 'T';
+    dst[2] = 'T';
+    dst[3] = 'P';
+    dst[4] = '_';
+
+    for (long i = 0; i < src_len; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c >= 'a' && c <= 'z') {
+            dst[5 + i] = (char)(c - 32);
+        } else if (c == '-') {
+            dst[5 + i] = '_';
+        } else {
+            dst[5 + i] = (char)c;
+        }
+    }
+
+    rb_enc_associate(out, rb_usascii_encoding());
+    /* Keep rb_name live across the loop above. RSTRING_PTR returns an
+     * interior pointer that becomes invalid if the GC moves the source
+     * String — unlikely on this tight path, but cheap insurance. */
+    RB_GC_GUARD(rb_name);
+    return out;
+}
+
 void Init_hyperion_http(void) {
     install_settings();
 
@@ -557,6 +611,8 @@ void Init_hyperion_http(void) {
                                cbuild_response_head, 6);
     rb_define_singleton_method(rb_cCParser, "build_access_line",
                                cbuild_access_line, 9);
+    rb_define_singleton_method(rb_cCParser, "upcase_underscore",
+                               cupcase_underscore, 1);
 
     id_new             = rb_intern("new");
     id_downcase        = rb_intern("downcase");

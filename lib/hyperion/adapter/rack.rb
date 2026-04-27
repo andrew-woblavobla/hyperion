@@ -48,6 +48,17 @@ module Hyperion
         }
       )
 
+      # Whether Hyperion::CParser.upcase_underscore is available. Probed lazily
+      # at first use (CParser is required after this file, so an eager check
+      # at load time would always be false). Memoised in a class-level ivar to
+      # keep the hot path branchless.
+      def self.c_upcase_available?
+        return @c_upcase_available unless @c_upcase_available.nil?
+
+        @c_upcase_available = defined?(::Hyperion::CParser) &&
+                              ::Hyperion::CParser.respond_to?(:upcase_underscore)
+      end
+
       class << self
         # Pre-allocate `n` env-hash and rack-input objects in master before
         # fork. Children inherit the populated free-list via copy-on-write —
@@ -122,8 +133,14 @@ module Hyperion
           env['rack.run_once']     = false
           env['SCRIPT_NAME']       = ''
 
+          # Header-name → Rack env-key conversion. Cache covers the 16 most
+          # common names; uncached headers (X-* customs, vendor-specific) flow
+          # through CParser.upcase_underscore (single C-level allocation) when
+          # the extension is built, else the pure-Ruby triple-allocation path.
+          c_upcase = Rack.c_upcase_available?
           request.headers.each do |name, value|
-            key = HTTP_KEY_CACHE[name] || "HTTP_#{name.upcase.tr('-', '_')}"
+            key = HTTP_KEY_CACHE[name] ||
+                  (c_upcase ? ::Hyperion::CParser.upcase_underscore(name) : "HTTP_#{name.upcase.tr('-', '_')}")
             env[key] = value
           end
 

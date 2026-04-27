@@ -2,11 +2,13 @@
 
 ## [1.6.0] - 2026-04-27
 
-Architectural rewrite of the HTTP/2 outbound write path — per-stream send queue + dedicated writer fiber replace the global `@send_mutex`.
+Two parallel improvements landing in 1.6.0:
+1. Three small C-extension additions on the request hot path (sibling commit — see "Performance" below).
+2. Architectural rewrite of the HTTP/2 outbound write path — per-stream send queue + dedicated writer fiber replace the global `@send_mutex` (see "HTTP/2 writer architecture" below).
 
-> Note: 1.6.0 is bundling a separate set of C-extension changes for the parser hot path (sibling commit). Once both land, the CHANGELOG sub-sections will be merged before tag.
+These are independent and can be reviewed / reverted separately. The CHANGELOG sub-sections will be merged before tag.
 
-### Changed
+### HTTP/2 writer architecture (Changed)
 - **`Hyperion::Http2Handler` now uses a per-connection writer fiber instead of a single send Mutex.** Pre-1.6.0 every framer write — HEADERS, DATA, RST_STREAM, GOAWAY — ran inside one `@send_mutex.synchronize { socket.write(...) }`. That capped per-connection h2 throughput at "one socket-write at a time" regardless of how many streams were concurrently in flight: a slow socket (kernel send buffer full, peer reading slowly) blocked every other stream's writes too. 1.6.0 splits the path:
   - **Encode + frame format** (HPACK encoding, frame layout) is fast (microseconds, in-memory) and stays serialized on the calling fiber via `WriterContext#encode_mutex`. HPACK state is connection-scoped and stateful across HEADERS frames; per-stream wire order (HEADERS → DATA → END_STREAM) must also be preserved. Holding the encode mutex across a `stream.send_*` call satisfies both.
   - **Bytes-to-socket** is owned by a dedicated `run_writer_loop` fiber spawned per connection. Encoder fibers hand bytes off via `WriterContext#enqueue` (non-blocking, signals an `Async::Notification`); the writer pops chunks from the queue and writes them. Only this fiber ever calls `socket.write`, satisfying SSLSocket's "no concurrent writes from different fibers" constraint.
@@ -14,7 +16,7 @@ Architectural rewrite of the HTTP/2 outbound write path — per-stream send queu
 - **Per-connection backpressure cap** (`MAX_PER_CONN_PENDING_BYTES = 16 MiB`). Pathological clients that read very slowly could otherwise let the queue grow without bound. `WriterContext#enqueue` parks the encoder on `@drained_notify` once `@pending_bytes` exceeds the cap; the writer signals `@drained_notify` after each drain pass.
 - **Coordinated shutdown**: when `Http2Handler#serve` exits (clean close, peer disconnect, or protocol error), the `ensure` block sets `WriterContext#shutdown!` and `writer_task.wait`s for the final drain BEFORE closing the socket. Order matters — closing the socket first would discard final RST_STREAM / GOAWAY / END_STREAM frames sitting in the queue.
 
-### Added
+### HTTP/2 writer architecture (Added)
 - **`Hyperion::Http2Handler::SendQueueIO`** — IO-shaped wrapper passed to `Protocol::HTTP2::Framer` in place of the raw socket. `read` is a passthrough (single-reader on the connection fiber); `write` enqueues onto the connection-wide queue. Reports `closed?` from the underlying socket so framer EOF detection still works.
 - **`Hyperion::Http2Handler::WriterContext`** — holds the per-connection queue, the encode mutex, the send/drained notifications, and the byte-budget counters. One instance per connection; lives for the lifetime of `Http2Handler#serve`.
 - **9 new specs in `spec/hyperion/http2_writer_loop_spec.rb`**:
@@ -25,12 +27,22 @@ Architectural rewrite of the HTTP/2 outbound write path — per-stream send queu
   - Shutdown drains all queued frames before the writer fiber exits; shutdown with an empty queue exits cleanly (2).
 - **`bench/h2_streams.sh`** — `h2load`-driven recipe (`-c 1 -m 100 -n 5000`) for measuring per-connection multi-stream rps. Skips with a clear message if `h2load` isn't on PATH; emits a one-line JSON summary so cross-version diffs are easy.
 
-### Migration
+### HTTP/2 writer architecture (Migration)
 - No public-API changes. Operators do not need to touch config or restart with new flags. The architectural change is internal to `Http2Handler`.
 
-### Notes for the curious
+### HTTP/2 writer architecture (Notes)
 - HPACK's dynamic-table state is shared across all streams on a connection (per RFC 7541 §2.3.2.1). That is why we still serialize encode work — two fibers calling `stream.send_headers` concurrently would corrupt the encoder's table state. The mutex is now microseconds-of-CPU rather than "however long the socket takes to drain N MB."
 - `Async::Notification#signal` is a no-op when there are no waiters (signals are not buffered). The writer loop accordingly re-checks `writer_done? && queue_empty?` before parking, so a `shutdown!` call that races a `wait_for_signal` doesn't deadlock.
+
+### Performance
+- **`Hyperion::CParser.upcase_underscore(name)` — C-level Rack header-name normalizer.** Replaces the per-uncached-header `"HTTP_#{name.upcase.tr('-', '_')}"` allocation in `Adapter::Rack#build_env`. Single allocation (5 prefix bytes + N source bytes), single byte loop, no Ruby intermediates. Microbench (5 typical X-* names per call): 460k i/s Ruby → 2.21M i/s C, **4.80×** faster (2.17 μs → 452 ns/iter). On a header-heavy hello-world rackup with 8 X-Custom-* request headers + 9 response headers, headline throughput went from ~16.6k r/s to ~18.0k r/s wrk-driven (~+8.5%, averaged across 3 trials). The 16-name `HTTP_KEY_CACHE` still short-circuits the common headers; this only fires on uncached customs.
+- **`Hyperion::CParser.chunked_body_complete?(buffer, body_start)` — chunked-transfer body completion check in C.** Replaces the pure-Ruby walker in `Connection#chunked_body_complete?` with a C-level loop that scans CRLF boundaries, decodes hex sizes, and advances the cursor without per-iteration `String#index` / `byteslice` / `split` allocations. Returns `[complete?, last_safe_offset]` so the caller can persist parse progress across read boundaries (handy for pipelined / streaming buffers, even though Connection currently only consults the boolean). Microbench (3 mixed buffers per iter): 283k i/s Ruby → 3.73M i/s C, **13.19×** faster (3.54 μs → 268 ns/iter). Profit is small in production because chunked uploads are rare, but the path now matches the rest of the parser in cost shape.
+- **`Hyperion::CParser.build_access_line_colored(...)` — TTY-coloured access-log builder in C.** Mirrors `build_access_line` with the green ANSI escape pair `\e[32mINFO \e[0m` baked into the level label. Ten extra bytes per line, single allocation. The pre-1.6.0 `Logger#access` path fell back to the slower Ruby builder whenever `@colorize` was on (i.e. local TTY / dev runs); now the C builder fires there too. Microbench: 1.78M i/s Ruby → 2.90M i/s C, **1.63×** faster (561 ns → 345 ns per line). Smaller win than the others — the Ruby builder was already a single interpolation — but closes the parity gap so dev-loop `tail -f` doesn't pay an avoidable Ruby tax.
+
+### Added
+- **9 new specs in `spec/hyperion/c_upcase_underscore_spec.rb`** plus a fallback-parity assertion that flips `Hyperion::Adapter::Rack.@c_upcase_available` to walk both the C and Ruby branches in one process. Covers lowercase / uppercase / multi-dash / empty / single-byte / non-ASCII byte-pass-through / digit-preservation / Ruby-equivalence on a panel of canonical custom names / encoding (US-ASCII).
+- **13 new specs in `spec/hyperion/c_chunked_body_complete_spec.rb`** including a fallback-parity assertion against the original Ruby walker. Covers single chunk, multi-chunk, trailers, partial CRLF, partial size token, partial chunk data, chunk extensions, body_start offset, last-safe-cursor reporting on partial buffers, ArgumentError on out-of-range body_start, and a panel of mixed inputs that must agree byte-for-byte with the Ruby walker.
+- **9 new specs in `spec/hyperion/c_access_line_colored_spec.rb`** plus a Logger#access integration test that constructs a TTY-faking IO and asserts the green INFO label appears in the emitted line. Covers text + json formats, query nil/empty/quote-trigger, remote_addr nil, ANSI absence in JSON, and byte-for-byte parity against a hand-rolled Ruby colored builder.
 
 ## [1.5.0] - 2026-04-27
 
