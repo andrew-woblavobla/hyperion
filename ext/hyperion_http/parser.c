@@ -597,6 +597,143 @@ static VALUE cupcase_underscore(VALUE self, VALUE rb_name) {
     return out;
 }
 
+/* Hyperion::CParser.chunked_body_complete?(buffer, body_start)
+ *   -> [complete?, end_offset]
+ *
+ * Walks chunked-transfer framing in `buffer` starting at byte offset
+ * `body_start`. Returns a 2-element array:
+ *   [true,  end_offset] — chunked body fully buffered; end_offset is the
+ *                         byte just after the trailer CRLF (where pipelined
+ *                         bytes from a follow-on request would begin).
+ *   [false, last_safe]  — body is not yet complete; last_safe is the
+ *                         furthest cursor we successfully advanced to,
+ *                         useful as a hint for incremental parsing.
+ *
+ * Mirrors Connection#chunked_body_complete? in pure Ruby — see lib/hyperion/
+ * connection.rb. Trailing whitespace after the size token (e.g. "5 ; ext\r\n")
+ * is permitted as a permissive parse to match the upstream Ruby `.strip`.
+ */
+static VALUE cchunked_body_complete(VALUE self, VALUE rb_buffer, VALUE rb_body_start) {
+    (void)self;
+    Check_Type(rb_buffer, T_STRING);
+
+    const char *data = RSTRING_PTR(rb_buffer);
+    long len         = RSTRING_LEN(rb_buffer);
+    long cursor      = NUM2LONG(rb_body_start);
+
+    if (cursor < 0 || cursor > len) {
+        rb_raise(rb_eArgError, "body_start out of range");
+    }
+
+    long last_safe = cursor;
+    VALUE result   = rb_ary_new_capa(2);
+
+    while (1) {
+        /* Find the next CRLF starting at cursor. */
+        long line_end = -1;
+        for (long i = cursor; i + 1 < len; i++) {
+            if (data[i] == '\r' && data[i + 1] == '\n') {
+                line_end = i;
+                break;
+            }
+        }
+        if (line_end < 0) {
+            rb_ary_push(result, Qfalse);
+            rb_ary_push(result, LONG2NUM(last_safe));
+            RB_GC_GUARD(rb_buffer);
+            return result;
+        }
+
+        /* Parse the size token: hex digits up to ';' or whitespace, optional
+         * chunk extension after ';' which we ignore wholesale. */
+        long tok_start = cursor;
+        long tok_end   = line_end;
+        for (long i = cursor; i < line_end; i++) {
+            if (data[i] == ';') { tok_end = i; break; }
+        }
+        /* Trim leading/trailing ASCII whitespace from the token. */
+        while (tok_start < tok_end &&
+               (data[tok_start] == ' ' || data[tok_start] == '\t')) {
+            tok_start++;
+        }
+        while (tok_end > tok_start &&
+               (data[tok_end - 1] == ' ' || data[tok_end - 1] == '\t')) {
+            tok_end--;
+        }
+        if (tok_end <= tok_start) {
+            /* Empty size token — incomplete frame. */
+            rb_ary_push(result, Qfalse);
+            rb_ary_push(result, LONG2NUM(last_safe));
+            RB_GC_GUARD(rb_buffer);
+            return result;
+        }
+
+        /* Validate + decode hex. */
+        unsigned long size = 0;
+        for (long i = tok_start; i < tok_end; i++) {
+            unsigned char c = (unsigned char)data[i];
+            unsigned int digit;
+            if (c >= '0' && c <= '9') {
+                digit = c - '0';
+            } else if (c >= 'a' && c <= 'f') {
+                digit = 10 + (c - 'a');
+            } else if (c >= 'A' && c <= 'F') {
+                digit = 10 + (c - 'A');
+            } else {
+                /* Non-hex byte: incomplete/malformed. Match the Ruby
+                 * regex `/\A\h+\z/` semantics — return false, advance no
+                 * further. The caller will read more bytes and retry. */
+                rb_ary_push(result, Qfalse);
+                rb_ary_push(result, LONG2NUM(last_safe));
+                RB_GC_GUARD(rb_buffer);
+                return result;
+            }
+            size = (size << 4) | digit;
+        }
+
+        cursor = line_end + 2;
+
+        if (size == 0) {
+            /* Final chunk — walk trailer headers until we hit "\r\n\r\n"
+             * (i.e. an empty trailer line directly after the size line). */
+            while (1) {
+                long nl = -1;
+                for (long i = cursor; i + 1 < len; i++) {
+                    if (data[i] == '\r' && data[i + 1] == '\n') {
+                        nl = i;
+                        break;
+                    }
+                }
+                if (nl < 0) {
+                    rb_ary_push(result, Qfalse);
+                    rb_ary_push(result, LONG2NUM(last_safe));
+                    RB_GC_GUARD(rb_buffer);
+                    return result;
+                }
+                if (nl == cursor) {
+                    /* Empty line — body complete. */
+                    rb_ary_push(result, Qtrue);
+                    rb_ary_push(result, LONG2NUM(nl + 2));
+                    RB_GC_GUARD(rb_buffer);
+                    return result;
+                }
+                cursor = nl + 2;
+            }
+        }
+
+        /* Need cursor + size + 2 bytes (chunk data + trailing CRLF). */
+        if ((unsigned long)(len - cursor) < size + 2) {
+            rb_ary_push(result, Qfalse);
+            rb_ary_push(result, LONG2NUM(last_safe));
+            RB_GC_GUARD(rb_buffer);
+            return result;
+        }
+
+        cursor += (long)size + 2;
+        last_safe = cursor;
+    }
+}
+
 void Init_hyperion_http(void) {
     install_settings();
 
@@ -613,6 +750,8 @@ void Init_hyperion_http(void) {
                                cbuild_access_line, 9);
     rb_define_singleton_method(rb_cCParser, "upcase_underscore",
                                cupcase_underscore, 1);
+    rb_define_singleton_method(rb_cCParser, "chunked_body_complete?",
+                               cchunked_body_complete, 2);
 
     id_new             = rb_intern("new");
     id_downcase        = rb_intern("downcase");

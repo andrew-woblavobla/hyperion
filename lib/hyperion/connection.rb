@@ -287,9 +287,29 @@ module Hyperion
 
     # Walks chunked framing in `buffer` starting at `body_start` and
     # returns true once the final 0-sized chunk (and trailer terminator)
-    # is fully buffered. Mirrors the parser's dechunk walk; Phase 4's C
-    # parser folds these together via incremental parsing.
+    # is fully buffered. The C extension folds the size-line scan + hex
+    # decode + chunk advance into a single tight loop with no per-iteration
+    # Ruby allocation; the pure-Ruby fallback below preserves the original
+    # semantics for environments where the C extension didn't build.
     def chunked_body_complete?(buffer, body_start)
+      if self.class.c_chunked_available?
+        ::Hyperion::CParser.chunked_body_complete?(buffer, body_start).first
+      else
+        chunked_body_complete_ruby?(buffer, body_start)
+      end
+    end
+
+    # Whether Hyperion::CParser.chunked_body_complete? is available. Probed
+    # lazily at first use; memoised in a class-level ivar to keep the
+    # per-request hot path branchless.
+    def self.c_chunked_available?
+      return @c_chunked_available unless @c_chunked_available.nil?
+
+      @c_chunked_available = defined?(::Hyperion::CParser) &&
+                             ::Hyperion::CParser.respond_to?(:chunked_body_complete?)
+    end
+
+    def chunked_body_complete_ruby?(buffer, body_start)
       cursor = body_start
       loop do
         line_end = buffer.index("\r\n", cursor)
