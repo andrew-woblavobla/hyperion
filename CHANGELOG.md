@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.3.1] - 2026-04-27
+
+Documentation + observability follow-ups for the 1.3.0 `--async-io` feature. No behaviour changes to existing code paths.
+
+### Added
+- **Dispatch-path metrics** — `Hyperion::Server` now bumps two new counters so operators can verify which path served their requests:
+  - `:requests_threadpool_dispatched` — HTTP/1.1 connection handed to the worker pool (or served inline in `start_raw_loop` when `thread_count: 0`).
+  - `:requests_async_dispatched` — HTTP/1.1 connection served inline on the accept-loop fiber under `--async-io`.
+  HTTP/2 streams are not bucketed (per-stream counters cover them); the rare TLS+`thread_count: 0` config is also un-counted to avoid misclassification.
+- **`docs/MIGRATING_FROM_PUMA.md`** — new "Fiber-cooperative I/O for PG-bound apps" section near the top, with the Linux 50 ms `pg_sleep` bench summary and the three-prerequisite checklist (`async_io: true` + `hyperion-async-pg` + fiber-aware pool).
+- **README** — `async_io` documented in the config-DSL example block; the new dispatch-path counters listed in the Metrics table.
+- **Specs** — two new examples in `spec/hyperion/server_async_io_spec.rb`:
+  - `async_io: true` + `thread_count: 0` boots cleanly and serves a request under a scheduler.
+  - Thread-decoupling proof: 5 concurrent requests against a 200 ms fiber-yielding handler complete in <600 ms wall (vs. ~1.0 s if serialized), locking in the architectural promise from the README.
+
+### Changed
+- N/A — no behavioural changes; metrics are additive, docs are additive.
+
+### Fixed
+- N/A.
+
 ## [1.3.0] - 2026-04-27
 
 Adds the structural moat for fiber-cooperative I/O. No breaking changes.
