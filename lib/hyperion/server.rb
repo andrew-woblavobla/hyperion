@@ -42,7 +42,7 @@ module Hyperion
 
     def initialize(app:, host: '127.0.0.1', port: 9292, read_timeout: DEFAULT_READ_TIMEOUT_SECONDS,
                    tls: nil, thread_count: DEFAULT_THREAD_COUNT, max_pending: nil,
-                   max_request_read_seconds: 60, h2_settings: nil, async_io: false)
+                   max_request_read_seconds: 60, h2_settings: nil, async_io: nil)
       @host                     = host
       @port                     = port
       @app                      = app
@@ -111,7 +111,10 @@ module Hyperion
       if @tls || @async_io
         # TLS path: ALPN may pick `h2`, and h2 spawns one fiber per stream
         # inside Http2Handler. Keep the Async wrapper so the scheduler is
-        # available for those fibers and for handshake yields.
+        # available for those fibers and for handshake yields. Plain
+        # HTTP/1.1-over-TLS dispatch is also handled inline on the calling
+        # fiber by default in 1.4.0+ (see #dispatch) — fiber-cooperative
+        # libraries (async-pg, async-redis) work without --async-io.
         #
         # async_io: true: operator opt-in for plain HTTP/1.1. The Async wrap
         # is required when callers want fiber cooperative I/O — e.g.
@@ -120,9 +123,10 @@ module Hyperion
         # OS thread can serve N concurrent in-flight DB queries instead of 1.
         start_async_loop
       else
-        # Plain HTTP/1.1, async_io: false (default): the worker thread owns
-        # each connection for its lifetime, so the Async wrapper adds zero
-        # value (no fibers ever run on this loop's task). Skip it — pure
+        # Plain HTTP/1.1, async_io: nil (default with no TLS) or
+        # async_io: false (explicit opt-out): the worker thread owns each
+        # connection for its lifetime, so the Async wrapper adds zero value
+        # (no fibers ever run on this loop's task). Skip it — pure
         # IO.select + accept_nonblock shaves measurable overhead off the
         # accept hot path.
         start_raw_loop
@@ -187,19 +191,26 @@ module Hyperion
         # counters live inside Http2Handler; we don't bump either of the
         # H1 dispatch buckets here — neither fits the h2 model cleanly.
         Http2Handler.new(app: @app, thread_pool: @thread_pool, h2_settings: @h2_settings).serve(socket)
-      elsif @async_io
-        # async_io plain HTTP/1.1: serve inline on the calling fiber so the
-        # request runs *under* Async::Scheduler. This is what makes
-        # hyperion-async-pg (and other Async-aware libraries) actually
-        # cooperate — each fiber yields the OS thread on socket waits, so
-        # one thread can serve N concurrent in-flight DB queries. The
-        # thread pool is intentionally bypassed here: handing the socket
-        # to a worker thread strips the scheduler context.
+      elsif inline_h1_dispatch?
+        # Inline-on-fiber HTTP/1.1 dispatch. Two ways to land here:
+        #   1. async_io: true — operator explicitly opted into fiber I/O on
+        #      the plain HTTP/1.1 path.
+        #   2. async_io: nil (default) AND TLS configured — TLS already
+        #      runs the Async accept loop for ALPN handshake + h2 streams,
+        #      so the scheduler is current on this fiber. Handing the
+        #      socket to a worker thread would strip the scheduler context
+        #      for no perf benefit (we paid the Async-loop cost already)
+        #      and would defeat hyperion-async-pg / async-redis on the
+        #      TLS h1 path.
+        # Operators who specifically want TLS+threadpool (e.g. CPU-heavy
+        # handlers competing for OS threads) can pass async_io: false to
+        # force the pool branch below.
         Hyperion.metrics.increment(:requests_async_dispatched)
         Connection.new.serve(socket, @app, max_request_read_seconds: @max_request_read_seconds)
       elsif @thread_pool
-        # HTTP/1.1 (e.g. TLS-wrapped after ALPN picked http/1.1): hand the
-        # connection to a worker thread. The fiber that called dispatch
+        # HTTP/1.1 default plain-HTTP path, OR explicit async_io: false on
+        # TLS (operator opted out of inline-on-fiber dispatch). Hand the
+        # connection to a worker thread; the fiber that called dispatch
         # returns immediately. On overflow, reject with 503 + close.
         if @thread_pool.submit_connection(socket, @app,
                                           max_request_read_seconds: @max_request_read_seconds)
@@ -208,12 +219,27 @@ module Hyperion
           reject_connection(socket)
         end
       else
-        # No pool (thread_count: 0) on the TLS / async-wrap path. Rare
-        # config — neither dispatch bucket fits cleanly. Leave un-counted
-        # rather than misclassify; the request still shows up in
-        # :requests_total via Connection.
+        # No pool (thread_count: 0) on the TLS / async-wrap path with
+        # async_io: false. Rare config — neither dispatch bucket fits
+        # cleanly. Leave un-counted rather than misclassify; the request
+        # still shows up in :requests_total via Connection.
         Connection.new.serve(socket, @app, max_request_read_seconds: @max_request_read_seconds)
       end
+    end
+
+    # Decide whether to serve HTTP/1.1 inline on the calling fiber instead
+    # of hopping through the worker thread pool. The matrix:
+    #   async_io == true       → inline always (plain h1 + TLS h1).
+    #   async_io == nil + TLS  → inline (TLS already runs Async loop, so
+    #                            the scheduler is current; preserve it).
+    #   async_io == nil + plain → pool (pure HTTP/1.1 fast path; no scheduler).
+    #   async_io == false       → pool always (explicit opt-out).
+    def inline_h1_dispatch?
+      return true if @async_io == true
+      return false if @async_io == false
+
+      # @async_io.nil? — auto: inline on TLS, pool on plain.
+      !@tls.nil?
     end
 
     # Backpressure rejection. Emits a pre-built 503 + closes the socket.

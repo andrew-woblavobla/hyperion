@@ -52,10 +52,22 @@ RSpec.describe Hyperion::Server, 'async_io flag' do
     end
   end
 
-  context 'with default async_io: false (perf-bypass)' do
+  context 'with default async_io: nil and no TLS (perf-bypass)' do
     it 'serves the request without a fiber scheduler current in the handler' do
       server = described_class.new(app: probe_app, host: '127.0.0.1', port: port,
                                    thread_count: 0)
+      server.listen
+      response = serve_one_request(server, port)
+      expect(response.code).to eq('200')
+      expect(response.body).to eq('ok')
+      expect(scheduler_probe[:saw_scheduler]).to be(false)
+    end
+  end
+
+  context 'with explicit async_io: false and no TLS (forced opt-out)' do
+    it 'serves the request without a fiber scheduler current in the handler' do
+      server = described_class.new(app: probe_app, host: '127.0.0.1', port: port,
+                                   thread_count: 0, async_io: false)
       server.listen
       response = serve_one_request(server, port)
       expect(response.code).to eq('200')

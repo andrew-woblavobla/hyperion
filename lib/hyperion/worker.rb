@@ -20,7 +20,7 @@ module Hyperion
                    thread_count: Server::DEFAULT_THREAD_COUNT,
                    config: nil, worker_index: 0, listener: nil,
                    max_pending: nil, max_request_read_seconds: 60,
-                   h2_settings: nil, async_io: false)
+                   h2_settings: nil, async_io: nil)
       @host                     = host
       @port                     = port
       @app                      = app
