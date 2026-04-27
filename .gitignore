@@ -13,3 +13,7 @@ ext/**/*.so
 ext/**/Makefile
 ext/**/mkmf.log
 lib/hyperion_http/
+
+# bench output
+bench/keepalive_memory_results/
+keepalive_memory_results/
