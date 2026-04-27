@@ -105,7 +105,12 @@ Three things must all be true to get this win:
 
 Skip any of these and you get parity with Puma at the same `-t`. Run the bench yourself: `MODE=async DATABASE_URL=... PG_POOL_SIZE=200 bundle exec hyperion --async-io -t 5 bench/pg_concurrent.ru` (in the [hyperion-async-pg](https://github.com/andrew-woblavobla/hyperion-async-pg) repo).
 
-> **TLS + async-pg note.** TLS / HTTPS already runs each connection on a fiber under `Async::Scheduler` (the TLS path always uses `start_async_loop` for the ALPN handshake). But the post-handshake `app.call` for HTTP/1.1-over-TLS still hops through the worker thread pool by default. To get fiber-cooperative I/O on the TLS h1 path too — i.e. async-pg yielding while the PG socket is parked — pair `--tls-cert/--tls-key` with `--async-io`. h2 streams are always fiber-dispatched and benefit from async-pg without the flag.
+> **TLS + async-pg note (1.4.0+).** TLS / HTTPS already runs each connection on a fiber under `Async::Scheduler` (the TLS path always uses `start_async_loop` for the ALPN handshake). **As of 1.4.0, the post-handshake `app.call` for HTTP/1.1-over-TLS dispatches inline on the calling fiber by default** — so fiber-cooperative libraries (`hyperion-async-pg`, `async-redis`) work on the TLS h1 path without needing `--async-io`. The Async-loop cost is already paid for the handshake; running the handler under the existing scheduler just preserves that context instead of stripping it on a thread-pool hop. h2 streams are always fiber-dispatched and benefit from async-pg without the flag.
+>
+> Operators who specifically want **TLS + threadpool dispatch** (e.g. CPU-heavy handlers competing for OS threads, where you'd rather not pay fiber yields and want true OS-thread parallelism on a synchronous handler) can pass `async_io: false` in the config to force the pool branch back on. The three-way `async_io` setting:
+> - `nil` (default): plain HTTP/1.1 → pool, TLS h1 → inline.
+> - `true`: plain HTTP/1.1 → inline, TLS h1 → inline (force fiber dispatch everywhere; needed for `hyperion-async-pg` on plain HTTP).
+> - `false`: plain HTTP/1.1 → pool, TLS h1 → pool (explicit opt-out for TLS+threadpool).
 
 ### CPU-bound JSON workload
 
@@ -266,7 +271,7 @@ log_requests true
 
 fiber_local_shim false
 
-async_io false  # When true, the plain HTTP/1.1 accept loop runs each connection on a fiber under Async::Scheduler instead of handing it to a worker thread. Required for fiber-cooperative I/O (e.g. hyperion-async-pg). ~5% throughput hit on hello-world; in exchange one OS thread serves N concurrent in-flight DB queries on wait-bound workloads. TLS / HTTP/2 paths always use the async loop and ignore this flag.
+async_io nil    # Three-way (1.4.0+): nil (default, auto: inline-on-fiber for TLS h1, pool hop for plain HTTP/1.1), true (force inline-on-fiber everywhere — required for hyperion-async-pg on plain HTTP/1.1), false (force pool hop everywhere — explicit opt-out for TLS+threadpool with CPU-heavy handlers). ~5% throughput hit on hello-world when inline; in exchange one OS thread serves N concurrent in-flight DB queries on wait-bound workloads. TLS / HTTP/2 accept loops always run under Async::Scheduler regardless of this flag.
 
 before_fork do
   ActiveRecord::Base.connection_handler.clear_all_connections! if defined?(ActiveRecord)
