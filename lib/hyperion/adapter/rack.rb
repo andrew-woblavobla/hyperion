@@ -138,7 +138,17 @@ module Hyperion
 
           if host_header.start_with?('[')
             close = host_header.index(']')
-            return [host_header, '80'] unless close
+            # Malformed bracketed IPv6 (no closing bracket): we used to return
+            # the raw garbage as SERVER_NAME, which then leaked into Rack env
+            # where downstream URL generators / loggers / SSRF allow-lists
+            # would trust attacker-controlled bytes. Fail closed to a safe
+            # default and bump a counter so operators can alert on volume.
+            # No raise — Rack apps don't expect Hyperion's adapter to throw
+            # on header-parse failures, so we degrade gracefully instead.
+            unless close
+              Hyperion.metrics.increment(:malformed_host_header)
+              return %w[localhost 80]
+            end
 
             name = host_header[0..close]
             rest = host_header[(close + 1)..]

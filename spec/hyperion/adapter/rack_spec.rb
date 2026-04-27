@@ -186,4 +186,77 @@ RSpec.describe Hyperion::Adapter::Rack do
     expect(captured['SERVER_NAME']).to eq('[::1]')
     expect(captured['SERVER_PORT']).to eq('9292')
   end
+
+  it 'parses plain IPv4 host with port' do
+    req = Hyperion::Request.new(
+      method: 'GET',
+      path: '/',
+      query_string: '',
+      http_version: 'HTTP/1.1',
+      headers: { 'host' => '127.0.0.1:8080' },
+      body: ''
+    )
+    captured = nil
+    app = lambda do |env|
+      captured = env
+      [200, {}, []]
+    end
+
+    described_class.call(app, req)
+
+    expect(captured['SERVER_NAME']).to eq('127.0.0.1')
+    expect(captured['SERVER_PORT']).to eq('8080')
+  end
+
+  it 'parses bare hostname without port and defaults to 80' do
+    req = Hyperion::Request.new(
+      method: 'GET',
+      path: '/',
+      query_string: '',
+      http_version: 'HTTP/1.1',
+      headers: { 'host' => 'example.com' },
+      body: ''
+    )
+    captured = nil
+    app = lambda do |env|
+      captured = env
+      [200, {}, []]
+    end
+
+    described_class.call(app, req)
+
+    expect(captured['SERVER_NAME']).to eq('example.com')
+    expect(captured['SERVER_PORT']).to eq('80')
+  end
+
+  # Regression: pre-1.5.0, a malformed bracketed IPv6 (no closing bracket)
+  # was returned as-is in SERVER_NAME, leaking attacker-controlled bytes
+  # into Rack env where URL generators / SSRF allow-lists / log lines would
+  # trust them. The adapter must fail closed to a safe default and bump a
+  # metric so operators can alert on volume — without raising, since Rack
+  # apps don't expect a server adapter to throw on header parse failures.
+  it 'falls back to localhost:80 and bumps :malformed_host_header on bracketed IPv6 without closing bracket' do
+    Hyperion.metrics.reset!
+    before = Hyperion.stats[:malformed_host_header] || 0
+
+    req = Hyperion::Request.new(
+      method: 'GET',
+      path: '/',
+      query_string: '',
+      http_version: 'HTTP/1.1',
+      headers: { 'host' => '[::1' },
+      body: ''
+    )
+    captured = nil
+    app = lambda do |env|
+      captured = env
+      [200, {}, []]
+    end
+
+    described_class.call(app, req)
+
+    expect(captured['SERVER_NAME']).to eq('localhost')
+    expect(captured['SERVER_PORT']).to eq('80')
+    expect(Hyperion.stats[:malformed_host_header].to_i).to eq(before.to_i + 1)
+  end
 end
