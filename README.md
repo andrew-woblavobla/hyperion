@@ -201,6 +201,8 @@ The architectural difference shows up under **load**, not at idle: Puma can only
 
 Hyperion fans 100 in-flight streams across separate fibers within a single TCP connection. A serial server would take 5 s; the fiber-multiplexed result (1.04 s, ~96 req/s on one socket) is bounded by single-handler sleep time plus framing overhead. Puma has no native HTTP/2 path — production deployments terminate h2 at nginx and forward h1 to the worker pool, which serializes again.
 
+> **1.6.0 outbound write path** — `Http2Handler` no longer serializes every framer write through one `Mutex#synchronize { socket.write(...) }`. HPACK encoding (microseconds, in-memory) still serializes on a fast encode mutex, but the actual `socket.write` is owned by a dedicated per-connection writer fiber draining a queue. On per-connection multi-stream workloads where the kernel send buffer or peer reads are slow, encode work for ready streams overlaps the writer's flush of earlier chunks, instead of stacking up behind it. See `bench/h2_streams.sh` (`h2load -c 1 -m 100 -n 5000`) for a recipe to compare 1.5.0 vs 1.6.0 on a workload of your choice.
+
 ### Reproduce
 
 ```sh

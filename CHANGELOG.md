@@ -1,5 +1,37 @@
 # Changelog
 
+## [1.6.0] - 2026-04-27
+
+Architectural rewrite of the HTTP/2 outbound write path — per-stream send queue + dedicated writer fiber replace the global `@send_mutex`.
+
+> Note: 1.6.0 is bundling a separate set of C-extension changes for the parser hot path (sibling commit). Once both land, the CHANGELOG sub-sections will be merged before tag.
+
+### Changed
+- **`Hyperion::Http2Handler` now uses a per-connection writer fiber instead of a single send Mutex.** Pre-1.6.0 every framer write — HEADERS, DATA, RST_STREAM, GOAWAY — ran inside one `@send_mutex.synchronize { socket.write(...) }`. That capped per-connection h2 throughput at "one socket-write at a time" regardless of how many streams were concurrently in flight: a slow socket (kernel send buffer full, peer reading slowly) blocked every other stream's writes too. 1.6.0 splits the path:
+  - **Encode + frame format** (HPACK encoding, frame layout) is fast (microseconds, in-memory) and stays serialized on the calling fiber via `WriterContext#encode_mutex`. HPACK state is connection-scoped and stateful across HEADERS frames; per-stream wire order (HEADERS → DATA → END_STREAM) must also be preserved. Holding the encode mutex across a `stream.send_*` call satisfies both.
+  - **Bytes-to-socket** is owned by a dedicated `run_writer_loop` fiber spawned per connection. Encoder fibers hand bytes off via `WriterContext#enqueue` (non-blocking, signals an `Async::Notification`); the writer pops chunks from the queue and writes them. Only this fiber ever calls `socket.write`, satisfying SSLSocket's "no concurrent writes from different fibers" constraint.
+  - **Net effect**: a stream that has bytes ready can encode and enqueue while the writer is mid-flush of an earlier chunk — the slow-socket case no longer serializes encode work across streams. Mutex hold time drops from "until the kernel accepts the write" to "until the bytes are appended to the in-memory queue."
+- **Per-connection backpressure cap** (`MAX_PER_CONN_PENDING_BYTES = 16 MiB`). Pathological clients that read very slowly could otherwise let the queue grow without bound. `WriterContext#enqueue` parks the encoder on `@drained_notify` once `@pending_bytes` exceeds the cap; the writer signals `@drained_notify` after each drain pass.
+- **Coordinated shutdown**: when `Http2Handler#serve` exits (clean close, peer disconnect, or protocol error), the `ensure` block sets `WriterContext#shutdown!` and `writer_task.wait`s for the final drain BEFORE closing the socket. Order matters — closing the socket first would discard final RST_STREAM / GOAWAY / END_STREAM frames sitting in the queue.
+
+### Added
+- **`Hyperion::Http2Handler::SendQueueIO`** — IO-shaped wrapper passed to `Protocol::HTTP2::Framer` in place of the raw socket. `read` is a passthrough (single-reader on the connection fiber); `write` enqueues onto the connection-wide queue. Reports `closed?` from the underlying socket so framer EOF detection still works.
+- **`Hyperion::Http2Handler::WriterContext`** — holds the per-connection queue, the encode mutex, the send/drained notifications, and the byte-budget counters. One instance per connection; lives for the lifetime of `Http2Handler#serve`.
+- **9 new specs in `spec/hyperion/http2_writer_loop_spec.rb`**:
+  - `SendQueueIO#write` returns bytesize, enqueues without writing the socket, no-ops on empty/nil, reports the underlying socket's `closed?` state (4).
+  - Writer loop drains a single encoder's frames in enqueue order (1).
+  - Two encoder fibers pushing concurrently — bytes for both streams reach the wire and per-stream order (HEADERS → DATA → END) is preserved (1).
+  - Backpressure parks the encoder when `@pending_bytes` exceeds `max_pending_bytes`; encoder resumes after the writer drains (1).
+  - Shutdown drains all queued frames before the writer fiber exits; shutdown with an empty queue exits cleanly (2).
+- **`bench/h2_streams.sh`** — `h2load`-driven recipe (`-c 1 -m 100 -n 5000`) for measuring per-connection multi-stream rps. Skips with a clear message if `h2load` isn't on PATH; emits a one-line JSON summary so cross-version diffs are easy.
+
+### Migration
+- No public-API changes. Operators do not need to touch config or restart with new flags. The architectural change is internal to `Http2Handler`.
+
+### Notes for the curious
+- HPACK's dynamic-table state is shared across all streams on a connection (per RFC 7541 §2.3.2.1). That is why we still serialize encode work — two fibers calling `stream.send_headers` concurrently would corrupt the encoder's table state. The mutex is now microseconds-of-CPU rather than "however long the socket takes to drain N MB."
+- `Async::Notification#signal` is a no-op when there are no waiters (signals are not buffered). The writer loop accordingly re-checks `writer_done? && queue_empty?` before parking, so a `shutdown!` call that races a `wait_for_signal` doesn't deadlock.
+
 ## [1.5.0] - 2026-04-27
 
 Audit-driven CLI + adapter polish. No breaking changes; pure additions to the operator surface and a hardening of the host-header parser.
