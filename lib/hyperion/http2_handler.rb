@@ -18,11 +18,40 @@ module Hyperion
   # dispatch — slow handlers no longer block other streams on the same
   # connection.
   #
-  # All framer writes (HEADERS, DATA, RST_STREAM) are serialized through a
-  # single connection-scoped Mutex (`@send_mutex`). The OpenSSL::SSL::SSLSocket
-  # underneath is not safe to drive from two fibers concurrently, and
-  # protocol-http2's HPACK encoder is also stateful across HEADERS frames,
-  # so all sends must be serialized.
+  # ## Outbound write architecture (1.6.0+)
+  #
+  # Pre-1.6.0 every framer write (HEADERS / DATA / RST_STREAM / GOAWAY) ran
+  # under one connection-scoped `Mutex#synchronize { socket.write(...) }`.
+  # That capped per-connection h2 throughput to "one socket-write at a time"
+  # regardless of stream count: a slow socket (kernel send buffer full,
+  # remote peer reading slowly) blocked every other stream's writes too.
+  #
+  # 1.6.0 splits the path:
+  #   * The HPACK encode + frame format step is fast (microseconds, in-memory)
+  #     and remains serialized on the calling fiber via `@encode_mutex`. HPACK
+  #     state is stateful across HEADERS frames per connection, and frames for
+  #     a single stream must be wire-ordered (HEADERS → DATA → END_STREAM).
+  #     Holding the encode mutex across a `send_*` call accomplishes both.
+  #   * The framer writes through a `SendQueueIO` wrapper (wraps the real
+  #     socket). `SendQueueIO#write(bytes)` enqueues onto a connection-wide
+  #     `@send_queue` and signals `@send_notify`; it never touches the real
+  #     socket.
+  #   * A dedicated **writer fiber** owns the real socket. It pops byte chunks
+  #     off the queue, writes them, and parks on `@send_notify` when empty.
+  #     Only this fiber ever calls `socket.write` — the SSLSocket cross-fiber
+  #     unsafety constraint is satisfied.
+  #
+  # Net effect: the slow-socket case no longer serializes encode work across
+  # streams. A stream that has bytes ready to encode can encode and enqueue
+  # while the writer is mid-flush of an earlier chunk. The mutex hold time
+  # drops from "until the kernel accepts the write" to "until the bytes are
+  # appended to the in-memory queue."
+  #
+  # Backpressure: pathological clients (slow-read h2) could otherwise let the
+  # queue grow without bound. We track `@pending_bytes`; once it exceeds
+  # `MAX_PER_CONN_PENDING_BYTES`, encoding fibers wait on `@drained_notify`
+  # before enqueueing more. The writer signals `@drained_notify` after each
+  # drain pass.
   #
   # Flow control: `RequestStream#window_updated` overrides the protocol-http2
   # default to fan a notification out to any fiber blocked in `send_body`
@@ -31,6 +60,153 @@ module Hyperion
   # size and yields on the notification when the window is exhausted, so
   # large bodies never trip a FlowControlError.
   class Http2Handler
+    # Cap on bytes that may sit in a connection's send queue waiting for the
+    # writer fiber to drain. Slow-read h2 clients can otherwise let an
+    # encoder fiber pile arbitrary bytes into RAM. 16 MiB matches the upper
+    # bound a well-behaved peer will buffer — anything beyond that is the
+    # writer being starved, and the right answer is to backpressure the
+    # encoder rather than allocate more.
+    MAX_PER_CONN_PENDING_BYTES = 16 * 1024 * 1024
+
+    # IO-shaped wrapper passed to `Protocol::HTTP2::Framer` in place of the
+    # real socket. Reads are direct passthroughs (the read loop runs on the
+    # connection fiber and there's only one reader). Writes are enqueued
+    # onto the connection-wide `WriterContext#queue`; the writer fiber owns
+    # the real socket and drains the queue.
+    #
+    # We deliberately do NOT delegate `flush` to the real socket: writes
+    # don't reach it from this object — the writer fiber does that. `flush`
+    # here is a no-op (the writer flushes after each batch).
+    #
+    # `closed?` reports the real socket's state so protocol-http2's read
+    # loop sees EOF the same way it always has.
+    class SendQueueIO
+      attr_reader :real_socket
+
+      def initialize(real_socket, writer_ctx)
+        @real_socket = real_socket
+        @writer_ctx  = writer_ctx
+      end
+
+      # Framer's read path — direct delegation. Single-reader (the conn
+      # fiber), so no contention here.
+      def read(*args)
+        @real_socket.read(*args)
+      end
+
+      # Framer's write path — non-blocking handoff into the send queue.
+      # Backpressure is applied here: if pending bytes exceed the cap, the
+      # calling fiber parks on the drained notification until the writer
+      # has flushed enough to bring us below the threshold.
+      def write(bytes)
+        return 0 if bytes.nil? || bytes.empty?
+
+        @writer_ctx.enqueue(bytes)
+        bytes.bytesize
+      end
+
+      def flush
+        # No-op: bytes don't live in this object, they live in the queue.
+        # The writer fiber flushes the real socket as it drains.
+        nil
+      end
+
+      def close
+        @real_socket.close unless @real_socket.closed?
+      end
+
+      # Multi-line on purpose: a single-line `def closed?; @real_socket.closed?; end`
+      # gets autocorrected to `delegate :closed?, to: :@real_socket` by Rails-aware
+      # ruby-lsp formatters, which is wrong here (this is a plain gem, no
+      # ActiveSupport on the dependency graph).
+      def closed?
+        socket = @real_socket
+        socket.closed?
+      end
+    end
+
+    # Holds the per-connection outbound coordination state (queue,
+    # notifications, byte counters, shutdown flag) plus the encode mutex
+    # that protects HPACK state and per-stream frame ordering.
+    #
+    # Single instance per connection, lives for the lifetime of `serve`.
+    class WriterContext
+      attr_reader :encode_mutex
+
+      def initialize(max_pending_bytes: MAX_PER_CONN_PENDING_BYTES)
+        @queue              = ::Thread::Queue.new
+        @send_notify        = ::Async::Notification.new
+        @drained_notify     = ::Async::Notification.new
+        @encode_mutex       = ::Mutex.new
+        @pending_bytes      = 0
+        @pending_bytes_lock = ::Mutex.new
+        @max_pending_bytes  = max_pending_bytes
+        @writer_done        = false
+      end
+
+      # Called by SendQueueIO#write on the calling (encoder) fiber. Enforces
+      # the per-connection backpressure cap before enqueuing.
+      def enqueue(bytes)
+        wait_for_drain_if_full(bytes.bytesize)
+        @pending_bytes_lock.synchronize { @pending_bytes += bytes.bytesize }
+        @queue << bytes
+        @send_notify.signal
+      end
+
+      # Pops a single chunk; returns nil if the queue is empty (non-blocking).
+      def try_pop
+        @queue.pop(true)
+      rescue ::ThreadError
+        nil
+      end
+
+      # Called by the writer fiber after each successful drain to release
+      # any encoders blocked on the cap.
+      def note_drained(bytesize)
+        @pending_bytes_lock.synchronize do
+          @pending_bytes -= bytesize
+          @pending_bytes = 0 if @pending_bytes.negative? # paranoia
+        end
+        @drained_notify.signal
+      end
+
+      def wait_for_signal
+        @send_notify.wait
+      end
+
+      def shutdown!
+        @writer_done = true
+        # Wake the writer if it's parked, and any encoder waiting on drain.
+        @send_notify.signal
+        @drained_notify.signal
+      end
+
+      def writer_done?
+        @writer_done
+      end
+
+      def queue_empty?
+        @queue.empty?
+      end
+
+      def pending_bytes
+        @pending_bytes_lock.synchronize { @pending_bytes }
+      end
+
+      private
+
+      def wait_for_drain_if_full(incoming_bytes)
+        # If we're already at/above the cap, park until the writer has
+        # drained. We re-check after every signal because multiple encoders
+        # can wake on a single drain notification.
+        while !@writer_done &&
+              @pending_bytes_lock.synchronize { @pending_bytes + incoming_bytes > @max_pending_bytes } &&
+              !@queue.empty?
+          @drained_notify.wait
+        end
+      end
+    end
+
     # Per-stream subclass that captures decoded request pseudo-headers,
     # regular headers, and any DATA frame body bytes for later dispatch.
     # Also exposes a `window_available` notification fan-out so the
@@ -247,20 +423,28 @@ module Hyperion
     def serve(socket)
       @metrics.increment(:connections_accepted)
       @metrics.increment(:connections_active)
-      framer = ::Protocol::HTTP2::Framer.new(socket)
-      server = build_server(framer)
+
+      # Per-connection outbound coordination. Encoder fibers enqueue bytes;
+      # the writer fiber owns the real socket and drains. See class docstring.
+      writer_ctx   = WriterContext.new
+      send_io      = SendQueueIO.new(socket, writer_ctx)
+      framer       = ::Protocol::HTTP2::Framer.new(send_io)
+      server       = build_server(framer)
+
+      task = ::Async::Task.current
+
+      # Spawn the dedicated writer fiber BEFORE the preface exchange.
+      # `Server#read_connection_preface` writes the server's SETTINGS frame
+      # via the framer; if the writer isn't running, those bytes sit in the
+      # queue. Spawning first guarantees they flush as soon as the scheduler
+      # ticks, avoiding any pathological deadlock where a client implementation
+      # waits for our SETTINGS before sending more frames.
+      writer_task = task.async { run_writer_loop(socket, writer_ctx) }
+
       server.read_connection_preface(initial_settings_payload)
 
       # Extract once — the same TCP peer drives every stream on this conn.
       peer_addr = peer_address(socket)
-
-      # All framer writes (HEADERS / DATA / RST_STREAM / GOAWAY) must be
-      # serialized: the underlying SSLSocket is not safe across fibers, and
-      # the HPACK encoder is also stateful. The connection's own frame loop
-      # uses this mutex too — see `dispatch_stream` and `send_body`.
-      send_mutex = ::Mutex.new
-
-      task = ::Async::Task.current
 
       # Track in-flight per-stream dispatch fibers so we can drain them on
       # connection close.
@@ -284,7 +468,7 @@ module Hyperion
           stream.instance_variable_set(:@hyperion_dispatched, true)
 
           stream_tasks << task.async do
-            dispatch_stream(stream, send_mutex, peer_addr)
+            dispatch_stream(stream, writer_ctx, peer_addr)
           end
         end
       end
@@ -309,6 +493,18 @@ module Hyperion
         }
       end
     ensure
+      # Coordinated shutdown: flag the writer, signal it, wait for the final
+      # drain, then close the real socket. Order matters — closing the
+      # socket before the writer drains would discard final RST_STREAM /
+      # GOAWAY / END_STREAM frames in the queue.
+      if writer_ctx
+        writer_ctx.shutdown!
+        begin
+          writer_task&.wait
+        rescue StandardError
+          nil
+        end
+      end
       @metrics.decrement(:connections_active)
       socket.close unless socket.closed?
     end
@@ -394,7 +590,7 @@ module Hyperion
       server
     end
 
-    def dispatch_stream(stream, send_mutex, peer_addr = nil)
+    def dispatch_stream(stream, writer_ctx, peer_addr = nil)
       # RFC 7540 §8.1.2 — header validation flagged this stream as malformed.
       # Send RST_STREAM PROTOCOL_ERROR instead of invoking the app.
       if stream.protocol_error?
@@ -403,7 +599,7 @@ module Hyperion
         end
         @metrics.increment(:requests_rejected)
         begin
-          send_mutex.synchronize do
+          writer_ctx.encode_mutex.synchronize do
             stream.send_reset_stream(::Protocol::HTTP2::Error::PROTOCOL_ERROR) unless stream.closed?
           end
         rescue StandardError
@@ -459,8 +655,8 @@ module Hyperion
       body_chunks.each { |c| payload << c.to_s }
       body_chunks.close if body_chunks.respond_to?(:close)
 
-      send_mutex.synchronize { stream.send_headers(out_headers) }
-      send_body(stream, payload, send_mutex)
+      writer_ctx.encode_mutex.synchronize { stream.send_headers(out_headers) }
+      send_body(stream, payload, writer_ctx)
       @metrics.increment_status(status)
     rescue StandardError => e
       @metrics.increment(:app_errors)
@@ -473,7 +669,9 @@ module Hyperion
         }
       end
       begin
-        send_mutex.synchronize { stream.send_reset_stream(::Protocol::HTTP2::Error::INTERNAL_ERROR) }
+        writer_ctx.encode_mutex.synchronize do
+          stream.send_reset_stream(::Protocol::HTTP2::Error::INTERNAL_ERROR)
+        end
       rescue StandardError
         nil
       end
@@ -485,9 +683,12 @@ module Hyperion
     # notification — protocol-http2 calls `window_updated` on every active
     # stream when WINDOW_UPDATE frames arrive (either stream- or
     # connection-scoped), which signals the notification.
-    def send_body(stream, payload, send_mutex)
+    #
+    # The encode_mutex protects HPACK state and per-stream frame ordering;
+    # the actual socket write happens off-fiber via the writer task.
+    def send_body(stream, payload, writer_ctx)
       if payload.empty?
-        send_mutex.synchronize { stream.send_data('', ::Protocol::HTTP2::END_STREAM) }
+        writer_ctx.encode_mutex.synchronize { stream.send_data('', ::Protocol::HTTP2::END_STREAM) }
         return
       end
 
@@ -508,7 +709,69 @@ module Hyperion
         offset += chunk.bytesize
         flags = offset >= bytesize ? ::Protocol::HTTP2::END_STREAM : 0
 
-        send_mutex.synchronize { stream.send_data(chunk, flags) }
+        writer_ctx.encode_mutex.synchronize { stream.send_data(chunk, flags) }
+      end
+    end
+
+    # Drain bytes off the per-connection send queue onto the real socket.
+    # This fiber is the SOLE writer to `socket` for the connection's
+    # lifetime, which satisfies SSLSocket's "no concurrent writes from
+    # different fibers" constraint.
+    #
+    # The loop:
+    #   1. Drain everything currently enqueued (non-blocking pops).
+    #   2. If we drained anything, signal `@drained_notify` so backpressured
+    #      encoders can resume, then loop again — more bytes may have been
+    #      enqueued while we were writing.
+    #   3. If shutdown was requested AND the queue is empty, exit.
+    #   4. Otherwise park on the send notification until an encoder pokes us.
+    def run_writer_loop(socket, writer_ctx)
+      loop do
+        drained_bytes = 0
+        while (chunk = writer_ctx.try_pop)
+          begin
+            socket.write(chunk)
+          rescue EOFError, Errno::ECONNRESET, Errno::EPIPE, IOError, OpenSSL::SSL::SSLError
+            # Peer hung up. Release THIS chunk's byte budget, then drain the
+            # rest of the queue (without writing) so backpressured encoders
+            # don't stall waiting on a writer that's about to exit. Any
+            # remaining queued bytes are dropped — the connection is dead.
+            writer_ctx.note_drained(chunk.bytesize)
+            drain_and_discard_queue(writer_ctx)
+            return
+          end
+          drained_bytes += chunk.bytesize
+          writer_ctx.note_drained(chunk.bytesize)
+        end
+
+        # Some sockets (SSLSocket on a TCPSocket whose Nagle is off) need an
+        # explicit flush to push small final frames (END_STREAM data, GOAWAY)
+        # without waiting for the next write. Cheap when there's nothing
+        # buffered.
+        socket.flush if drained_bytes.positive? && socket.respond_to?(:flush) && !socket.closed?
+
+        return if writer_ctx.writer_done? && writer_ctx.queue_empty?
+
+        writer_ctx.wait_for_signal
+      end
+    rescue StandardError => e
+      @logger.error do
+        {
+          message: 'h2 writer loop error',
+          error: e.message,
+          error_class: e.class.name,
+          backtrace: (e.backtrace || []).first(10).join(' | ')
+        }
+      end
+    end
+
+    # On peer-disconnect we discard any queued bytes (we can't write them),
+    # but we MUST still decrement the byte counter for each one or
+    # backpressured encoder fibers will park forever on the drain
+    # notification.
+    def drain_and_discard_queue(writer_ctx)
+      while (chunk = writer_ctx.try_pop)
+        writer_ctx.note_drained(chunk.bytesize)
       end
     end
 
