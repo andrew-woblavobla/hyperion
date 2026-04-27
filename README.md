@@ -61,7 +61,7 @@ Falcon edges Hyperion ~20% on raw rps at `-w 4` on macOS hello-world. **Hyperion
 | Hyperion `--no-log-requests` | 6,364 | 1.114× |
 | Puma `-w 4 -t 10:10` (no per-req logs) | 5,715 | 1.000× |
 
-Bench is **wait-bound** — ~3-4 ms median is the PG + Redis round-trip, dwarfing the per-request CPU work where Hyperion's optimisations live. With a synchronous `pg` driver, fibers don't help: every in-flight DB call still parks an OS thread, and both servers max out at `workers × threads` concurrent queries. To widen this gap requires either an async PG driver (lets one OS thread serve N concurrent in-flight queries via fiber yields — see [hyperion-async-pg](#) when it ships) or a CPU-bound workload, where Hyperion's lead becomes visible (next section).
+Bench is **wait-bound** — ~3-4 ms median is the PG + Redis round-trip, dwarfing the per-request CPU work where Hyperion's optimisations live. With a synchronous `pg` driver, fibers don't help: every in-flight DB call still parks an OS thread, and both servers max out at `workers × threads` concurrent queries. To widen this gap requires either an async PG driver — see [hyperion-async-pg](https://github.com/andrew-woblavobla/hyperion-async-pg) (companion gem; lets one OS thread serve N concurrent in-flight queries via fiber yields) — or a CPU-bound workload, where Hyperion's lead becomes visible (next section).
 
 ### CPU-bound JSON workload
 
