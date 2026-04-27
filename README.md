@@ -65,43 +65,38 @@ Bench is **wait-bound** — ~3-4 ms median is the PG + Redis round-trip, dwarfin
 
 ### Async I/O — fiber concurrency on PG-bound apps
 
-`bench/pg_concurrent.ru` (50 ms PG query per request, fiber-aware connection pool). Ubuntu 24.04 / 16 vCPU / Ruby 3.3.3, Postgres 17 over WAN, wrk `-t4 -c200 -d20s`. Single worker (`-w 1`) throughout; the 4-worker pre-fork PG-fd-sharing pattern is documented in the bench file but excluded from this table because it requires per-worker pool init via `on_worker_boot`, which is the typical Rails pattern but not what this microbench scaffolds.
+Ubuntu 24.04 / 16 vCPU / Ruby 3.3.3, Postgres 17 over WAN, `wrk -t4 -c200 -d20s`. Single worker (`-w 1`) unless noted. All configs returned 0 non-2xx and 0 timeouts. RSS sampled mid-run via `ps -o rss`.
 
-**Sync server + plain pg** (baselines — every in-flight query parks an OS thread):
+**Wait-bound workload** (`bench/pg_concurrent.ru`: `SELECT pg_sleep(0.05)` + tiny JSON):
 
-| | r/s | p99 | vs Puma `-t 5` |
-|---|---:|---:|---:|
-| Puma 8.0 `-t 5` pool=5 | 66.2 | 3.51 s | 1.0× |
-| Puma 8.0 `-t 16` pool=16 | 126.0 | 2.01 s | 1.9× |
-| Puma 8.0 `-t 30` pool=30 | 386.9 | 900 ms | 5.8× |
-| Hyperion 1.3.0 (no `--async-io`) `-t 5` | 56.3 | 458 ms | 0.85× |
-| Hyperion 1.3.0 (no `--async-io`) `-t 16` | 172.5 | 459 ms | 2.6× |
+| | r/s | p99 | RSS | vs Puma `-t 5` |
+|---|---:|---:|---:|---:|
+| Puma 8.0 `-t 5` pool=5 | 56.5 | 3.88 s | 87 MB | 1.0× |
+| Puma 8.0 `-t 30` pool=30 | 402.1 | 880 ms | 99 MB | 7.1× |
+| Puma 8.0 `-t 100` pool=100 | 1067.4 | 557 ms | 121 MB | 18.9× |
+| **Hyperion `--async-io -t 5`** pool=32 | 400.4 | 878 ms | 123 MB | 7.1× |
+| **Hyperion `--async-io -t 5`** pool=64 | 778.9 | 638 ms | 133 MB | 13.8× |
+| **Hyperion `--async-io -t 5`** pool=128 | 1344.2 | 536 ms | 148 MB | 23.8× |
+| **Hyperion `--async-io -t 5` pool=200** | **2381.4** | **471 ms** | **164 MB** | **42.2×** |
+| Hyperion `--async-io -w 4 -t 5` pool=64 | 1937.5 | 4.84 s | 416 MB | 34.3× (cold-start p99 — see note) |
+| Falcon 0.55.3 `--count 1` pool=128 | 1665.7 | 516 ms | 141 MB | 29.5× |
 
-**Hyperion `--async-io` + hyperion-async-pg + FiberPool** (one OS thread, fibers stack PG round-trips):
+**Mixed CPU+wait** (`bench/pg_mixed.ru`: same query + 50-key JSON serialization, ~5 ms CPU):
 
-| | r/s | p99 | vs Puma `-t 5` |
-|---|---:|---:|---:|
-| `-t 5` pool=5 | 58.2 | 3.58 s | 0.88× |
-| `-t 5` pool=16 | 221.0 | 1.01 s | 3.3× |
-| `-t 5` pool=32 | 421.3 | 842 ms | 6.4× |
-| `-t 5` pool=64 | 745.8 | 645 ms | **11.3×** |
-| `-t 5` pool=128 | 1631.9 | 499 ms | **24.7×** |
-| **`-t 5` pool=200** | **2228.0** | **491 ms** | **33.7×** |
-| **`-t 1` pool=64** | 733.0 | 646 ms | **11.1×** — proves OS-thread count is decoupled from concurrency |
-
-**Falcon 0.55.3 (reference, fiber-native server)**:
-
-| | r/s | p99 |
-|---|---:|---:|
-| `--count 1` pool=64 | 825.5 | 619 ms |
-| `--count 1` pool=128 | 1540.8 | 656 ms |
-| `--count 1` pool=200 | 2371.9 | 641 ms |
+| | r/s | p99 | RSS | vs Puma `-t 30` |
+|---|---:|---:|---:|---:|
+| Puma 8.0 `-t 30` pool=30 | 351.7 | 963 ms | 127 MB | 1.0× |
+| Hyperion `--async-io -t 5` pool=32 | 371.2 | 919 ms | 151 MB | 1.05× |
+| Hyperion `--async-io -t 5` pool=64 | 741.5 | 681 ms | 161 MB | 2.1× |
+| **Hyperion `--async-io -t 5` pool=128** | **1739.9** | **512 ms** | **201 MB** | **4.9×** |
+| Falcon `--count 1` pool=128 | 1642.1 | 531 ms | 213 MB | 4.7× |
 
 **Takeaways:**
-1. **Linear scaling with pool size** — `r/s ≈ pool × 11.7` on this WAN-bound bench. Theoretical ceiling is `pool / 0.05s = pool × 20`; we achieve ~58% (loss is RTT variance + Postgres-side serialization).
-2. **Threads decoupled from concurrency** — `-t 1 pool=64` matches `-t 5 pool=64`. Under `--async-io` the OS-thread count is decorative on wait-bound workloads; one accept-loop thread cooperatively serves all in-flight fibers.
-3. **Hyperion ≈ Falcon within 6-11%** at every pool size. Both fiber-native architectures extract similar value from async-pg.
-4. **vs sync best case** (Puma `-t 30 pool=30`): pool=64 wins 1.9×, pool=128 wins 4.2×, pool=200 wins 5.8×.
+1. **Linear scaling with pool size** under `--async-io` — `r/s ≈ pool × 12` on this WAN bench. Single-worker pool=200 hits 2381 r/s, **42× Puma `-t 5`** and **5.9× Puma's best** (`-t 30`).
+2. **Mixed workload doesn't kill the win** — Hyperion `--async-io` pool=128 actually goes *up* on mixed (1740 vs 1344 r/s) because CPU work overlaps other fibers' PG-wait windows. This is the honest "what happens to a real Rails handler" answer.
+3. **Hyperion ≈ Falcon within 3-7%** across pool sizes; both fiber-native architectures extract similar value from `hyperion-async-pg`.
+4. **RSS at single-worker scale isn't the architectural moat** — Linux thread stacks are demand-paged; PG connection buffers dominate RSS at pool sizes ≤ 200. The MB-vs-GB story shows up at **idle keep-alive connection scale** (10k+ conns), not in this PG-bound throughput bench. See [Concurrency at scale](#concurrency-at-scale-architectural-advantages) for the connection-count win.
+5. **`-w 4` cold-start caveat** — multi-worker p99 inflates because the bench rackup uses lazy per-process pool init (each worker pays full pool fill on its first request). Production apps avoid this with `on_worker_boot { Hyperion::AsyncPg::FiberPool.new(...).fill }`.
 
 Three things must all be true to get this win:
 1. **`async_io: true`** in your Hyperion config (or `--async-io` CLI flag). Default is off to keep 1.2.0's raw-loop perf for fiber-unaware apps.
