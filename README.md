@@ -95,7 +95,7 @@ Ubuntu 24.04 / 16 vCPU / Ruby 3.3.3, Postgres 17 over WAN, `wrk -t4 -c200 -d20s`
 1. **Linear scaling with pool size** under `--async-io` — `r/s ≈ pool × 12` on this WAN bench. Single-worker pool=200 hits 2381 r/s, **42× Puma `-t 5`** and **5.9× Puma's best** (`-t 30`).
 2. **Mixed workload doesn't kill the win** — Hyperion `--async-io` pool=128 actually goes *up* on mixed (1740 vs 1344 r/s) because CPU work overlaps other fibers' PG-wait windows. This is the honest "what happens to a real Rails handler" answer.
 3. **Hyperion ≈ Falcon within 3-7%** across pool sizes; both fiber-native architectures extract similar value from `hyperion-async-pg`.
-4. **RSS at single-worker scale isn't the architectural moat** — Linux thread stacks are demand-paged; PG connection buffers dominate RSS at pool sizes ≤ 200. The MB-vs-GB story shows up at **idle keep-alive connection scale** (10k+ conns), not in this PG-bound throughput bench. See [Concurrency at scale](#concurrency-at-scale-architectural-advantages) for the connection-count win.
+4. **RSS at single-worker scale isn't the architectural moat** — Linux thread stacks are demand-paged; PG connection buffers dominate RSS at pool sizes ≤ 200. The architectural win is **handler concurrency under load**, not idle memory: Hyperion's fiber path runs thousands of in-flight handler invocations per OS thread, so wait-bound handlers don't queue at `max_threads`. See [Concurrency at scale](#concurrency-at-scale-architectural-advantages) for both the throughput-under-load row and a measured 10k-idle-keepalive RSS sweep against Puma and Falcon.
 5. **`-w 4` cold-start caveat** — multi-worker p99 inflates because the bench rackup uses lazy per-process pool init (each worker pays full pool fill on its first request). Production apps avoid this with `on_worker_boot { Hyperion::AsyncPg::FiberPool.new(...).fill }`.
 
 Three things must all be true to get this win:
@@ -176,7 +176,21 @@ These workloads demonstrate structural differences between Hyperion's fiber-per-
 | Hyperion `-w 1 -t 10` | 93,090 | 6,910 | 3,446 | 27.01 s |
 | Puma `-w 1 -t 10:10`  | 77,340 | 22,660 | 706 | 109.59 s |
 
-Hyperion holds each connection in a ~1 KB fiber stack; Puma needs an OS thread (~1–8 MB each, capped at `max_threads`). At 10k concurrent connections Hyperion serves **~5× the throughput** of Puma with **~20% fewer dropped requests**, while the per-connection bookkeeping cost is bounded by fiber size, not by `max_threads`.
+At 10k concurrent connections under load Hyperion serves **~5× the throughput** of Puma with **~20% fewer dropped requests**. The per-connection bookkeeping cost is bounded by fiber size, not by `max_threads` — workers don't get pinned to long-lived sockets, so a slow handler doesn't starve other connections.
+
+**Memory at idle keep-alive scale — 10,000 idle HTTP/1.1 keep-alive connections:**
+
+Each client opens a TCP connection, sends one keep-alive GET, drains the response, then holds the socket open without sending a follow-up request. RSS is sampled once a second across a 30s idle hold. Same hello-world rackup, single worker, no TLS. Hyperion runs with `async_io true` (fiber-per-connection on the plain HTTP/1.1 path).
+
+| | held | dropped | peak RSS | RSS after drain |
+|---|---:|---:|---:|---:|
+| Hyperion `-w 1 -t 5 --async-io` | 10,000 / 10,000 | 0 | 173 MB | 155 MB |
+| Puma `-w 0 -t 100`               | 10,000 / 10,000 | 0 | 101 MB | 104 MB |
+| Falcon `--count 1`               | 10,000 / 10,000 | 0 | 429 MB | 440 MB |
+
+All three hold 10k idle conns without OOMing or dropping — the "MB-per-thread" intuition that thread-based servers can't reach this scale doesn't survive contact with Linux's demand-paged thread stacks plus Puma's reactor-based keep-alive handling. Per-conn RSS lands at ~14 KB (Hyperion fiber + parser state), ~7 KB (Puma reactor entry + tiny thread share), ~36 KB (Falcon Async::Task + protocol-http stack). Bounded, not unbounded — for all three.
+
+The architectural difference shows up under **load**, not at idle: Puma can only run `max_threads` handler invocations concurrently, so wait-bound handlers (DB, HTTP, Redis) starve at higher request concurrency than `max_threads`. Hyperion's fiber-per-connection model + `--async-io` gives one OS thread thousands of in-flight handler executions, paired with [hyperion-async-pg](https://github.com/exodusgaming-io/hyperion-async-pg) for non-blocking DB. The 10k-conn throughput row above (5× Puma) is the consequence — same idle RSS shape, very different behaviour once the handlers actually do work.
 
 **HTTP/2 multiplexing — 1 connection × 100 concurrent streams (handler sleeps 50 ms):**
 
@@ -193,6 +207,9 @@ Hyperion fans 100 in-flight streams across separate fibers within a single TCP c
 # hello-world
 bundle exec ruby bench/compare.rb
 HYPERION_WORKERS=4 PUMA_WORKERS=4 FALCON_COUNT=4 bundle exec ruby bench/compare.rb
+
+# Idle keep-alive RSS sweep (1k / 5k / 10k conns, 30s hold per server)
+./bench/keepalive_memory.sh
 
 # Real Rails / Grape: see bench/db.ru for the schema
 ```
