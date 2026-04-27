@@ -378,6 +378,29 @@ Tail latency tells the queueing story; rps tells the throughput story. Hyperion'
 
 **Size capacity by p99, not by mean.** Throughput peaks are easy to fake under controlled bench conditions; tail latency reflects what your slowest user actually experiences when the load balancer fans them onto a busy worker.
 
+### Production tuning (real Rails apps)
+
+Distilled from a real-app bench against the [Exodus platform](https://github.com/andrew-woblavobla/hyperion/blob/master/docs/BENCH_2026_04_27.md) (Rails 8.1, on-LAN PG + Redis at ~0.3 ms RTT, `-w 4 -t 10`, `wrk -t8 -c200 -d30s`). The headline finding: the **simplest drop-in is the right answer**, and the additional knobs operators reach for first don't help on real Rails.
+
+**Recommended for migrating from Puma**: `hyperion -t N -w M` matching your current Puma `-t N:N -w M`. No other flags. That gives you (vs Puma at the same `-t/-w`):
+
+- **+9% rps on lightweight endpoints** (matches the 5-10% per-request CPU savings the rest of the bench section documents).
+- **28× lower p99 on health-style endpoints** — the queue-of-doom shape Puma exhibits under sustained 200-conn load doesn't reproduce on Hyperion's worker-owns-connection model.
+- **3.8× lower p99 on PG-touching endpoints**.
+- **Same RSS, same operator surface** — you keep all your existing config, monitoring, and deploy scripts.
+
+**Knobs that help on synthetic benches but NOT on real Rails — leave them off:**
+
+| Knob | Synthetic bench result | Real Rails result | Recommendation |
+|---|---|---|---|
+| `-t 30` (more threads/worker) | Helped Hyperion 5-10% on hello-world | **Hurt** p99 vs `-t 10` on real Rails (3.51 s vs 148 ms on /up) — GVL + middleware Mutex contention dominates past `-t 10` | Stay at `-t 10`. Match Puma's recommended `RAILS_MAX_THREADS`. |
+| `--yjit` | 5-10% on synthetic CPU-bound | Wash on dev-mode Rails (312 vs 328 rps, p99 worse with YJIT) | Skip for now. Production-mode Rails may behave differently — verify with your own bench before flipping. |
+| `RAILS_POOL` > 25 | n/a | No improvement at pool=50 or pool=100 on real Rails (rps within 3%, p99 within noise). Pool starvation is rarely the bottleneck on a `-w 4 -t 10` config | Keep your existing AR pool size. |
+| `--async-io` | 33-42× rps on PG-bound (with `hyperion-async-pg`) | **Worse** than drop-in on real Rails (4.14 s p99 on /up vs 148 ms drop-in) | **Don't enable** until your full I/O stack is fiber-cooperative. The synchronous Redis client (`redis-rb`) blocks the OS thread before async-pg can yield, so fibers can't compound. Migrate to `async-redis` *first*, then revisit. |
+| `--async-io` + `hyperion-async-pg` AR adapter | Verified 48× rps lift on a single-PG-query bench | Marginal-or-negative on real Rails (similar reason: Redis-first handlers don't yield) | Same — wait for a full-async I/O stack. |
+
+**Why the simple drop-in wins on real Rails:** the per-request budget on a real handler is dominated by the Rails middleware chain (rack-attack, locale redirect, tagger, etc.) + handler logic + DB + cache I/O. Hyperion's per-request CPU optimizations (C-ext header parser, response builder, lock-free metrics, fiber-cooperative TLS dispatch in 1.4.0+) shave ~5-10% off the *non-I/O* portion of the budget consistently — and the [worker-owns-connection model](#concurrency-at-scale-architectural-advantages) prevents the queue-amplification that Puma's thread-pool dispatch shows under sustained load. You don't need to "tune" anything to get those.
+
 ## Logging
 
 Default behaviour (rc16+):

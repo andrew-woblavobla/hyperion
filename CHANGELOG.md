@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.2] - 2026-04-27
+
+Doc release. No code changes.
+
+### Added
+- **README "Production tuning (real Rails apps)" section** — distilled from a real-app bench against the Exodus platform (Rails 8.1, on-LAN PG + Redis at ~0.3 ms RTT, `-w 4 -t 10`, `wrk -t8 -c200 -d30s`). Headline: the simplest drop-in (`hyperion -t N -w M` matching Puma's existing `-t/-w`) is the right answer; `+9%` rps and `28×` lower p99 on health endpoints over the same Puma config, no other knobs needed. Documents which synthetic-bench knobs (`-t 30`, `--yjit`, larger `RAILS_POOL`, `--async-io`) DON'T help on real Rails and why (GVL contention past `-t 10`, dev-mode YJIT instability, pool rarely the bottleneck, sync Redis blocking ahead of async-pg yields). Saves operators from the trap of "tune harder = faster" — the simple drop-in IS the answer on real workloads.
+
 ## [1.6.1] - 2026-04-27
 
 Audit follow-up from the [BENCH_2026_04_27.md](docs/BENCH_2026_04_27.md) sweep. No code-path changes; doc surface and operator-UX polish.
