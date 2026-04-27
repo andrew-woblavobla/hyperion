@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.3.0] - 2026-04-27
+
+Adds the structural moat for fiber-cooperative I/O. No breaking changes.
+
+### Added
+- **`async_io: true` config flag** (also `--async-io` CLI flag) — when enabled, the plain HTTP/1.1 accept loop runs each connection on a fiber under `Async::Scheduler` instead of handing it to a worker thread. This is what makes [hyperion-async-pg](https://github.com/andrew-woblavobla/hyperion-async-pg) (and other Async-aware libraries) actually cooperate: each fiber yields the OS thread on socket waits, so one thread can serve N concurrent in-flight DB queries instead of 1. **Default off** to keep the 1.2.0 raw-loop perf for fiber-unaware apps. Trade-off: ~5% throughput hit on hello-world; 5–10× throughput on PG-bound workloads when paired with hyperion-async-pg + a fiber-aware connection pool.
+- **Bench validation (macOS, 50ms PG round-trip, 200 concurrent wrk conns):**
+
+  | | r/s | p99 |
+  |---|---:|---:|
+  | Puma 7.2 `-t 5` + plain pg (pool=5) | 88.9 | 2.31 s |
+  | **Hyperion 1.3.0 `--async-io -t 5` + hyperion-async-pg (FiberPool=64)** | **1,103.7** | **237 ms** |
+
+  **12.4× throughput, 9.7× lower p99.** Theoretical ceiling at pool=64 + 50ms query is ~1280 r/s; achieved 86% of it. Linux numbers will land in a follow-up bench section.
+
+### Changed
+- TLS / HTTP/2 paths still always use the Async accept loop (unchanged); they ignore the `async_io` flag because they need the scheduler for ALPN handshake yields and per-stream fiber dispatch anyway.
+- When `async_io: true`, plain HTTP/1.1 dispatch bypasses the thread pool and serves the connection inline on the calling fiber. The pool stays in use for the TLS path's `app.call` hops on each h2 stream.
+
 ## [1.2.0] - 2026-04-27
 
 Production hardening + perf round 2. No breaking changes.

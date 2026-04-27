@@ -166,7 +166,8 @@ module Hyperion
           worker_index: worker_index,
           max_pending: @config.max_pending,
           max_request_read_seconds: @config.max_request_read_seconds,
-          h2_settings: Master.build_h2_settings(@config)
+          h2_settings: Master.build_h2_settings(@config),
+          async_io: @config.async_io
         }
         # Hand the inherited socket to the worker in :share mode. In
         # :reuseport mode the worker binds its own with SO_REUSEPORT.

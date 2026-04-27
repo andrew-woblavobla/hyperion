@@ -61,7 +61,25 @@ Falcon edges Hyperion ~20% on raw rps at `-w 4` on macOS hello-world. **Hyperion
 | Hyperion `--no-log-requests` | 6,364 | 1.114× |
 | Puma `-w 4 -t 10:10` (no per-req logs) | 5,715 | 1.000× |
 
-Bench is **wait-bound** — ~3-4 ms median is the PG + Redis round-trip, dwarfing the per-request CPU work where Hyperion's optimisations live. With a synchronous `pg` driver, fibers don't help: every in-flight DB call still parks an OS thread, and both servers max out at `workers × threads` concurrent queries. To widen this gap requires either an async PG driver — see [hyperion-async-pg](https://github.com/andrew-woblavobla/hyperion-async-pg) (companion gem; lets one OS thread serve N concurrent in-flight queries via fiber yields) — or a CPU-bound workload, where Hyperion's lead becomes visible (next section).
+Bench is **wait-bound** — ~3-4 ms median is the PG + Redis round-trip, dwarfing the per-request CPU work where Hyperion's optimisations live. With a synchronous `pg` driver, fibers don't help: every in-flight DB call still parks an OS thread, and both servers max out at `workers × threads` concurrent queries. To widen this gap requires either an async PG driver — see [hyperion-async-pg](https://github.com/andrew-woblavobla/hyperion-async-pg) (companion gem; pair with `--async-io` and a fiber-aware pool, see "Async I/O — fiber concurrency on PG-bound apps" below) — or a CPU-bound workload, where Hyperion's lead becomes visible (next section).
+
+### Async I/O — fiber concurrency on PG-bound apps
+
+`bench/pg_concurrent.ru` (50 ms PG query per request, pool sized for the server's concurrency model). macOS, Postgres over WAN, wrk `-t4 -c200 -d20s`:
+
+| | r/s | p99 |
+|---|---:|---:|
+| Puma 7.2 `-t 5` + plain pg (pool=5) | 88.9 | 2.31 s |
+| **Hyperion 1.3.0 `--async-io -t 5` + hyperion-async-pg (FiberPool=64)** | **1,103.7** | **237 ms** |
+
+**12.4× throughput, 9.7× lower p99.** Puma is bottlenecked at `threads × 1 in-flight query` because plain `pg` blocks the OS thread on `recv()`. Hyperion + async-pg + a fiber-aware pool decouples concurrency from threads: 5 OS threads serve 64 concurrent in-flight queries via fiber cooperation. Theoretical ceiling at pool=64 + 50 ms query = 1280 r/s; achieved 1103 r/s = 86% of it.
+
+Three things must all be true to get this win:
+1. **`async_io: true`** in your Hyperion config (or `--async-io` CLI flag). Default is off to keep 1.2.0's raw-loop perf for fiber-unaware apps.
+2. **`hyperion-async-pg`** installed: `gem 'hyperion-async-pg', require: 'hyperion/async_pg'` + `Hyperion::AsyncPg.install!` at boot.
+3. **Fiber-aware connection pool.** The popular `connection_pool` gem is NOT — its Mutex blocks the OS thread. Use [`async-pool`](https://github.com/socketry/async-pool), `Async::Semaphore`, or hand-roll one (see `bench/pg_concurrent.ru` for a 30-line FiberPool example).
+
+Skip any of these and you get parity with Puma at the same `-t`. Run the bench yourself: `MODE=async DATABASE_URL=... PG_POOL_SIZE=64 bundle exec hyperion --async-io -t 5 bench/pg_concurrent.ru` (in the [hyperion-async-pg](https://github.com/andrew-woblavobla/hyperion-async-pg) repo).
 
 ### CPU-bound JSON workload
 

@@ -20,7 +20,7 @@ module Hyperion
                    thread_count: Server::DEFAULT_THREAD_COUNT,
                    config: nil, worker_index: 0, listener: nil,
                    max_pending: nil, max_request_read_seconds: 60,
-                   h2_settings: nil)
+                   h2_settings: nil, async_io: false)
       @host                     = host
       @port                     = port
       @app                      = app
@@ -33,6 +33,7 @@ module Hyperion
       @max_pending              = max_pending
       @max_request_read_seconds = max_request_read_seconds
       @h2_settings              = h2_settings
+      @async_io                 = async_io
     end
 
     def run
@@ -51,7 +52,8 @@ module Hyperion
                           thread_count: @thread_count,
                           max_pending: @max_pending,
                           max_request_read_seconds: @max_request_read_seconds,
-                          h2_settings: @h2_settings)
+                          h2_settings: @h2_settings,
+                          async_io: @async_io)
       tcp_server = @listener || build_reuseport_listener
       server.adopt_listener(tcp_server)
 

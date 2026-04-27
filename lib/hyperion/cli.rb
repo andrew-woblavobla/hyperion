@@ -57,6 +57,10 @@ module Hyperion
              'Enable Ruby YJIT (default: auto on RAILS_ENV/RACK_ENV=production/staging)') do |v|
           cli_opts[:yjit] = v
         end
+        o.on('--[no-]async-io',
+             'Run plain HTTP/1.1 connections under Async::Scheduler (required for hyperion-async-pg and other fiber-cooperative I/O; default off)') do |v|
+          cli_opts[:async_io] = v
+        end
         o.on('-h', '--help', 'show help') do
           puts o
           exit 0
@@ -114,7 +118,8 @@ module Hyperion
                           read_timeout: config.read_timeout,
                           max_pending: config.max_pending,
                           max_request_read_seconds: config.max_request_read_seconds,
-                          h2_settings: Master.build_h2_settings(config))
+                          h2_settings: Master.build_h2_settings(config),
+                          async_io: config.async_io)
       server.listen
       scheme = tls ? 'https' : 'http'
       Hyperion.logger.info { { message: 'listening', url: "#{scheme}://#{server.host}:#{server.port}" } }

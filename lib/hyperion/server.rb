@@ -42,7 +42,7 @@ module Hyperion
 
     def initialize(app:, host: '127.0.0.1', port: 9292, read_timeout: DEFAULT_READ_TIMEOUT_SECONDS,
                    tls: nil, thread_count: DEFAULT_THREAD_COUNT, max_pending: nil,
-                   max_request_read_seconds: 60, h2_settings: nil)
+                   max_request_read_seconds: 60, h2_settings: nil, async_io: false)
       @host                     = host
       @port                     = port
       @app                      = app
@@ -52,6 +52,7 @@ module Hyperion
       @max_pending              = max_pending
       @max_request_read_seconds = max_request_read_seconds
       @h2_settings              = h2_settings
+      @async_io                 = async_io
       @thread_pool              = nil
       @stopped                  = false
     end
@@ -107,16 +108,23 @@ module Hyperion
       listen unless @server
       @thread_pool = ThreadPool.new(size: @thread_count, max_pending: @max_pending) if @thread_count.positive?
 
-      if @tls
+      if @tls || @async_io
         # TLS path: ALPN may pick `h2`, and h2 spawns one fiber per stream
         # inside Http2Handler. Keep the Async wrapper so the scheduler is
         # available for those fibers and for handshake yields.
+        #
+        # async_io: true: operator opt-in for plain HTTP/1.1. The Async wrap
+        # is required when callers want fiber cooperative I/O — e.g.
+        # `hyperion-async-pg` yielding while a Postgres query is in flight.
+        # Pays ~5% throughput vs the raw-loop fast path; in exchange one
+        # OS thread can serve N concurrent in-flight DB queries instead of 1.
         start_async_loop
       else
-        # Plain HTTP/1.1: the worker thread owns each connection for its
-        # lifetime, so the Async wrapper adds zero value (no fibers ever
-        # run on this loop's task). Skip it — pure IO.select + accept_nonblock
-        # shaves measurable overhead off the accept hot path.
+        # Plain HTTP/1.1, async_io: false (default): the worker thread owns
+        # each connection for its lifetime, so the Async wrapper adds zero
+        # value (no fibers ever run on this loop's task). Skip it — pure
+        # IO.select + accept_nonblock shaves measurable overhead off the
+        # accept hot path.
         start_raw_loop
       end
     ensure
@@ -174,6 +182,15 @@ module Hyperion
         # handler still uses the pool's `#call` for app.call hops on each
         # stream (one per stream, not one per connection).
         Http2Handler.new(app: @app, thread_pool: @thread_pool, h2_settings: @h2_settings).serve(socket)
+      elsif @async_io
+        # async_io plain HTTP/1.1: serve inline on the calling fiber so the
+        # request runs *under* Async::Scheduler. This is what makes
+        # hyperion-async-pg (and other Async-aware libraries) actually
+        # cooperate — each fiber yields the OS thread on socket waits, so
+        # one thread can serve N concurrent in-flight DB queries. The
+        # thread pool is intentionally bypassed here: handing the socket
+        # to a worker thread strips the scheduler context.
+        Connection.new.serve(socket, @app, max_request_read_seconds: @max_request_read_seconds)
       elsif @thread_pool
         # HTTP/1.1 (e.g. TLS-wrapped after ALPN picked http/1.1): hand the
         # connection to a worker thread. The fiber that called dispatch
