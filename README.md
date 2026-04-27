@@ -65,21 +65,50 @@ Bench is **wait-bound** — ~3-4 ms median is the PG + Redis round-trip, dwarfin
 
 ### Async I/O — fiber concurrency on PG-bound apps
 
-`bench/pg_concurrent.ru` (50 ms PG query per request, pool sized for the server's concurrency model). macOS, Postgres over WAN, wrk `-t4 -c200 -d20s`:
+`bench/pg_concurrent.ru` (50 ms PG query per request, fiber-aware connection pool). Ubuntu 24.04 / 16 vCPU / Ruby 3.3.3, Postgres 17 over WAN, wrk `-t4 -c200 -d20s`. Single worker (`-w 1`) throughout; the 4-worker pre-fork PG-fd-sharing pattern is documented in the bench file but excluded from this table because it requires per-worker pool init via `on_worker_boot`, which is the typical Rails pattern but not what this microbench scaffolds.
+
+**Sync server + plain pg** (baselines — every in-flight query parks an OS thread):
+
+| | r/s | p99 | vs Puma `-t 5` |
+|---|---:|---:|---:|
+| Puma 8.0 `-t 5` pool=5 | 66.2 | 3.51 s | 1.0× |
+| Puma 8.0 `-t 16` pool=16 | 126.0 | 2.01 s | 1.9× |
+| Puma 8.0 `-t 30` pool=30 | 386.9 | 900 ms | 5.8× |
+| Hyperion 1.3.0 (no `--async-io`) `-t 5` | 56.3 | 458 ms | 0.85× |
+| Hyperion 1.3.0 (no `--async-io`) `-t 16` | 172.5 | 459 ms | 2.6× |
+
+**Hyperion `--async-io` + hyperion-async-pg + FiberPool** (one OS thread, fibers stack PG round-trips):
+
+| | r/s | p99 | vs Puma `-t 5` |
+|---|---:|---:|---:|
+| `-t 5` pool=5 | 58.2 | 3.58 s | 0.88× |
+| `-t 5` pool=16 | 221.0 | 1.01 s | 3.3× |
+| `-t 5` pool=32 | 421.3 | 842 ms | 6.4× |
+| `-t 5` pool=64 | 745.8 | 645 ms | **11.3×** |
+| `-t 5` pool=128 | 1631.9 | 499 ms | **24.7×** |
+| **`-t 5` pool=200** | **2228.0** | **491 ms** | **33.7×** |
+| **`-t 1` pool=64** | 733.0 | 646 ms | **11.1×** — proves OS-thread count is decoupled from concurrency |
+
+**Falcon 0.55.3 (reference, fiber-native server)**:
 
 | | r/s | p99 |
 |---|---:|---:|
-| Puma 7.2 `-t 5` + plain pg (pool=5) | 88.9 | 2.31 s |
-| **Hyperion 1.3.0 `--async-io -t 5` + hyperion-async-pg (FiberPool=64)** | **1,103.7** | **237 ms** |
+| `--count 1` pool=64 | 825.5 | 619 ms |
+| `--count 1` pool=128 | 1540.8 | 656 ms |
+| `--count 1` pool=200 | 2371.9 | 641 ms |
 
-**12.4× throughput, 9.7× lower p99.** Puma is bottlenecked at `threads × 1 in-flight query` because plain `pg` blocks the OS thread on `recv()`. Hyperion + async-pg + a fiber-aware pool decouples concurrency from threads: 5 OS threads serve 64 concurrent in-flight queries via fiber cooperation. Theoretical ceiling at pool=64 + 50 ms query = 1280 r/s; achieved 1103 r/s = 86% of it.
+**Takeaways:**
+1. **Linear scaling with pool size** — `r/s ≈ pool × 11.7` on this WAN-bound bench. Theoretical ceiling is `pool / 0.05s = pool × 20`; we achieve ~58% (loss is RTT variance + Postgres-side serialization).
+2. **Threads decoupled from concurrency** — `-t 1 pool=64` matches `-t 5 pool=64`. Under `--async-io` the OS-thread count is decorative on wait-bound workloads; one accept-loop thread cooperatively serves all in-flight fibers.
+3. **Hyperion ≈ Falcon within 6-11%** at every pool size. Both fiber-native architectures extract similar value from async-pg.
+4. **vs sync best case** (Puma `-t 30 pool=30`): pool=64 wins 1.9×, pool=128 wins 4.2×, pool=200 wins 5.8×.
 
 Three things must all be true to get this win:
 1. **`async_io: true`** in your Hyperion config (or `--async-io` CLI flag). Default is off to keep 1.2.0's raw-loop perf for fiber-unaware apps.
 2. **`hyperion-async-pg`** installed: `gem 'hyperion-async-pg', require: 'hyperion/async_pg'` + `Hyperion::AsyncPg.install!` at boot.
-3. **Fiber-aware connection pool.** The popular `connection_pool` gem is NOT — its Mutex blocks the OS thread. Use [`async-pool`](https://github.com/socketry/async-pool), `Async::Semaphore`, or hand-roll one (see `bench/pg_concurrent.ru` for a 30-line FiberPool example).
+3. **Fiber-aware connection pool.** The popular `connection_pool` gem is NOT — its Mutex blocks the OS thread. Use [`async-pool`](https://github.com/socketry/async-pool), `Async::Semaphore`, or hand-roll one (see `bench/pg_concurrent.ru` for a ~30-line FiberPool example).
 
-Skip any of these and you get parity with Puma at the same `-t`. Run the bench yourself: `MODE=async DATABASE_URL=... PG_POOL_SIZE=64 bundle exec hyperion --async-io -t 5 bench/pg_concurrent.ru` (in the [hyperion-async-pg](https://github.com/andrew-woblavobla/hyperion-async-pg) repo).
+Skip any of these and you get parity with Puma at the same `-t`. Run the bench yourself: `MODE=async DATABASE_URL=... PG_POOL_SIZE=200 bundle exec hyperion --async-io -t 5 bench/pg_concurrent.ru` (in the [hyperion-async-pg](https://github.com/andrew-woblavobla/hyperion-async-pg) repo).
 
 ### CPU-bound JSON workload
 
