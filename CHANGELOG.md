@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.4.1] - 2026-04-27
+
+### Fixed
+- **`Hyperion::Metrics` fiber-key bug** — pre-1.4.1 the metrics module stored counters via `Thread.current[:key]`, which is FIBER-local in Ruby 1.9+. Under an `Async::Scheduler` (TLS / h2 / `--async-io` plain HTTP/1.1) every handler fiber got its own private counters Hash that `Hyperion.stats` could never see — increments were stranded, the dispatch counters and `:bytes_written` etc. read as zero from any non-handler-fiber observer (including the Prometheus `/-/metrics` exporter when scraped from a different fiber). Switched to `Thread#thread_variable_*` (truly thread-local across fibers) plus direct counter-Hash list storage so snapshots also survive thread death. Verified via 4 new specs: cross-fiber on same thread, cross-thread, cross-fiber-on-different-thread, many-fibers-on-same-thread (210 increments aggregated correctly). Surfaced by hyperion-async-pg 0.4.0's bench round, which couldn't read `:requests_async_dispatched` from spec assertions even though the increments were firing.
+
 ## [1.4.0] - 2026-04-27
 
 Default-behaviour change for TLS users: HTTP/1.1-over-TLS now dispatches inline on the calling fiber instead of hopping through the worker thread pool. Fiber-cooperative libraries (`hyperion-async-pg`, `async-redis`) work on the TLS h1 path without `--async-io`. No code-path changes for plain HTTP/1.1 default behaviour.
