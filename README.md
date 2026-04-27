@@ -322,6 +322,62 @@ Strict DSL: unknown methods raise `NoMethodError` at boot — typos surface imme
 
 A documented sample lives at [`config/hyperion.example.rb`](config/hyperion.example.rb).
 
+## Operator guidance
+
+Concrete tradeoffs distilled from [`docs/BENCH_2026_04_27.md`](docs/BENCH_2026_04_27.md). If the bench numbers cited below feel surprising, check that doc for the full matrix + caveats.
+
+### When to use `-w N`
+
+| Workload shape | Recommended | Why |
+|---|---|---|
+| **Pure I/O-bound** (PG / Redis / external HTTP, no significant CPU) | `-w 1` + larger pool | Bench: `-w 1 pool=200` = 87 MB / 2,180 r/s vs `-w 4 pool=64` = 224 MB / 1,680 r/s. **2.6× more memory, 0.77× rps** if you pick multi-worker on a wait-bound workload. |
+| **Pure CPU-bound** (heavy JSON / template render / image processing) | `-w N` matching CPU count | Each worker's accept loop is single-threaded under `--async-io`; multi-worker gives CPU-parallelism. Bench: `-w 16 -t 5` hits 98,818 r/s on a 16-vCPU box, 4.7× a `-w 1` ceiling on the same hardware. |
+| **Mixed** (Rails-shaped: ~5 ms CPU + 50 ms PG wait per request) | `-w N/2` (half cores) + medium pool | Lets CPU work parallelise while keeping per-worker memory tractable. Bench `pg_mixed.ru` at `-w 4 -t 5 pool=128` = 1,740 r/s with no cold-start spike (ForkSafe `prefill_in_child: true`). |
+
+Multi-worker on PG-wait workloads is the **wrong** default for most apps — the headline rps doesn't justify the memory and PG-connection cost. Verify your shape with the bench before scaling out.
+
+### When to use `--async-io`
+
+```
+                 Are you using a fiber-cooperative I/O library?
+                 (hyperion-async-pg, async-redis, async-http)
+                              │
+                ┌─────────────┴─────────────┐
+                yes                          no
+                │                            │
+        Pair with a fiber-aware       Leave --async-io OFF.
+        connection pool               Default thread-pool dispatch
+        (FiberPool, async-pool —      is faster for synchronous
+        NOT connection_pool gem,      Rails apps. Bench: --async-io
+        which uses non-fiber Mutex).  on hello-world = 47% rps
+                │                     regression + p99 spike to
+        Set --async-io.               3.65 s under no-yield workloads.
+        Pool size is the real         No reason to flip the flag.
+        concurrency knob; -t is
+        decorative for wait-bound.
+```
+
+Hyperion warns at boot if you set `--async-io` without any fiber-cooperative library loaded. The setting is still honoured; the warn just nudges operators who flipped it expecting a free perf bump.
+
+### Tuning `-t` and pool sizes
+
+- **Without `--async-io`** (sync server, default): `-t` is the concurrency knob. Each in-flight request holds an OS thread; pool size should match `-t`. Bench shows Puma-style behaviour — at 200 wrk conns hitting a 5-thread server, queue depth dominates p99 (Hyperion `-t 5 -w 1` p50 = 0.95 ms vs Puma's same shape at 59.5 ms — Hyperion's queueing is cheaper but the model still serializes at `-t`).
+- **With `--async-io` + a fiber-aware pool**: pool size is the concurrency knob. `-t` is decorative for wait-bound workloads; one accept-loop fiber serves all in-flight queries via the pool. Linear scaling: pool=64 → ~780 r/s, pool=128 → ~1,344 r/s, pool=200 → ~2,180 r/s on 50 ms PG queries.
+- **Pool over WAN**: if `PG.connect` round-trip is >50 ms, expect pool fill at startup to take `pool_size / parallel_fill_threads × RTT`. `hyperion-async-pg 0.5.1+` auto-scales `parallel_fill_threads` so pool=200 fills in ~1-2 s.
+
+### How to read p50 vs p99
+
+Tail latency tells the queueing story; rps tells the throughput story. Hyperion's tail wins are **always** bigger than its rps wins — sometimes the rps numbers look close to a competitor while p99 is 5-200× lower:
+
+| Workload | Hyperion rps / p99 | Closest competitor | rps ratio | p99 ratio |
+|---|---|---|---:|---:|
+| Hello `-w 4` | 21,215 r/s / 1.87 ms | Falcon 24,061 / 9.78 ms | 0.88× | **5.2× lower** |
+| CPU JSON `-w 4` | 15,582 r/s / 2.47 ms | Falcon 18,643 / 13.51 ms | 0.84× | **5.5× lower** |
+| Static 1 MiB | 1,919 r/s / 4.22 ms | Puma 2,074 / 55 ms | 0.93× | **13× lower** |
+| PG-wait `-w 1` pool=200 | 2,180 r/s / 668 ms | Puma 530 r/s + 200 timeouts | **4.1×** | qualitative crush |
+
+**Size capacity by p99, not by mean.** Throughput peaks are easy to fake under controlled bench conditions; tail latency reflects what your slowest user actually experiences when the load balancer fans them onto a busy worker.
+
 ## Logging
 
 Default behaviour (rc16+):

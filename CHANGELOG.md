@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.6.1] - 2026-04-27
+
+Audit follow-up from the [BENCH_2026_04_27.md](docs/BENCH_2026_04_27.md) sweep. No code-path changes; doc surface and operator-UX polish.
+
+### Added
+- **`## Operator guidance` README section** — concrete "when do I pick which config?" tables. Translates the bench numbers into decisions: `-w 1 + larger pool` vs `-w N + smaller pool` for I/O-bound (multi-worker is 2.6× memory for 0.77× rps if you pick wrong on PG-wait); the `--async-io` decision tree (default OFF unless you're paired with a fiber-cooperative library); how to read p50 vs p99 (tail wins are 5-200× larger than the rps story suggests — size capacity by p99).
+- **Boot-time advisory warn for orphan `--async-io`** — if `async_io: true` is set but no fiber-cooperative library is loaded (`hyperion-async-pg`, `async-redis`, `async-http`), Hyperion logs a single advisory warn at boot pointing at the operator-guidance docs. The setting is still honoured; the warn just helps operators who flipped the flag expecting a free perf bump (bench showed `--async-io` on hello-world = 47% rps regression + 3.65 s p99 spike).
+- **4 new specs in `spec/hyperion/cli_async_io_warn_spec.rb`** covering all four warn-fire cases (true + no library, false, nil, true + library detected via stub_const).
+
 ## [1.6.0] - 2026-04-27
 
 Two parallel improvements landing in 1.6.0:

@@ -26,6 +26,14 @@ module Hyperion
         Hyperion.logger = Hyperion::Logger.new(level: config.log_level, format: config.log_format)
       end
 
+      # Advisory: operators frequently flip --async-io expecting "fast mode"
+      # without installing a fiber-cooperative I/O library. On hello-world this
+      # costs ~5% rps; on no-I/O workloads more. The flag only pays off when
+      # paired with `hyperion-async-pg` / `async-redis` / `async-http`. We log
+      # once at boot pointing at the operator-guidance docs; the operator's
+      # setting is still honoured.
+      warn_orphan_async_io(config)
+
       # Propagate log_requests so every Connection picks it up via
       # `Hyperion.log_requests?` without needing to thread it through
       # Server/ThreadPool/Master plumbing. Default is ON; nil means "don't
@@ -260,6 +268,35 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
       end
     end
     private_class_method :maybe_enable_yjit
+
+    # Probe table for fiber-cooperative I/O libraries. If `async_io: true` is
+    # set but none of these are loaded, the operator has likely flipped the
+    # flag without reading the bench numbers — `--async-io` adds Async-loop
+    # overhead and only pays off when paired with a library whose I/O calls
+    # yield to the scheduler. Hello-world bench (BENCH_2026_04_27.md) showed
+    # a 47% rps regression + 3.65 s p99 spike on this shape.
+    ASYNC_IO_PROBE_LIBS = {
+      'hyperion-async-pg' => -> { defined?(::Hyperion::AsyncPg) },
+      'async-redis' => -> { defined?(::Async::Redis) },
+      'async-http' => -> { defined?(::Async::HTTP) }
+    }.freeze
+
+    def self.warn_orphan_async_io(config)
+      return unless config.async_io == true # nil and false are both no-ops here
+
+      detected = ASYNC_IO_PROBE_LIBS.select { |_name, probe| probe.call }.keys
+      return unless detected.empty?
+
+      Hyperion.logger.warn do
+        {
+          message: 'async_io enabled but no fiber-cooperative I/O library detected',
+          libraries_checked: ASYNC_IO_PROBE_LIBS.keys,
+          impact: 'async_io adds Async-loop overhead (~5-47% rps depending on workload) and only pays off when paired with a library that yields to the Async scheduler on socket waits.',
+          docs: 'https://github.com/andrew-woblavobla/hyperion#operator-guidance'
+        }
+      end
+    end
+    private_class_method :warn_orphan_async_io
 
     # When admin_token is configured, wrap the app in AdminMiddleware so
     # POST /-/quit and GET /-/metrics become token-protected admin endpoints.
