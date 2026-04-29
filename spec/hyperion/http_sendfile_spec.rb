@@ -184,11 +184,159 @@ RSpec.describe Hyperion::Http::Sendfile do
     it 'propagates SystemCallError from the C primitive without retry' do
       out = StringIO.new(+''.b)
       allow(described_class).to receive(:fast_path_kind).and_return(:native)
+      # 1024 bytes routes through the small-file fast path (Phase 8a).
+      # 65 KiB would route through the streaming `copy` primitive instead.
+      allow(described_class).to receive(:copy_small).once.and_raise(Errno::EPIPE)
       allow(described_class).to receive(:copy).once.and_raise(Errno::EPIPE)
 
       expect do
         described_class.copy_to_socket(out, tempfile, 0, 1024)
       end.to raise_error(Errno::EPIPE)
+    end
+  end
+
+  describe 'Phase 8a — small-file fast path' do
+    it 'exposes a small-file threshold introspection method' do
+      skip 'native ext not loaded' unless described_class.respond_to?(:small_file_threshold)
+
+      expect(described_class.small_file_threshold).to eq(64 * 1024)
+    end
+
+    it 'routes a 1 KiB single-MSS file through copy_small (one call) and not through copy' do
+      skip 'native ext not loaded' unless described_class.respond_to?(:copy_small)
+
+      one_k = Tempfile.new(%w[hy-sf-1k .bin]).tap do |f|
+        f.binmode
+        f.write('A' * 1024)
+        f.flush
+        f.rewind
+      end
+      begin
+        with_socket_pair(1024) do |client, reader|
+          # Spy on both primitives — copy_small should fire exactly once,
+          # copy (the streaming sendfile primitive) should not be invoked
+          # at all because the file fits the small-file threshold.
+          allow(described_class).to receive(:copy_small).and_call_original
+          allow(described_class).to receive(:copy).and_call_original
+
+          written = described_class.copy_to_socket(client, one_k, 0, 1024)
+          client.close
+
+          expect(described_class).to have_received(:copy_small).once
+          expect(described_class).not_to have_received(:copy)
+          expect(written).to eq(1024)
+          expect(reader.value.bytesize).to eq(1024)
+        end
+      ensure
+        one_k.close!
+      end
+    end
+
+    it 'routes an 8 KiB file through copy_small (one call) and not through copy' do
+      skip 'native ext not loaded' unless described_class.respond_to?(:copy_small)
+
+      eight_k = Tempfile.new(%w[hy-sf-8k .bin]).tap do |f|
+        f.binmode
+        f.write('B' * 8192)
+        f.flush
+        f.rewind
+      end
+      begin
+        with_socket_pair(8192) do |client, reader|
+          allow(described_class).to receive(:copy_small).and_call_original
+          allow(described_class).to receive(:copy).and_call_original
+
+          written = described_class.copy_to_socket(client, eight_k, 0, 8192)
+          client.close
+
+          expect(described_class).to have_received(:copy_small).once
+          expect(described_class).not_to have_received(:copy)
+          expect(written).to eq(8192)
+          expect(reader.value).to eq('B' * 8192)
+        end
+      ensure
+        eight_k.close!
+      end
+    end
+
+    it 'falls through to the streaming path at the 65 KiB boundary (just over threshold)' do
+      skip 'native ext not loaded' unless described_class.respond_to?(:copy_small)
+
+      big = Tempfile.new(%w[hy-sf-65k .bin]).tap do |f|
+        f.binmode
+        f.write('C' * (65 * 1024))
+        f.flush
+        f.rewind
+      end
+      begin
+        size = big.size
+        with_socket_pair(size) do |client, reader|
+          allow(described_class).to receive(:copy_small).and_call_original
+
+          written = described_class.copy_to_socket(client, big, 0, size)
+          client.close
+
+          # 65 KiB > SMALL_FILE_THRESHOLD (64 KiB) — small-file path
+          # MUST NOT fire on this size.
+          expect(described_class).not_to have_received(:copy_small)
+          expect(written).to eq(size)
+          expect(reader.value.bytesize).to eq(size)
+        end
+      ensure
+        big.close!
+      end
+    end
+
+    it 'rejects len > SMALL_FILE_THRESHOLD on the C primitive directly' do
+      skip 'native ext not loaded' unless described_class.respond_to?(:copy_small)
+
+      with_socket_pair(0) do |client, _reader|
+        expect do
+          described_class.copy_small(client, tempfile, 0, (64 * 1024) + 1)
+        end.to raise_error(ArgumentError, /SMALL_FILE_THRESHOLD/)
+        client.close
+      end
+    end
+  end
+
+  describe 'Phase 8b — splice(2) through pipe (Linux-only)' do
+    it 'exposes splice_supported? introspection on every host' do
+      expect([true, false]).to include(described_class.splice_supported?)
+    end
+
+    it 'reports splice_supported? == true on Linux builds' do
+      skip 'non-Linux host' unless /linux/i.match?(RbConfig::CONFIG['host_os'])
+
+      expect(described_class.splice_supported?).to be(true)
+    end
+
+    it 'invokes copy_splice on the streaming path on Linux for files > 64 KiB' do
+      skip 'splice path not compiled' unless described_class.respond_to?(:copy_splice)
+      skip 'splice path inert on this host' unless described_class.splice_supported?
+
+      with_socket_pair(payload.bytesize) do |client, reader|
+        allow(described_class).to receive(:copy_splice).and_call_original
+
+        written = described_class.copy_to_socket(client, tempfile, 0, payload.bytesize)
+        client.close
+
+        # On Linux the streaming loop must invoke copy_splice at least
+        # once; the kernel will route the page-cached file -> pipe ->
+        # socket without copying through userspace.
+        expect(described_class).to have_received(:copy_splice).at_least(:once)
+        expect(written).to eq(payload.bytesize)
+        expect(reader.value).to eq(payload)
+      end
+    end
+
+    it 'falls back to copy() on non-Linux builds — splice_supported? is false' do
+      skip 'this host has splice' if described_class.splice_supported?
+
+      # On macOS / BSD splice_supported? is false; the streaming loop
+      # uses plain sendfile (the existing 1 MiB integrity test in
+      # `.copy_to_socket — round-trip integrity` already covers byte
+      # equality on this host, so we just assert the gate is closed.
+      expect(described_class.splice_supported?).to be(false)
     end
   end
 
