@@ -1,5 +1,170 @@
 # Changelog
 
+## [2.0.0] - 2026-04-29
+
+RFC §3 2.0.0 — the breaking-removal release that closes the deprecation
+cycle opened in 1.8.0, plus Phase 6 of the perf overhaul: a Rust
+HPACK encoder/decoder shipped as `ext/hyperion_h2_codec` with
+graceful fallback to `protocol-http2` when Rust isn't available at
+install time.
+
+This is the largest API-surface change since 1.0. Operators on the
+1.8 line who paid attention to the deprecation warns have no further
+action to take; operators jumping from 1.6.x straight to 2.0 should
+read the migration table in [docs/RFC_2_0_DESIGN.md §4](docs/RFC_2_0_DESIGN.md).
+
+### Breaking changes (removals from 1.8 deprecations)
+
+- **Flat-name DSL keys removed.** All 13 flat keys
+  (`h2_max_concurrent_streams`, `h2_initial_window_size`,
+  `h2_max_frame_size`, `h2_max_header_list_size`, `h2_max_total_streams`,
+  `admin_token`, `admin_listener_port`, `admin_listener_host`,
+  `worker_max_rss_mb`, `worker_check_interval`, `log_level`,
+  `log_format`, `log_requests`) no longer parse on the Ruby DSL.
+  `Hyperion::Config.load` raises `NoMethodError` from the DSL
+  evaluator if a config file uses them. Migration: wrap in the nested
+  block (`h2 do; max_concurrent_streams 256; end`, `admin do; token
+  ENV['T']; end`, etc — see the migration table in the RFC).
+
+  CLI flags keep their flat operator-facing spellings unchanged
+  (`--admin-token`, `--worker-max-rss-mb`, `--log-level`, …); only
+  the in-Ruby DSL surface lost the flat names.
+
+- **`Hyperion.metrics =` / `Hyperion.logger =` setters removed.** The
+  module-level writers no longer exist (the readers stay as
+  `Runtime.default` delegators for REPL convenience).
+
+  Migration recipes:
+  ```ruby
+  # before
+  Hyperion.metrics = MyMetricsAdapter.new
+
+  # after — option A: mutate the default Runtime in-place
+  Hyperion::Runtime.default.metrics = MyMetricsAdapter.new
+
+  # after — option B: per-Server isolation (preferred for new code)
+  runtime = Hyperion::Runtime.new(metrics: MyMetricsAdapter.new)
+  Hyperion::Server.new(app: my_app, runtime: runtime).start
+  ```
+
+- **Dual-emit Prometheus keys retired.** 1.7.0 introduced per-mode
+  dispatch counters (`:requests_dispatch_threadpool_h1`,
+  `:requests_dispatch_tls_h2`, etc.) and dual-emitted the legacy
+  `:requests_async_dispatched` / `:requests_threadpool_dispatched`
+  alongside them. 2.0 keeps only the per-mode keys. Operators on
+  Grafana dashboards from the 1.x line had two minor releases
+  (1.7→1.8) to migrate; the legacy keys are simply gone now.
+
+- **Default flip on `h2.max_total_streams`.** The 1.7→1.8 default
+  was nil (admission control disabled). 2.0 defaults to
+  `max_concurrent_streams × workers × 4`, computed at config-finalize
+  time once the worker count is known. The headroom factor (4×) is
+  large enough that no realistic legitimate workload trips the cap;
+  the abuse path (5,000 conns × 128 streams = 640k fibers → OOM)
+  closes by default.
+
+  Per-worker example caps:
+  - 1 worker:  cap = 128 × 1 × 4 =   512
+  - 4 workers: cap = 128 × 4 × 4 =  2,048
+  - 32 workers: cap = 128 × 32 × 4 = 16,384
+
+  Operator override:
+  ```ruby
+  h2 do
+    max_total_streams :unbounded   # restore pre-2.0 unbounded
+    # or:
+    max_total_streams 8192         # explicit fixed cap
+  end
+  ```
+
+### Phase 6 — Rust HPACK + h2 frame codec
+
+New native extension at `ext/hyperion_h2_codec`:
+
+- Self-contained, zero-dependency Rust crate (RFC 7541 HPACK
+  encoder/decoder + RFC 7541 Appendix B static Huffman decoder +
+  RFC 7540 §6 frame primitives).
+- Exposed to Ruby via `extern "C"` + Fiddle (`lib/hyperion/h2_codec.rb`).
+  No magnus, no transitive crate fetching at install time.
+- ABI version guard — Ruby refuses to load a binary that disagrees
+  with `EXPECTED_ABI`, so a stale on-disk codec from a prior install
+  can't crash the process.
+- `Hyperion::H2Codec.available?` reports load state. `Encoder` /
+  `Decoder` are instance-per-connection, hold owned Rust pointers,
+  finalize via `ObjectSpace.define_finalizer`.
+
+Microbench (50,000 iterations, M2 Pro, opt-level=3 LTO):
+
+| Operation     | Rust (us/op) | protocol-hpack (us/op) | speedup |
+|---------------|--------------|------------------------|---------|
+| HPACK encode  | 9.0          | 29.2                   | 3.26×   |
+| HPACK decode  | 6.3          | 12.5                   | 1.98×   |
+
+The h2load wire-level bench (`bench/h2_post.ru` + `h2load -c 1 -m 100
+-n 5000`) was not run on the Mac dev host (h2load isn't installed
+locally) — operators on Linux should re-run to confirm the 4,000+
+r/s target.
+
+#### Fallback path
+
+The codec is opt-in at runtime. When `cargo` is missing or the build
+fails (`gem install` on a host without Rust), `extconf.rb` writes a
+no-op Makefile and gem install completes — Hyperion boots with
+`H2Codec.available? == false` and serves h2 traffic via
+`protocol-http2`'s Ruby HPACK exactly as it did in 1.x.
+
+`Http2Handler#codec_native?` reports the per-handler view; the boot
+log carries a one-shot info line per process:
+
+```json
+{"message":"h2 codec selected","mode":"native (Rust)","native_available":true}
+```
+
+Two new metrics counters bump on first construction:
+`:h2_codec_native_selected` or `:h2_codec_fallback_selected`.
+
+### Phase 6c (deferred to 2.x)
+
+The connection state machine + framer continue to be driven by
+`protocol-http2` for now. Splicing the native codec directly into
+the framer's encode/decode hot paths requires unifying the framer
+abstraction layer; that work lands in a 2.x point release once the
+production rollout shows the boot probe is green and the encoder/
+decoder paths haven't surfaced any RFC edge case the static-table-
++-Huffman-only encoder doesn't cover.
+
+### Spec count
+
+499 (1.8.0) → 521 (2.0.0). +22 examples covering: removed-API
+smoke checks, default flip arithmetic + sentinel handling, RFC 7541
+C.2.1 + C.4.1 vectors, 100-iter random round-trip, native/fallback
+gating, Http2Handler codec_native? readback, one-shot boot log.
+
+### Migration checklist (1.x → 2.0)
+
+1. Search your `config/hyperion.rb` for any of the 13 flat DSL keys.
+   Wrap each in its nested block. The 1.8.0 deprecation log already
+   listed the rewrite per key.
+2. Search your application for `Hyperion.metrics =` /
+   `Hyperion.logger =`. Replace with `Hyperion::Runtime.default.metrics =`
+   (in-place mutation) or pass a custom `Runtime` to
+   `Hyperion::Server.new`.
+3. If your Grafana boards still query `requests_async_dispatched` /
+   `requests_threadpool_dispatched`, migrate the queries to
+   `requests_dispatch_<mode>` (5 mode keys; see
+   `lib/hyperion/dispatch_mode.rb` for the canonical list).
+4. If you have an h2-heavy multi-tenant edge with extreme stream
+   fan-out (>`max_concurrent_streams × workers × 4` simultaneous
+   streams across the process), set
+   `h2 do; max_total_streams :unbounded; end` to restore the
+   pre-2.0 unbounded behaviour.
+5. (Optional) If `cargo` is on your build hosts, `gem install
+   hyperion-rb` will produce the native HPACK codec automatically
+   and the boot log will report `mode: native (Rust)`. Otherwise
+   you stay on the protocol-http2 fallback with no action needed.
+
+---
+
 ## [1.8.0] - 2026-04-29
 
 RFC §3 1.8.0 deprecation wave + Phase 4 TLS session resumption. Two
