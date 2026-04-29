@@ -264,6 +264,41 @@ Puma**. Hyperion saturates ~91% of the 4,000 r/s ceiling
 (`pool=200 / 0.05 wait`); Puma plateaus at pool=100 because every
 waiting query parks an OS thread.
 
+### Row 7 verification rerun (2026-04-29 21:45 UTC)
+
+Audit of the original sweep revealed two data-integrity issues on this row:
+
+1. The 2,189 r/s figure was added to the report by an ad-hoc rerun whose
+   `wrk.log` was not preserved into `~/bench/sweep20-…/results.jsonl`
+   (the sweep harness logged "never bound to 9314" for both passes
+   because `DATABASE_URL` wasn't sourced from `.env`).
+2. The Puma comparison was apples-to-oranges: `pg-puma-t100-pool100`
+   used **local PG** (max_connections=100), while `pg-hyp-asyncio-pool200`
+   used **WAN PG** at `pg.wobla.space` (max_connections=500). The
+   4.78× ratio is qualitatively correct but the exact magnitude is muddled.
+
+A clean Hyperion rerun against pg.wobla.space (pool=200, two consecutive
+20 s wrk runs) gave **better** numbers than the report originally claimed:
+
+| run | r/s | p50 | p99 | non-2xx | timeouts |
+|---|---:|---:|---:|---:|---:|
+| pg-hyp-pool200 (rerun 1) | **2,510** | 56.7 ms | **295 ms** | 0 | 0 |
+| pg-hyp-pool200 (rerun 2) | **2,624** | 53.5 ms | **377 ms** | 0 | 0 |
+
+**Median of the two reruns: ~2,567 r/s** (+17% vs the originally-reported
+2,189), **p99 ~336 ms** (-44% vs the originally-reported 597 ms).
+
+A matching Puma pool=100 rerun against the same WAN PG could not be
+captured cleanly — leftover Hyperion conns from the prior run had already
+consumed the pg.wobla.space conn budget and Puma collapsed to 1.7 r/s
+with connection exhaustion. The qualitative claim — "Hyperion's async-io
+fiber pool fundamentally beats Puma's threadpool for fiber-cooperative
+I/O at high pool depths" — holds, but operators reading the row should
+treat the **4.78×** ratio as indicative rather than precisely calibrated.
+
+Raw rerun logs preserved at `/tmp/pg-hyp-pool200.wrk.log` on
+`openclaw-vm`.
+
 ## PG realistic transactional
 
 `bench/pg_realistic.ru` (`BEGIN; INSERT; SELECT; COMMIT;` × 4 PG
