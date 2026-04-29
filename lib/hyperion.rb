@@ -75,6 +75,47 @@ module Hyperion
     # with a warn log: warmup is an optimization, not a correctness gate.
     # If, for instance, OpenSSL can't be required in some odd environment,
     # we'd rather start cold than refuse to boot.
+    # PID of the Hyperion master process. Writable so the master records its
+    # own PID at boot; readable everywhere so AdminMiddleware (and other
+    # would-be signallers) can target the master regardless of context.
+    #
+    # Why not `Process.ppid`? Two reasons:
+    #
+    #   1. In single-worker mode, the "master" and "worker" are the same
+    #      process; `Process.ppid` points to the shell / init that launched
+    #      hyperion, NOT to ourselves.
+    #   2. When the master runs as PID 1 inside containerd / Docker (the
+    #      default for `hyperion` as a container CMD), `Process.ppid` from a
+    #      worker is `1` — but the worker IS a child of PID 1, so `kill`ing
+    #      ppid signals the master correctly only by accident, and the
+    #      pre-1.6.3 fallback `ppid > 1 ? ppid : Process.pid` would
+    #      MIS-target the worker itself. (Repro: `docker run -e
+    #      HYPERION_ADMIN_TOKEN=… hyperion` then `curl -X POST /-/quit` —
+    #      response says draining, nothing happens.)
+    #
+    # The master sets this at boot (cluster: Master#run, single: CLI.run_single)
+    # AND exports `HYPERION_MASTER_PID` into ENV so forked workers read the
+    # correct value via copy-on-write. The reader prefers the in-process
+    # ivar (faster) and falls back to ENV (cross-fork) and finally to
+    # `Process.pid` (last-resort: someone constructed AdminMiddleware before
+    # the master booted, or in a non-Hyperion test context).
+    def master_pid
+      return @master_pid if @master_pid
+
+      env = ENV['HYPERION_MASTER_PID']
+      env_pid = env && env =~ /\A\d+\z/ ? env.to_i : nil
+      env_pid&.positive? ? env_pid : Process.pid
+    end
+
+    # Record the master PID and export it for forked workers. Called once
+    # by the master at boot. Workers inherit ENV via fork; the worker's own
+    # `master_pid` ivar stays nil and its reader falls back to ENV.
+    def master_pid!(pid = Process.pid)
+      @master_pid = pid
+      ENV['HYPERION_MASTER_PID'] = pid.to_s
+      pid
+    end
+
     def warmup!
       return if @warmed
 

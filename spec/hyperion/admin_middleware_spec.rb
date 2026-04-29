@@ -26,6 +26,109 @@ RSpec.describe Hyperion::AdminMiddleware do
     end
   end
 
+  describe 'signal target resolution' do
+    # These cover the S1 hotfix: `AdminMiddleware#resolve_signal_target`
+    # used to mistarget when the Hyperion master runs as PID 1 (the
+    # default shape inside containerd / Docker, where `CMD ["hyperion",
+    # …]` makes the master process PID 1). Old logic:
+    #
+    #     ppid = Process.ppid
+    #     ppid > 1 ? ppid : Process.pid
+    #
+    # In a worker forked from a PID-1 master, `Process.ppid` returns 1,
+    # so the fallback branch fired and mistargeted *the worker itself*.
+    # SIGTERM landed on the worker, the master kept running, and the
+    # admin endpoint returned 202 "draining" while nothing happened at
+    # the fleet level. The fix routes resolution through
+    # `Hyperion.master_pid`, which the master writes at boot and
+    # exports into ENV so workers inherit the correct PID via fork.
+
+    # Build a middleware WITHOUT injecting signal_target so the resolver runs.
+    let(:resolving_middleware) { described_class.new(app, token: token) }
+    let(:env_quit) do
+      env_for(method: 'POST', path: '/-/quit',
+              headers: { 'HTTP_X_HYPERION_ADMIN_TOKEN' => token })
+    end
+
+    around do |example|
+      prev_ivar = Hyperion.instance_variable_get(:@master_pid)
+      prev_env  = ENV['HYPERION_MASTER_PID']
+      example.run
+    ensure
+      Hyperion.instance_variable_set(:@master_pid, prev_ivar)
+      if prev_env.nil?
+        ENV.delete('HYPERION_MASTER_PID')
+      else
+        ENV['HYPERION_MASTER_PID'] = prev_env
+      end
+    end
+
+    it 'targets Hyperion.master_pid (NOT Process.ppid) when master runs as PID 1' do
+      # Simulate a worker forked from a master that is PID 1 inside a
+      # container. ppid == 1 is the trap: pre-fix code took the
+      # `ppid > 1 ? ppid : Process.pid` branch and signalled the
+      # worker itself.
+      master_pid_in_container = 1
+      worker_pid_in_container = 42
+      allow(Process).to receive(:ppid).and_return(master_pid_in_container)
+      allow(Process).to receive(:pid).and_return(worker_pid_in_container)
+
+      # The master would have done this at boot before forking us.
+      Hyperion.instance_variable_set(:@master_pid, master_pid_in_container)
+      ENV['HYPERION_MASTER_PID'] = master_pid_in_container.to_s
+
+      expect(Process).to receive(:kill).with('TERM', master_pid_in_container)
+
+      status, = resolving_middleware.call(env_quit)
+      expect(status).to eq(202)
+    end
+
+    it 'reads HYPERION_MASTER_PID from ENV when the in-process ivar is absent (post-fork worker)' do
+      # In a real worker, `Hyperion.master_pid!` was called in the
+      # master only — the child's @master_pid ivar is nil but the env
+      # var was inherited via fork.
+      Hyperion.instance_variable_set(:@master_pid, nil)
+      ENV['HYPERION_MASTER_PID'] = '99999'
+
+      expect(Process).to receive(:kill).with('TERM', 99_999)
+
+      status, = resolving_middleware.call(env_quit)
+      expect(status).to eq(202)
+    end
+
+    it 'falls back to Process.pid when master_pid is unset (single-mode pre-boot or non-Hyperion test context)' do
+      Hyperion.instance_variable_set(:@master_pid, nil)
+      ENV.delete('HYPERION_MASTER_PID')
+      allow(Process).to receive(:pid).and_return(7777)
+
+      expect(Process).to receive(:kill).with('TERM', 7777)
+
+      status, = resolving_middleware.call(env_quit)
+      expect(status).to eq(202)
+    end
+
+    it 'ignores malformed HYPERION_MASTER_PID and falls back to Process.pid' do
+      Hyperion.instance_variable_set(:@master_pid, nil)
+      ENV['HYPERION_MASTER_PID'] = 'not-a-number'
+      allow(Process).to receive(:pid).and_return(8888)
+
+      expect(Process).to receive(:kill).with('TERM', 8888)
+
+      status, = resolving_middleware.call(env_quit)
+      expect(status).to eq(202)
+    end
+
+    it 'prefers the explicit signal_target constructor arg over Hyperion.master_pid' do
+      Hyperion.instance_variable_set(:@master_pid, 11_111)
+      explicit = described_class.new(app, token: token, signal_target: 22_222)
+
+      expect(Process).to receive(:kill).with('TERM', 22_222)
+
+      status, = explicit.call(env_quit)
+      expect(status).to eq(202)
+    end
+  end
+
   describe '#call' do
     subject(:middleware) { described_class.new(app, token: token, signal_target: fake_target) }
 

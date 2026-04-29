@@ -86,6 +86,12 @@ module Hyperion
 
     def run
       install_signal_handlers
+      # Record master PID + export to ENV BEFORE the first fork. Workers
+      # inherit the env var via copy-on-write so AdminMiddleware can target
+      # the master regardless of whether `Process.ppid` is meaningful in
+      # the deployment (containerd / Docker run hyperion as PID 1, where
+      # ppid would point at the host's init or 0). See Hyperion.master_pid.
+      Hyperion.master_pid!(Process.pid)
       Hyperion.logger.info do
         {
           message: 'master starting',

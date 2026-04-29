@@ -36,8 +36,9 @@ module Hyperion
 
       @app           = app
       @token         = token.to_s
-      # Override hook for tests. Defaults to ppid in worker context, pid
-      # for single-worker context (caller decides).
+      # Override hook for tests. When unset, resolve_signal_target consults
+      # Hyperion.master_pid (master writes itself there at boot, exports
+      # HYPERION_MASTER_PID into ENV so forked workers inherit it).
       @signal_target = signal_target
     end
 
@@ -101,10 +102,29 @@ module Hyperion
     def resolve_signal_target
       return @signal_target if @signal_target
 
-      # In a forked worker, ppid IS the master; in single-worker mode,
-      # the master + worker are the same process — signal self.
-      ppid = Process.ppid
-      ppid > 1 ? ppid : Process.pid
+      # Always prefer the explicitly-recorded master PID. In a worker the
+      # master wrote `HYPERION_MASTER_PID` into ENV before forking, so
+      # `Hyperion.master_pid` returns the master from inside the worker
+      # via inherited ENV. In single-mode the master IS the running
+      # process and `master_pid!` set the ivar in #run_single.
+      #
+      # Why not Process.ppid? Two failure modes:
+      #
+      #   1. Master runs as PID 1 inside containerd / Docker (default
+      #      shape: `CMD ["hyperion", "config.ru"]`). A worker's
+      #      `Process.ppid` is 1 — and the previous fallback
+      #      `ppid > 1 ? ppid : Process.pid` then mistargeted the
+      #      *worker itself* on a graceful drain, so SIGTERM killed the
+      #      worker but left the master + the rest of the workers intact.
+      #      Operators saw the admin endpoint return 202 "draining" and
+      #      nothing happen at the fleet level.
+      #
+      #   2. Single-worker mode has no parent Hyperion process; ppid is
+      #      whatever launched us (shell, systemd, a supervisor). Killing
+      #      that is at best confusing, at worst destructive.
+      #
+      # Hyperion.master_pid handles both correctly without any ppid math.
+      Hyperion.master_pid
     end
   end
 end

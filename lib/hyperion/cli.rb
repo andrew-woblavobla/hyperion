@@ -174,6 +174,15 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
     end
 
     def self.run_single(config, app)
+      # Single-mode: there's no fork, but AdminMiddleware still resolves the
+      # signal target via Hyperion.master_pid. Set it to ourselves so
+      # POST /-/quit signals the lone process — same contract as cluster
+      # mode (SIGTERM the master). See Hyperion.master_pid for why we don't
+      # rely on Process.pid alone (the AdminMiddleware reader's fallback
+      # would do that anyway, but making it explicit + writing
+      # HYPERION_MASTER_PID into ENV keeps single/cluster behaviour
+      # symmetric for any external tooling that introspects the var).
+      Hyperion.master_pid!(Process.pid)
       tls = build_tls_from_config(config)
       server = Server.new(host: config.host, port: config.port, app: app,
                           tls: tls, thread_count: config.thread_count,
