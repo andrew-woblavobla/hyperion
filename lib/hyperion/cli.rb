@@ -70,6 +70,12 @@ module Hyperion
       app = wrap_admin_middleware(app, config)
       workers = config.workers.zero? ? Etc.nprocessors : config.workers
 
+      # 2.0 default flip (RFC A7): resolve the `h2.max_total_streams`
+      # auto-sentinel now that worker count is known. After finalize!
+      # the field always carries either a positive integer (cap) or nil
+      # (operator-requested unbounded).
+      config.finalize!(workers: workers)
+
       if workers <= 1
         run_single(config, app)
       else

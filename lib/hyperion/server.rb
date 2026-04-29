@@ -89,7 +89,12 @@ module Hyperion
       @runtime                  = runtime || Hyperion::Runtime.default
       @explicit_runtime         = !runtime.nil?
       @accept_fibers_per_worker = [accept_fibers_per_worker.to_i, 1].max
-      @h2_admission             = if h2_max_total_streams
+      # 2.0: `h2_max_total_streams` is normally a positive integer (the
+      # default-flipped cap from `Config#finalize!`) or nil (operator
+      # opted out via `h2.max_total_streams :unbounded`). Defensive
+      # branch: treat the `:auto` / `:unbounded` sentinels as "no cap"
+      # if a caller bypasses Config and constructs Server directly.
+      @h2_admission             = if h2_max_total_streams.is_a?(Integer) && h2_max_total_streams.positive?
                                     Hyperion::H2Admission.new(max_total_streams: h2_max_total_streams)
                                   end
       @admin_listener_port      = admin_listener_port

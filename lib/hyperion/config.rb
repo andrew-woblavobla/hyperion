@@ -61,12 +61,21 @@ module Hyperion
                  max_header_list_size max_total_streams].freeze
       attr_accessor(*ATTRS)
 
+      # 2.0 default for `max_total_streams`. The literal value `:auto`
+      # is a deferred sentinel: `Config#finalize!` resolves it to
+      # `max_concurrent_streams × workers × 4` once the worker count
+      # is known. Operators wanting the pre-2.0 unbounded behaviour
+      # write `:unbounded` (or `nil` after finalize); operators wanting
+      # a fixed cap write a positive integer.
+      AUTO = :auto
+      UNBOUNDED = :unbounded
+
       def initialize
         @max_concurrent_streams = 128
         @initial_window_size    = 1_048_576
         @max_frame_size         = 1_048_576
         @max_header_list_size   = 65_536
-        @max_total_streams      = nil # RFC A7 — opt-in 1.7; default flips in 2.0.
+        @max_total_streams      = AUTO # 2.0 default — finalize! resolves it.
       end
     end
 
@@ -186,6 +195,46 @@ module Hyperion
       contents = File.read(path)
       DSL.new(cfg).instance_eval(contents, path)
       cfg
+    end
+
+    # Sentinel surfaced through `Config#h2.max_total_streams` when the
+    # operator hasn't touched the setting and 2.0's auto-default formula
+    # ought to compute on their behalf at finalize time. The `nil` value
+    # (RFC §3 1.7 default) used to mean "admission disabled forever";
+    # 2.0 redefines `nil` as "auto" and adds an explicit
+    # `H2Settings::UNBOUNDED` sentinel for operators who want the
+    # pre-2.0 unbounded behaviour.
+    #
+    # The Auto path is a sentinel-only wire — `H2Settings#initialize` no
+    # longer sets a hard `nil`; finalize! resolves it to
+    # `max_concurrent_streams × workers × 4` and writes the result back
+    # onto `h2.max_total_streams`. Operators reading the value before
+    # finalize see the sentinel; after finalize see the resolved
+    # integer.
+    # Resolve any "auto" sentinels to concrete integers based on
+    # finalized peer settings. Called once after `merge_cli!` and after
+    # the worker count is known (Master#initialize / CLI run_single).
+    # Idempotent — a finalized config can be re-finalized without
+    # changing values.
+    def finalize!(workers:)
+      case @h2.max_total_streams
+      when H2Settings::AUTO
+        @h2.max_total_streams = compute_h2_max_total_streams(workers: workers)
+      when H2Settings::UNBOUNDED
+        @h2.max_total_streams = nil
+      end
+      self
+    end
+
+    # 2.0 default formula (RFC §3): per-conn cap × worker count × 4.
+    # The 4× headroom factor assumes the average connection holds 25%
+    # of the per-conn cap; well above realistic legitimate fan-out yet
+    # still bounds the OOM abuse window (5k conns × 128 streams = 640k
+    # fibers).
+    def compute_h2_max_total_streams(workers:)
+      cap_per_conn = @h2.max_concurrent_streams || H2Settings.new.max_concurrent_streams
+      worker_count = (workers && workers.positive? ? workers : 1)
+      cap_per_conn * worker_count * 4
     end
 
     # Apply CLI overrides on top of an existing config. Only non-nil values

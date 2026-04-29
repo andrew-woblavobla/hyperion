@@ -77,6 +77,12 @@ module Hyperion
       @tls          = tls
       @thread_count = thread_count
       @config       = config || Hyperion::Config.new
+      # 2.0 default flip (RFC A7): if the operator hasn't already
+      # finalized the config (e.g. via the CLI bootstrap path), do it
+      # now so the worker count for the auto-cap formula is the one
+      # Master actually uses. `finalize!` is idempotent — a config the
+      # CLI already finalized passes through unchanged.
+      @config.finalize!(workers: @workers || 1)
       @graceful_timeout = @config.graceful_timeout || GRACEFUL_TIMEOUT_SECONDS
       @children     = {} # pid => worker_index
       @next_index   = 0
