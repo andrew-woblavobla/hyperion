@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased] — 1.6.3 hotfix wave (in progress)
+
+Five revertable hotfixes flagged by the post-1.6.0 audits. No RFC items here — those land in 1.7.0+. See [RFC_2_0_DESIGN.md](docs/RFC_2_0_DESIGN.md) for the larger architectural roadmap.
+
+### Fixed
+- **C1 — FiberLocal shim compat with the 1.4.x `thread_variable_*` fixes.** Audit flagged the shim re-introduces a regression we already fixed in 1.4.x. Restore proper thread-local fallback when fibers are not in use; gate the FiberLocal path on `async_io`.
+- **A1 — Lifecycle hooks fire in correct order on `:share` worker model.** `before_fork` / `on_worker_boot` / `on_worker_shutdown` ran out of order on `:share` mode vs `:reuseport`. Aligned both paths.
+- **S1 — `AdminMiddleware#signal_target` ppid mistarget under PID 1 / containerd.** When Hyperion runs as PID 1 in a container, signals were sent to the container init instead of the Hyperion master. Detect PID 1 and fall back to a known-master pidfile / parent walk.
+- **S2 — Cap `Content-Length` parsing at `max_body_bytes + 1`.** Parser previously accepted up to `Integer::MAX`. Reject abusive values with 413 before reading any body.
+- **C2 — `WriterContext` short-circuit on empty-body responses (204/304).** Skip the Mutex hop when there is nothing to write.
+
 ## [1.6.2] - 2026-04-27
 
 Doc release. No code changes.
