@@ -104,6 +104,17 @@ module Hyperion
       body.close if body.respond_to?(:close)
     end
 
+    # 2.0.1 Phase 8 — coalesce head + body into ONE write for small
+    # static files. With Nagle on (kernel default) and TCP_NODELAY off,
+    # `io.write(head)` followed by a separate `write(body)` for an 8 KB
+    # asset stalled ~40 ms per response on the client's delayed-ACK
+    # waiting for the next packet to fill an MSS — capping the static
+    # 8 KB row at 121 r/s vs Puma 1,246. By concatenating head + body
+    # into a single read+write under the threshold (= Sendfile small-
+    # file fast path), the response goes out as one TCP segment train
+    # and the client ACKs immediately. No setsockopt churn required.
+    SENDFILE_COALESCE_THRESHOLD = 64 * 1024
+
     def write_sendfile(io, status, headers, body, keep_alive:)
       path = body.to_path
       file = File.open(path, 'rb')
@@ -118,20 +129,40 @@ module Hyperion
       date_str = cached_date
       head = build_head(status, reason, headers, content_length, keep_alive, date_str)
 
-      io.write(head)
-      # 1.7.0 Phase 1 — Hyperion::Http::Sendfile picks the best path:
-      #   * Linux + plain TCPSocket → native sendfile(2) (true zero-copy,
-      #     page cache → socket buffer, no userspace intermediate).
-      #   * Darwin / *BSD + plain TCPSocket → BSD sendfile(2).
-      #   * TLS-wrapped sockets → 64 KiB IO.copy_stream loop (kernel can't
-      #     encrypt for us; we still bypass the per-chunk fiber-hop).
-      #   * Hosts where the C ext didn't compile → IO.copy_stream fallback.
-      # The helper loops on partial writes and yields to the fiber scheduler
-      # on EAGAIN, so we don't busy-spin under slow-client backpressure.
-      copied = ::Hyperion::Http::Sendfile.copy_to_socket(io, file, 0, file_size)
+      head_bytes = head.bytesize
+
+      # Phase 8 small-file coalescing. For files <= 64 KiB, read the
+      # body bytes inline and emit head + body as one write. This
+      # bypasses the Nagle delayed-ACK stall completely (one TCP
+      # segment train carries everything; client ACKs the whole
+      # response, no second write parked waiting for an ACK on the
+      # first). Bonus: skips the syscall round-trip into copy_small.
+      copied =
+        if file_size.positive? && file_size <= SENDFILE_COALESCE_THRESHOLD
+          body_bytes = file.read(file_size)
+          head << body_bytes if body_bytes
+          io.write(head)
+          file_size
+        else
+          # Streaming path for larger files. 1.7.0 Phase 1 —
+          # Hyperion::Http::Sendfile picks the best kernel route:
+          #   * Linux + plain TCPSocket → native sendfile(2) (true
+          #     zero-copy, page cache → socket buffer, no userspace
+          #     intermediate).
+          #   * Darwin / *BSD + plain TCPSocket → BSD sendfile(2).
+          #   * TLS-wrapped sockets → 64 KiB IO.copy_stream loop
+          #     (kernel can't encrypt for us; we still bypass the
+          #     per-chunk fiber-hop).
+          #   * Hosts where the C ext didn't compile → IO.copy_stream
+          #     fallback.
+          # The helper loops on partial writes and yields to the fiber
+          # scheduler on EAGAIN.
+          io.write(head)
+          ::Hyperion::Http::Sendfile.copy_to_socket(io, file, 0, file_size)
+        end
 
       record_zero_copy_metric(io)
-      Hyperion.metrics.increment(:bytes_written, head.bytesize + copied)
+      Hyperion.metrics.increment(:bytes_written, head_bytes + copied)
     ensure
       file&.close
       body.close if body.respond_to?(:close)

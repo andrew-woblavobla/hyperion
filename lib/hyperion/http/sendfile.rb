@@ -153,26 +153,25 @@ module Hyperion
           false
         end
 
-        # Native streaming loop for files > SMALL_FILE_THRESHOLD.  On
-        # Linux we try the splice(2)-through-pipe path first (Phase 8b)
-        # for an extra ~5-15% over plain sendfile on the 1 MiB row;
-        # falls back to plain `copy` (sendfile) if splice rejects the
-        # fd pair or returns :unsupported (older kernel, sandboxed env).
+        # Native streaming loop for files > SMALL_FILE_THRESHOLD.  Uses
+        # plain sendfile(2) (Linux / BSD / Darwin).
+        #
+        # Phase 8b's splice(2)-through-pipe variant was prototyped as
+        # `copy_splice` but is currently disabled on the hot path —
+        # holding bytes in a persistent per-thread pipe between requests
+        # creates a correctness window where a partial transfer
+        # interrupted by EPIPE can leak residual bytes onto the next
+        # connection's socket.  The underlying primitive is kept in the
+        # C ext for callers that need it (and for the spec coverage)
+        # but the production path stays on the well-tested
+        # sendfile(2) primitive.
         def native_copy_loop(out_io, file_io, offset, len)
           remaining = len
           cursor    = offset
           total     = 0
-          # Once the kernel rejects splice for this fd pair, don't keep
-          # asking — drop to plain sendfile for the rest of the response.
-          splice_ok = splice_available?
 
           while remaining.positive?
-            bytes, status =
-              if splice_ok
-                copy_splice(out_io, file_io, cursor, remaining)
-              else
-                copy(out_io, file_io, cursor, remaining)
-              end
+            bytes, status = copy(out_io, file_io, cursor, remaining)
 
             case status
             when :done
@@ -185,17 +184,11 @@ module Hyperion
             when :eagain
               wait_writable(out_io)
             when :unsupported
-              if splice_ok
-                # Splice rejected this fd pair (e.g. a non-page-cached
-                # filesystem). Drop to plain sendfile and re-issue from
-                # the same cursor.
-                splice_ok = false
-                next
-              end
-              # Plain sendfile also says no. Fall back mid-stream — the
-              # file's read offset is still untouched (we've been passing
-              # absolute offsets through to the kernel), so rewind via
-              # offset arg into the userspace path.
+              # Kernel said this fd pair doesn't support sendfile. Fall
+              # back mid-stream — the file's read offset is still
+              # untouched (we've been passing absolute offsets through
+              # to the kernel), so rewind via offset arg into the
+              # userspace path.
               file_io.seek(cursor) if file_io.respond_to?(:seek)
               return total + userspace_copy_loop(out_io, file_io, cursor, remaining)
             else
@@ -204,15 +197,6 @@ module Hyperion
           end
 
           total
-        end
-
-        # Phase 8b — true iff the C ext was built with the splice branch
-        # AND it's compiled in for this platform.  Cached on first read
-        # to avoid the respond_to? hit per request.
-        def splice_available?
-          return @splice_available if defined?(@splice_available)
-
-          @splice_available = respond_to?(:splice_supported?) && splice_supported? && respond_to?(:copy_splice)
         end
 
         # Userspace fallback. Bypasses the per-chunk fiber-hop in

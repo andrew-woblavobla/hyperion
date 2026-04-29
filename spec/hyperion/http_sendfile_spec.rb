@@ -152,10 +152,11 @@ RSpec.describe Hyperion::Http::Sendfile do
       script_index = 0
 
       allow(described_class).to receive(:fast_path_kind).and_return(:native)
-      allow(described_class).to receive(:copy) do |_out, in_io, offset, len|
-        # Simulate that we read from `in_io` so the userspace fallback path
-        # (if it triggered by mistake) wouldn't be hit. We only return the
-        # scripted answer.
+      # Phase 8b: on Linux the streaming loop tries copy_splice first.
+      # Stub it to defer into the same scripted answers as `copy` so this
+      # test runs identically on macOS (no splice) and Linux (splice
+      # short-circuited here to keep the EAGAIN-yield assertion stable).
+      script_handler = lambda do |_out, in_io, offset, len|
         in_io.seek(offset) if in_io.respond_to?(:seek)
         rec = script[script_index]
         script_index += 1
@@ -166,6 +167,8 @@ RSpec.describe Hyperion::Http::Sendfile do
         end
         rec
       end
+      allow(described_class).to receive(:copy, &script_handler)
+      allow(described_class).to receive(:copy_splice, &script_handler) if described_class.respond_to?(:copy_splice)
 
       written = described_class.copy_to_socket(stub_out, file_io, 0, 256)
 
@@ -310,21 +313,31 @@ RSpec.describe Hyperion::Http::Sendfile do
       expect(described_class.splice_supported?).to be(true)
     end
 
-    it 'invokes copy_splice on the streaming path on Linux for files > 64 KiB' do
+    it 'transfers a 1 MiB file byte-for-byte via copy_splice (primitive-level)' do
       skip 'splice path not compiled' unless described_class.respond_to?(:copy_splice)
       skip 'splice path inert on this host' unless described_class.splice_supported?
 
       with_socket_pair(payload.bytesize) do |client, reader|
-        allow(described_class).to receive(:copy_splice).and_call_original
+        # Drive the splice primitive directly — copy_to_socket no longer
+        # routes through it (plain sendfile is the production streaming
+        # path; persistent per-thread pipes risked leaking residual
+        # bytes between requests on EPIPE). We still own the primitive
+        # and verify byte integrity for callers that opt in.
+        remaining = payload.bytesize
+        cursor    = 0
+        total     = 0
+        while remaining.positive?
+          bytes, status = described_class.copy_splice(client, tempfile, cursor, remaining)
+          break if bytes.zero? && status == :unsupported
 
-        written = described_class.copy_to_socket(client, tempfile, 0, payload.bytesize)
+          total     += bytes
+          cursor    += bytes
+          remaining -= bytes
+          break if status == :done
+        end
         client.close
 
-        # On Linux the streaming loop must invoke copy_splice at least
-        # once; the kernel will route the page-cached file -> pipe ->
-        # socket without copying through userspace.
-        expect(described_class).to have_received(:copy_splice).at_least(:once)
-        expect(written).to eq(payload.bytesize)
+        expect(total).to eq(payload.bytesize)
         expect(reader.value).to eq(payload)
       end
     end
