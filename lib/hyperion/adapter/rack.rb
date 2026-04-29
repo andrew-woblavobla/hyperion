@@ -107,6 +107,19 @@ module Hyperion
                               ::Hyperion::CParser.respond_to?(:upcase_underscore)
       end
 
+      # Phase 3a (1.7.1) — whether the full env-build loop has moved into C.
+      # When true, build_env hands the populated env Hash + Request to the
+      # C ext, which sets REQUEST_METHOD / PATH_INFO / QUERY_STRING /
+      # HTTP_VERSION / SERVER_PROTOCOL / CONTENT_TYPE / CONTENT_LENGTH +
+      # every HTTP_<UPCASED> header in one trip across the FFI boundary.
+      # The Ruby fallback below stays exercised by spec for parity coverage.
+      def self.c_build_env_available?
+        return @c_build_env_available unless @c_build_env_available.nil?
+
+        @c_build_env_available = defined?(::Hyperion::CParser) &&
+                                 ::Hyperion::CParser.respond_to?(:build_env)
+      end
+
       class << self
         # Pre-allocate `n` env-hash and rack-input objects in master before
         # fork. Children inherit the populated free-list via copy-on-write —
@@ -158,13 +171,12 @@ module Hyperion
           input.string = request.body
           input.rewind
 
-          env['REQUEST_METHOD']    = request.method
-          env['PATH_INFO']         = request.path
-          env['QUERY_STRING']      = request.query_string
+          # Adapter-owned (non-header, non-request-line) env. SERVER_NAME/PORT
+          # need split_host, REMOTE_ADDR needs peer info, the rack.* keys are
+          # constants — none of these benefit from the FFI hop, so they stay
+          # in Ruby regardless of c_build_env_available?.
           env['SERVER_NAME']       = server_name
           env['SERVER_PORT']       = server_port
-          env['SERVER_PROTOCOL']   = request.http_version
-          env['HTTP_VERSION']      = request.http_version
           env['SERVER_SOFTWARE']   = "Hyperion/#{Hyperion::VERSION}"
           # Rack apps (Rack::Attack throttles, IpHelper.real_ip, audit logging)
           # require REMOTE_ADDR. Fall back to localhost when no peer info is
@@ -181,19 +193,33 @@ module Hyperion
           env['rack.run_once']     = false
           env['SCRIPT_NAME']       = ''
 
-          # Header-name → Rack env-key conversion. Cache covers the 16 most
-          # common names; uncached headers (X-* customs, vendor-specific) flow
-          # through CParser.upcase_underscore (single C-level allocation) when
-          # the extension is built, else the pure-Ruby triple-allocation path.
-          c_upcase = Rack.c_upcase_available?
-          request.headers.each do |name, value|
-            key = HTTP_KEY_CACHE[name] ||
-                  (c_upcase ? ::Hyperion::CParser.upcase_underscore(name) : "HTTP_#{name.upcase.tr('-', '_')}")
-            env[key] = value
-          end
+          if Rack.c_build_env_available?
+            # Phase 3a (1.7.1) — single FFI call sets REQUEST_METHOD,
+            # PATH_INFO, QUERY_STRING, HTTP_VERSION, SERVER_PROTOCOL,
+            # CONTENT_TYPE, CONTENT_LENGTH, and every HTTP_* header.
+            ::Hyperion::CParser.build_env(env, request)
+          else
+            env['REQUEST_METHOD']  = request.method
+            env['PATH_INFO']       = request.path
+            env['QUERY_STRING']    = request.query_string
+            env['SERVER_PROTOCOL'] = request.http_version
+            env['HTTP_VERSION']    = request.http_version
 
-          env['CONTENT_TYPE']   = env['HTTP_CONTENT_TYPE']   if env.key?('HTTP_CONTENT_TYPE')
-          env['CONTENT_LENGTH'] = env['HTTP_CONTENT_LENGTH'] if env.key?('HTTP_CONTENT_LENGTH')
+            # Header-name → Rack env-key conversion. Cache covers the
+            # 30 most common names; uncached headers (X-* customs,
+            # vendor-specific) flow through CParser.upcase_underscore
+            # (single C-level allocation) when the ext is built, else
+            # the pure-Ruby triple-allocation path.
+            c_upcase = Rack.c_upcase_available?
+            request.headers.each do |name, value|
+              key = HTTP_KEY_CACHE[name] ||
+                    (c_upcase ? ::Hyperion::CParser.upcase_underscore(name) : "HTTP_#{name.upcase.tr('-', '_')}")
+              env[key] = value
+            end
+
+            env['CONTENT_TYPE']   = env['HTTP_CONTENT_TYPE']   if env.key?('HTTP_CONTENT_TYPE')
+            env['CONTENT_LENGTH'] = env['HTTP_CONTENT_LENGTH'] if env.key?('HTTP_CONTENT_LENGTH')
+          end
 
           [env, input]
         end

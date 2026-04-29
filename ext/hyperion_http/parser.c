@@ -1,5 +1,6 @@
 #include <ruby.h>
 #include <ruby/encoding.h>
+#include <ruby/st.h>
 #include <string.h>
 #include "llhttp.h"
 
@@ -34,6 +35,28 @@ static ID id_query_string_kw;
 static ID id_http_version_kw;
 static ID id_headers_kw;
 static ID id_body_kw;
+
+/* Phase 3a (1.7.1) — pre-built frozen Strings for the fixed Rack env keys
+ * we set on every request (REQUEST_METHOD, PATH_INFO, QUERY_STRING,
+ * HTTP_VERSION, SERVER_PROTOCOL) plus the two non-HTTP_ promotions
+ * (CONTENT_TYPE, CONTENT_LENGTH). Allocated once at extension load and
+ * reused as hash keys forever — saves an alloc per key per request. */
+static VALUE rb_kREQUEST_METHOD;
+static VALUE rb_kPATH_INFO;
+static VALUE rb_kQUERY_STRING;
+static VALUE rb_kHTTP_VERSION;
+static VALUE rb_kSERVER_PROTOCOL;
+static VALUE rb_kCONTENT_TYPE;
+static VALUE rb_kCONTENT_LENGTH;
+
+/* Request ivar IDs, looked up once at extension load. Request is a frozen
+ * struct-like value so reading via rb_ivar_get is safe — no dispatch cost,
+ * no method-cache invalidation. */
+static ID id_iv_method;
+static ID id_iv_path;
+static ID id_iv_query_string;
+static ID id_iv_http_version;
+static ID id_iv_headers;
 
 /* Phase 2c (1.7.1) — pre-interned frozen lowercase keys for the 30 most
  * common production HTTP request headers. When llhttp finishes a header
@@ -927,6 +950,197 @@ static VALUE cchunked_body_complete(VALUE self, VALUE rb_buffer, VALUE rb_body_s
     }
 }
 
+/* Look up the pre-interned "HTTP_<UPCASED_UNDERSCORED>" Rack key for a
+ * lowercase header name, or build a fresh one bytewise if it's not on the
+ * 30-entry table. The fresh-build path mirrors cupcase_underscore exactly
+ * — a single Ruby String allocation, US-ASCII encoded.
+ *
+ * Returns the (frozen, table-owned) VALUE on a hit; the freshly-built
+ * (mutable, US-ASCII) VALUE on a miss. Both are safe as Hash keys: Ruby
+ * Hash dups+freezes mutable String keys on insertion. */
+static VALUE http_key_for(VALUE name_str) {
+    const char *src = RSTRING_PTR(name_str);
+    long src_len    = RSTRING_LEN(name_str);
+
+    /* The lowercase keys come straight from the parser's own
+     * stash_pending_header — for the 30 pre-interned entries those
+     * Strings are literally the same VALUE as header_table_lc_v[i],
+     * so we can short-circuit with a pointer compare before falling
+     * back to the byte-equality scan. */
+    for (int i = 0; i < HEADER_TABLE_PAIRS; i++) {
+        if (header_table_lc_v[i] == name_str) {
+            return rb_ary_entry(rb_aHeaderTable, (i * 2) + 1);
+        }
+    }
+    /* Fallback for headers that came in via a non-parser path (e.g.
+     * adapter receives an artificially constructed Request in specs)
+     * — case-insensitive scan against the same table. */
+    int idx = header_table_lookup(src, src_len);
+    if (idx >= 0) {
+        return rb_ary_entry(rb_aHeaderTable, (idx * 2) + 1);
+    }
+
+    /* Not on the table — build "HTTP_<UPCASED_UNDERSCORED>" in one alloc. */
+    VALUE out = rb_str_new(NULL, 5 + src_len);
+    char *dst = RSTRING_PTR(out);
+    dst[0] = 'H'; dst[1] = 'T'; dst[2] = 'T'; dst[3] = 'P'; dst[4] = '_';
+    for (long i = 0; i < src_len; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c >= 'a' && c <= 'z') {
+            dst[5 + i] = (char)(c - 32);
+        } else if (c == '-') {
+            dst[5 + i] = '_';
+        } else {
+            dst[5 + i] = (char)c;
+        }
+    }
+    rb_enc_associate(out, rb_usascii_encoding());
+    RB_GC_GUARD(name_str);
+    return out;
+}
+
+/* Iteration callback for the headers Hash in cbuild_env. `arg` is the env
+ * Hash; we map the lowercase header name to its HTTP_* Rack key (via the
+ * pre-interned table or a one-allocation upcase) and store the value. */
+static int build_env_iter(VALUE name, VALUE value, VALUE arg) {
+    VALUE env = arg;
+    if (TYPE(name) != T_STRING) return ST_CONTINUE;
+
+    VALUE http_key = http_key_for(name);
+    rb_hash_aset(env, http_key, value);
+
+    /* Promote the two RFC-mandated non-HTTP_ env keys. We compare against
+     * the pre-interned VALUEs first (pointer compare, common case) and
+     * fall back to byte compare for off-table-but-still-named matches. */
+    if (name == header_table_lc_v[8] /* "content-length" */ ||
+        (RSTRING_LEN(name) == 14 &&
+         memcmp(RSTRING_PTR(name), "content-length", 14) == 0)) {
+        rb_hash_aset(env, rb_kCONTENT_LENGTH, value);
+    } else if (name == header_table_lc_v[9] /* "content-type" */ ||
+               (RSTRING_LEN(name) == 12 &&
+                memcmp(RSTRING_PTR(name), "content-type", 12) == 0)) {
+        rb_hash_aset(env, rb_kCONTENT_TYPE, value);
+    }
+    return ST_CONTINUE;
+}
+
+/* Hyperion::CParser.build_env(env, request) -> env
+ *
+ * Phase 3a (1.7.1) — populate the Rack env hash with REQUEST_METHOD,
+ * PATH_INFO, QUERY_STRING, HTTP_VERSION, SERVER_PROTOCOL, CONTENT_TYPE,
+ * CONTENT_LENGTH, and HTTP_<UPCASED_UNDERSCORED> for every parsed header.
+ *
+ * The Ruby caller (Hyperion::Adapter::Rack#build_env) sets the rest of the
+ * Rack-required keys (rack.input, REMOTE_ADDR, SERVER_NAME/PORT, …) since
+ * those need a StringIO from a pool and a peer-address split. The header
+ * loop is the bytewise-bound piece and the only thing worth pulling into
+ * C — moving the full env build would mean threading the pool, host
+ * splitter, and version constant through the FFI boundary for ~no extra
+ * win.
+ *
+ * Returns the same env Hash (callers can either chain or ignore).
+ */
+static VALUE cbuild_env(VALUE self, VALUE env, VALUE request) {
+    (void)self;
+    Check_Type(env, T_HASH);
+
+    /* Read Request ivars directly — Request is a frozen value object set
+     * up in initialize; no risk of stale reads, no method-dispatch cost. */
+    VALUE method       = rb_ivar_get(request, id_iv_method);
+    VALUE path         = rb_ivar_get(request, id_iv_path);
+    VALUE query_string = rb_ivar_get(request, id_iv_query_string);
+    VALUE http_version = rb_ivar_get(request, id_iv_http_version);
+    VALUE headers      = rb_ivar_get(request, id_iv_headers);
+
+    rb_hash_aset(env, rb_kREQUEST_METHOD,  method);
+    rb_hash_aset(env, rb_kPATH_INFO,       path);
+    rb_hash_aset(env, rb_kQUERY_STRING,    query_string);
+    rb_hash_aset(env, rb_kSERVER_PROTOCOL, http_version);
+    rb_hash_aset(env, rb_kHTTP_VERSION,    http_version);
+
+    if (TYPE(headers) == T_HASH) {
+        rb_hash_foreach(headers, build_env_iter, env);
+    }
+
+    return env;
+}
+
+/* Hyperion::CParser.parse_cookie_header(cookie_str) -> Hash
+ *
+ * Phase 3b (1.7.1) — split a single Cookie header value into its
+ * { "name" => "value" } pairs.
+ *
+ * Standard format: "name1=val1; name2=val2; name3=val3".
+ * Leading/trailing ASCII whitespace is trimmed around each pair and
+ * around each key. Empty values are valid. Pairs without `=` are skipped
+ * (RFC 6265 calls them ignorable). Repeated names are last-wins —
+ * middlewares that need RFC-strict merge can override.
+ *
+ * Cookies are NOT URL-decoded by spec; values are opaque octets. We
+ * leave them verbatim. The returned Hash is mutable so the caller can
+ * extend it (e.g. for session-cookie hot-swaps).
+ */
+static VALUE cparse_cookie_header(VALUE self, VALUE rb_cookie) {
+    (void)self;
+    Check_Type(rb_cookie, T_STRING);
+
+    VALUE result = rb_hash_new();
+
+    const char *src = RSTRING_PTR(rb_cookie);
+    long src_len    = RSTRING_LEN(rb_cookie);
+    long i = 0;
+
+    while (i < src_len) {
+        /* Skip leading whitespace and stray semicolons. */
+        while (i < src_len && (src[i] == ' ' || src[i] == '\t' ||
+                               src[i] == ';')) {
+            i++;
+        }
+        if (i >= src_len) break;
+
+        /* Pair runs to next ';' (or end of string). */
+        long pair_start = i;
+        while (i < src_len && src[i] != ';') i++;
+        long pair_end = i;
+
+        /* Trim trailing whitespace inside the pair. */
+        while (pair_end > pair_start &&
+               (src[pair_end - 1] == ' ' || src[pair_end - 1] == '\t')) {
+            pair_end--;
+        }
+        if (pair_end == pair_start) continue;
+
+        /* Find '=' inside [pair_start, pair_end). */
+        long eq = -1;
+        for (long j = pair_start; j < pair_end; j++) {
+            if (src[j] == '=') { eq = j; break; }
+        }
+        if (eq < 0) continue; /* malformed — no '=' — skip per RFC 6265. */
+
+        /* Trim trailing ws on key (between pair_start and eq). */
+        long key_end = eq;
+        while (key_end > pair_start &&
+               (src[key_end - 1] == ' ' || src[key_end - 1] == '\t')) {
+            key_end--;
+        }
+        if (key_end == pair_start) continue; /* empty name — skip. */
+
+        /* Skip leading ws on value (between eq+1 and pair_end). */
+        long val_start = eq + 1;
+        while (val_start < pair_end &&
+               (src[val_start] == ' ' || src[val_start] == '\t')) {
+            val_start++;
+        }
+
+        VALUE key = rb_str_new(src + pair_start, key_end - pair_start);
+        VALUE val = rb_str_new(src + val_start,  pair_end - val_start);
+        rb_hash_aset(result, key, val);
+    }
+
+    RB_GC_GUARD(rb_cookie);
+    return result;
+}
+
 void Init_hyperion_http(void) {
     install_settings();
 
@@ -947,6 +1161,10 @@ void Init_hyperion_http(void) {
                                cupcase_underscore, 1);
     rb_define_singleton_method(rb_cCParser, "chunked_body_complete?",
                                cchunked_body_complete, 2);
+    rb_define_singleton_method(rb_cCParser, "build_env",
+                               cbuild_env, 2);
+    rb_define_singleton_method(rb_cCParser, "parse_cookie_header",
+                               cparse_cookie_header, 1);
 
     id_new             = rb_intern("new");
     id_downcase        = rb_intern("downcase");
@@ -956,6 +1174,31 @@ void Init_hyperion_http(void) {
     id_http_version_kw = rb_intern("http_version");
     id_headers_kw      = rb_intern("headers");
     id_body_kw         = rb_intern("body");
+
+    /* Phase 3a (1.7.1) — Request ivars + fixed env-key Strings. The
+     * env-key Strings are deeply frozen and registered via rb_global_variable
+     * so the GC doesn't reclaim them; reusing a single VALUE per fixed key
+     * eliminates a per-request String allocation on the hot path. */
+    id_iv_method       = rb_intern("@method");
+    id_iv_path         = rb_intern("@path");
+    id_iv_query_string = rb_intern("@query_string");
+    id_iv_http_version = rb_intern("@http_version");
+    id_iv_headers      = rb_intern("@headers");
+
+    rb_kREQUEST_METHOD  = rb_obj_freeze(rb_str_new_cstr("REQUEST_METHOD"));
+    rb_kPATH_INFO       = rb_obj_freeze(rb_str_new_cstr("PATH_INFO"));
+    rb_kQUERY_STRING    = rb_obj_freeze(rb_str_new_cstr("QUERY_STRING"));
+    rb_kHTTP_VERSION    = rb_obj_freeze(rb_str_new_cstr("HTTP_VERSION"));
+    rb_kSERVER_PROTOCOL = rb_obj_freeze(rb_str_new_cstr("SERVER_PROTOCOL"));
+    rb_kCONTENT_TYPE    = rb_obj_freeze(rb_str_new_cstr("CONTENT_TYPE"));
+    rb_kCONTENT_LENGTH  = rb_obj_freeze(rb_str_new_cstr("CONTENT_LENGTH"));
+    rb_global_variable(&rb_kREQUEST_METHOD);
+    rb_global_variable(&rb_kPATH_INFO);
+    rb_global_variable(&rb_kQUERY_STRING);
+    rb_global_variable(&rb_kHTTP_VERSION);
+    rb_global_variable(&rb_kSERVER_PROTOCOL);
+    rb_global_variable(&rb_kCONTENT_TYPE);
+    rb_global_variable(&rb_kCONTENT_LENGTH);
 
     /* Phase 2c (1.7.1): build the 30-entry pre-interned header table.
      * Each entry caches the frozen lowercase header name (used as the

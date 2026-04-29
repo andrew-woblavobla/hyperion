@@ -1,5 +1,113 @@
 # Changelog
 
+## [Unreleased] — 1.7.1
+
+Perf-only point release. No behavioural changes; no deprecation warns; no
+new public DSL surface. Three small streams move the hottest header /
+adapter paths out of pure Ruby and into the C extension.
+
+### Phase 2 — per-worker Lint pool + reused inbuf + 30-header intern table
+
+- **`Hyperion::LintWrapperPool` per worker.** When `RACK_ENV=development`
+  Hyperion wraps the app in `Rack::Lint`. The wrapper used to be a
+  per-request allocation; the pool now hands one out per worker so the
+  hot path is allocation-free in dev too.
+- **Reused inbuf on `Connection`.** The connection-level read buffer is
+  a single mutable `String` carried across requests on the same socket
+  (with explicit reset on framing-error / oversized-body / close). Cuts
+  per-request `String#new` traffic on keep-alive workloads.
+- **30-entry pre-interned header table in `CParser`.** Phase 2c —
+  widened from the rc16 16-entry table to cover the full production-
+  traffic top-30 (Sec-Fetch-*, X-Forwarded-Host, X-Real-IP, etc.). The
+  table doubles as the source of truth for `Adapter::Rack::HTTP_KEY_CACHE`
+  so parser, adapter, and downstream env consumers all share string
+  identity (`#equal?` is true) for the common keys.
+  `CParser::PREINTERNED_HEADERS` is the public exposure.
+
+### Phase 3a — env-construction loop moved into C extension
+
+The Ruby-side env build in `Hyperion::Adapter::Rack#build_env` looped
+over `request.headers` setting `env["HTTP_*"] = value` per pair, plus
+the request-line keys (`REQUEST_METHOD`, `PATH_INFO`, `QUERY_STRING`,
+`HTTP_VERSION`, `SERVER_PROTOCOL`) and the two RFC-mandated non-`HTTP_`
+promotions (`CONTENT_LENGTH`, `CONTENT_TYPE`). Every uncached header
+went through `HTTP_KEY_CACHE[name] || CParser.upcase_underscore(name)`,
+which still meant a Ruby Hash lookup + a method dispatch per header.
+
+- **New `Hyperion::CParser.build_env(env, request) -> env`.** Single
+  FFI hop per request that:
+  - Reads the Request's `@method`, `@path`, `@query_string`,
+    `@http_version`, `@headers` ivars directly via `rb_ivar_get` (zero
+    method dispatch — Request is a frozen value object).
+  - Sets `REQUEST_METHOD` / `PATH_INFO` / `QUERY_STRING` /
+    `HTTP_VERSION` / `SERVER_PROTOCOL` using seven pre-frozen,
+    GVAR-anchored String VALUEs (allocated once at extension load).
+  - Walks the headers hash via `rb_hash_foreach`. For each `(name,
+    value)` pair, looks up the Rack key via:
+    1. Pointer compare against `header_table_lc_v[]` (when the name
+       came from the parser, this is a one-instruction hit on the 30
+       pre-interned entries).
+    2. Case-insensitive scan against the same table (covers Request
+       objects constructed in specs without going through the parser).
+    3. Single-allocation `HTTP_<UPCASED_UNDERSCORED>` build (mirrors
+       `cupcase_underscore` byte-for-byte; US-ASCII encoded).
+  - Promotes `content-length` → `CONTENT_LENGTH` and `content-type` →
+    `CONTENT_TYPE` in the same pass (no second walk over env).
+- **`Adapter::Rack#build_env` rewired.** When `c_build_env_available?`
+  is true (memoised probe), the Ruby loop is replaced with a single
+  `::Hyperion::CParser.build_env(env, request)` call. The pre-Phase-3
+  Ruby loop stays in place behind the `else` branch and gets exercised
+  by the parity spec, so a hypothetical missing-extension build still
+  produces byte-identical env hashes.
+- **Bench (macOS arm64, `bench/headers_heavy.ru` + `headers_heavy_wrk.lua`,
+  `-t 5 -w 1`, `wrk -t4 -c100 -d10s`, 3 warmup runs):**
+
+  | | r/s (median of 3) |
+  |---|---:|
+  | Phase 3 OFF (Ruby loop) | 17,555 |
+  | Phase 3 ON (C build_env) | **20,390 (+16%)** |
+
+  Above the 3–5% target — the FFI savings stack with Phase 2c's
+  pointer-compare hit on the pre-interned header keys, since
+  `build_env` now reuses the same identity throughout.
+
+### Phase 3b — cookie split-parse in C extension
+
+Cookie header split (`name1=val1; name2=val2; …` → `{ "name1" => "val1",
+… }`) used to live in Ruby, hit on every session-using endpoint. Pulled
+into C with the same RFC 6265 §5.2 semantics: opaque values (no URL
+decoding), empty values valid, missing-`=` pairs skipped, last-wins on
+repeated names. Whitespace trimmed around each pair and around each
+key, as Ruby's `.strip` would.
+
+- **New `Hyperion::CParser.parse_cookie_header(str) -> Hash`.** Single
+  byte loop in C; returns a fresh (mutable, unfrozen) Ruby Hash so
+  middlewares can extend it. Long values (> 4 KiB session payloads,
+  signed JWT cookies) are passed through unmolested.
+
+### New specs (+27 examples)
+
+- `spec/hyperion/parser_build_env_spec.rb` (11) — request-line keys,
+  HTTP_* mapping, CONTENT_TYPE/CONTENT_LENGTH promotion, identity
+  preservation across all 30 pre-interned header keys, off-table
+  fallback, no-headers tolerance, byte-for-byte parity with the Ruby
+  fallback, last-wins on duplicate names, return-value identity.
+- `spec/hyperion/parser_cookie_split_spec.rb` (16) — single + multi
+  cookies, whitespace tolerance, trailing semicolon, empty value,
+  last-wins, missing-`=` skip, empty input, "=" inside value, no URL
+  decoding, mutable return Hash, 4 KiB long-value, malformed-pair
+  isolation.
+
+### Notes
+
+- `Hyperion::Parser` (pure-Ruby fallback) is unchanged. The
+  `Adapter::Rack#build_env` Ruby branch still reads from
+  `request.headers` and builds env exactly as in 1.7.0; the C path is
+  opt-in via the lazy `c_build_env_available?` probe.
+- Spec count 432 → 475 (+43 across Phase 2 and Phase 3). 432 1.7.0
+  specs unchanged.
+- No version bump in this commit — `1.7.1` lands in the release task.
+
 ## [1.7.0] - 2026-04-29
 
 **Spec count 325 → 432 (+107)** across three parallel streams: +86 RFC additive items, +8 Phase 1 (sendfile fast path), +13 Phase 5 (chunked-write coalescing).
