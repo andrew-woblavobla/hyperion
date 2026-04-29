@@ -49,8 +49,13 @@ module Hyperion
       abort("[hyperion] no such rackup file: #{rackup}") unless File.exist?(rackup)
 
       if config.fiber_local_shim
-        Hyperion::FiberLocal.install!
-        Hyperion.logger.info { { message: 'FiberLocal shim installed' } }
+        # Gate on async_io: with no fibers in play the shim has no purpose
+        # and patching `thread_variable_*` would re-stage the 1.4.x bug
+        # (stranded Logger/Metrics counters across thread-pool jobs running
+        # in distinct fibers). FiberLocal.install! itself enforces this and
+        # warns when ignored — we mirror the gate here for the success log.
+        Hyperion::FiberLocal.install!(async_io: config.async_io == true)
+        Hyperion.logger.info { { message: 'FiberLocal shim installed' } } if Hyperion::FiberLocal.installed?
       end
 
       app = load_rack_app(rackup)

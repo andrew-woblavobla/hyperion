@@ -25,11 +25,38 @@ module Hyperion
   # current Ruby actually isolates `Thread.current[:k]` per-fiber. Raises if
   # not (which would only happen on Ruby < 3.2).
   #
-  # `Hyperion::FiberLocal.install!` — opt-in monkey-patch that ALSO routes
-  # `thread_variable_get`/`thread_variable_set` to fiber storage. Use only
-  # if you know your app stores request scope via thread variables and you
-  # accept the trade-offs (genuine thread-pool patterns will break).
+  # `Hyperion::FiberLocal.install!(async_io:)` — opt-in monkey-patch that
+  # routes `thread_variable_get`/`thread_variable_set` to fiber storage. Use
+  # only if your app uses `thread_variable_set` for request scope under
+  # fiber-per-request concurrency.
+  #
+  # ## 1.4.x compat — the regression this gates against
+  #
+  # 1.4.x fixed a bug where Hyperion's own Logger access buffer + Metrics
+  # counters were stranded under `Async::Scheduler` because they were stored
+  # on `Thread.current[:k]` (which is fiber-local in Ruby 3.2+). The fix
+  # switched those to `Thread#thread_variable_*`, which is the only TRUE
+  # thread-local storage in CRuby (commits f987462 + e8db450). A blanket
+  # FiberLocal monkey-patch would re-route those calls to fiber storage and
+  # restage the exact bug 1.4.x fixed. To stay compatible:
+  #
+  # 1. When `async_io` is OFF (the default — single-thread or thread-pool
+  #    mode, no scheduler in play), `install!` is a no-op. The shim has no
+  #    purpose without fibers, and patching only risks re-introducing the
+  #    1.4.x stranded-counter bug if a thread pool ever runs job N and
+  #    job N+1 in distinct fibers on the same OS thread.
+  # 2. When `async_io` is ON, the patched `thread_variable_*` reserves the
+  #    `__hyperion_*` symbol keys for true thread-local storage so Hyperion's
+  #    Logger/Metrics keep aggregating correctly. Everything else routes to
+  #    `Fiber.current.storage` for fiber-per-request isolation.
   module FiberLocal
+    # Symbol keys with this prefix bypass the fiber-storage routing and use
+    # the original `thread_variable_*` semantics. Hyperion's internal
+    # Logger access buffer + ts-cache and Metrics counters all live behind
+    # this prefix and rely on TRUE thread-local storage to survive fiber
+    # scheduling on the same OS thread (1.4.x guarantee).
+    HYPERION_KEY_PREFIX = '__hyperion_'
+
     @installed = false
 
     class << self
@@ -59,11 +86,36 @@ module Hyperion
       end
 
       # Opt-in patch that routes thread_variable_get/set to fiber storage.
-      # Most apps DO NOT need this — Ruby 3.2+ symbol-keyed Thread.current[]
-      # is already fiber-local. Only install! if your app uses
-      # thread_variable_set for request scope.
-      def install!
+      #
+      # `async_io:` MUST be true to install the shim. With async_io off there
+      # are no fibers in flight and patching only risks the 1.4.x regression
+      # (stranded Logger/Metrics counters when a thread pool runs successive
+      # jobs in different fibers). When async_io is off we log a warning and
+      # leave thread_variable_* on its original (truly thread-local) path.
+      #
+      # Even with the shim installed, `__hyperion_*` symbol keys still route
+      # to the original thread_variable_* — Hyperion's own Logger and Metrics
+      # depend on true thread-local storage and must not be redirected to
+      # fiber storage. See the module docstring for the full rationale.
+      def install!(async_io: false)
         return if @installed
+
+        unless async_io
+          # 1.4.x compat: with no fibers in play the shim has no purpose,
+          # and patching `thread_variable_*` to fiber storage would
+          # re-introduce the bug 1.4.x fixed (Logger/Metrics counters
+          # stranded across thread-pool jobs that happen to run in distinct
+          # fibers on the same OS thread). Make this a no-op and tell the
+          # operator we ignored their flag.
+          Hyperion.logger.warn do
+            { message: 'FiberLocal.install! ignored — async_io is off',
+              hint: 'The shim only matters under fiber-per-request concurrency. ' \
+                    'Enable async_io: true (or pass --async-io) to opt in.' }
+          end
+          return
+        end
+
+        prefix = HYPERION_KEY_PREFIX
 
         ::Thread.class_eval do
           alias_method :__hyperion_orig_tvar_get, :thread_variable_get
@@ -71,15 +123,25 @@ module Hyperion
 
           define_method(:thread_variable_get) do |key|
             sym = key.to_sym
-            storage = ::Fiber.current.storage
-            return storage[sym] if storage&.key?(sym)
+            # Hyperion-internal keys always use TRUE thread-local storage
+            # to preserve the 1.4.x guarantee for Logger/Metrics.
+            return __hyperion_orig_tvar_get(sym) if sym.to_s.start_with?(prefix)
 
-            __hyperion_orig_tvar_get(key)
+            # Fiber#storage returns a COPY, so the canonical fiber-local
+            # access path is `Fiber[]` — it reads through to the underlying
+            # storage and falls back to inherited storage on parent fibers.
+            ::Fiber[sym]
           end
 
           define_method(:thread_variable_set) do |key, value|
-            ::Fiber.current.storage ||= {}
-            ::Fiber.current.storage[key.to_sym] = value
+            sym = key.to_sym
+            # Hyperion-internal keys always use TRUE thread-local storage
+            # to preserve the 1.4.x guarantee for Logger/Metrics.
+            return __hyperion_orig_tvar_set(sym, value) if sym.to_s.start_with?(prefix)
+
+            # Use `Fiber[]=` (not `Fiber.current.storage[k] = v`) — the
+            # latter mutates a copy and does not persist across reads.
+            ::Fiber[sym] = value
           end
         end
 
