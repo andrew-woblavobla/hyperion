@@ -20,6 +20,15 @@ module Hyperion
     DEADLINE_SENTINEL               = :__hyperion_request_deadline__
     OVERSIZED_BODY_SENTINEL         = :__hyperion_oversized_body__
     IDLE_KEEPALIVE_TIMEOUT_SECONDS  = 5
+    # Phase 2b (1.7.1) — per-Connection pre-sized scratch buffer for the
+    # read accumulator. Most HTTP/1.1 request lines + headers fit in a few
+    # hundred bytes; 8 KiB covers ~99% of legitimate traffic without ever
+    # re-allocating. We reuse the same String across keep-alive requests on
+    # the same connection (clear between requests preserves capacity).
+    # Requests larger than 8 KiB still parse correctly — `String#<<` grows
+    # the underlying buffer transparently — they just pay the realloc the
+    # first time, same as the pre-1.7.1 behaviour.
+    INBUF_INITIAL_CAPACITY          = 8 * 1024
 
     # Pre-built canned 413 — body is small + plain text, connection forced
     # closed. Reused across every oversized-CL rejection so the DOS-defense
@@ -89,7 +98,14 @@ module Hyperion
 
     def serve(socket, app, max_request_read_seconds: 60)
       request_count = 0
-      carry = +'' # bytes already pulled off the socket but past the prev request boundary
+      # Phase 2b (1.7.1): pre-size the read accumulator once per connection
+      # and reuse it across keep-alive requests. `String#clear` between
+      # requests preserves the underlying capacity, so subsequent appends
+      # don't pay the realloc tax. Pre-1.7.1 allocated a fresh `+''` per
+      # request; per-connection reuse is a strict win because the previous
+      # request's carry-over bytes (pipelined input) are copied into this
+      # same buffer at the bottom of the loop instead of into a new String.
+      @inbuf ||= String.new(capacity: INBUF_INITIAL_CAPACITY, encoding: Encoding::ASCII_8BIT)
       peer_addr = peer_address(socket)
       @metrics.increment(:connections_accepted)
       @metrics.increment(:connections_active)
@@ -98,9 +114,9 @@ module Hyperion
         # long-lived keep-alive sessions with many small requests don't
         # falsely trip after the cumulative budget elapses.
         request_started_clock = Process.clock_gettime(Process::CLOCK_MONOTONIC) if max_request_read_seconds
-        buffer = read_request(socket, carry, deadline_started_at: request_started_clock,
-                                             max_request_read_seconds: max_request_read_seconds,
-                                             peer_addr: peer_addr)
+        buffer = read_request(socket, @inbuf, deadline_started_at: request_started_clock,
+                                              max_request_read_seconds: max_request_read_seconds,
+                                              peer_addr: peer_addr)
         return unless buffer
 
         if buffer == TIMEOUT_SENTINEL
@@ -124,7 +140,10 @@ module Hyperion
         return if buffer == OVERSIZED_BODY_SENTINEL
 
         request, body_end = @parser.parse(buffer)
-        carry = +(buffer.byteslice(body_end, buffer.bytesize - body_end) || '')
+        # Carry over any pipelined trailing bytes for the next iteration. We
+        # rewrite @inbuf in place — `replace` keeps the underlying capacity
+        # allocation, so the next request starts with a warm 8 KiB buffer.
+        carry_into_inbuf!(buffer, body_end)
         request = enrich_with_peer(request, peer_addr) if peer_addr && request.peer_address.nil?
 
         @metrics.increment(:bytes_read, body_end)
@@ -176,6 +195,25 @@ module Hyperion
     end
 
     private
+
+    # Phase 2b: collapse @inbuf in place to retain only the carry-over (any
+    # bytes past the parsed request boundary, used for keep-alive pipelining).
+    # Operates byte-wise so the underlying capacity allocation stays put —
+    # `String#replace` with `byteslice` would allocate a fresh substring AND
+    # then memcpy back. Splice-with-empty keeps everything in the original
+    # buffer.
+    EMPTY_BIN = String.new('', encoding: Encoding::ASCII_8BIT).freeze
+    def carry_into_inbuf!(buffer, body_end)
+      total = buffer.bytesize
+      if body_end >= total
+        buffer.clear
+      else
+        # Splice the [0, body_end) prefix away. Ruby's String#[]=(start, len, "")
+        # performs an in-place shift of the remaining bytes — no new String
+        # allocation, capacity preserved.
+        buffer[0, body_end] = EMPTY_BIN
+      end
+    end
 
     # Route Rack dispatch through the thread pool when one was injected,
     # otherwise run inline on the current fiber. Inline keeps the test path

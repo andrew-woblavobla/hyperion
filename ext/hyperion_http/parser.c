@@ -35,6 +35,61 @@ static ID id_http_version_kw;
 static ID id_headers_kw;
 static ID id_body_kw;
 
+/* Phase 2c (1.7.1) — pre-interned frozen lowercase keys for the 30 most
+ * common production HTTP request headers. When llhttp finishes a header
+ * the parser's `stash_pending_header` does a case-insensitive O(N=30)
+ * scan against this table; on hit, it stores the pre-frozen lowercase
+ * VALUE as the hash key instead of allocating a fresh `name.downcase`
+ * String per request. The table doubles as an exposure point for the
+ * Ruby-side adapter so HTTP_KEY_CACHE can widen to the same 30 names.
+ *
+ * Memory layout: a flat array of strings, even indices are lowercase
+ * names, odd indices are the corresponding "HTTP_<UPCASED_UNDERSCORED>"
+ * Rack env keys. Both halves are deeply frozen at extension load.
+ */
+#define HEADER_TABLE_PAIRS 30
+static VALUE rb_aHeaderTable;          /* Array(2*30) — name+http key pairs */
+static const char *header_table_lc[HEADER_TABLE_PAIRS] = {
+    "host",             "user-agent",       "accept",         "accept-encoding",
+    "accept-language",  "cache-control",    "connection",     "cookie",
+    "content-length",   "content-type",     "authorization",  "referer",
+    "origin",           "upgrade",          "x-forwarded-for","x-forwarded-proto",
+    "x-forwarded-host", "x-real-ip",        "x-request-id",   "if-none-match",
+    "if-modified-since","if-match",         "etag",           "range",
+    "pragma",           "dnt",              "sec-ch-ua",      "sec-fetch-dest",
+    "sec-fetch-mode",   "sec-fetch-site"
+};
+static const char *header_table_http[HEADER_TABLE_PAIRS] = {
+    "HTTP_HOST",            "HTTP_USER_AGENT",     "HTTP_ACCEPT",         "HTTP_ACCEPT_ENCODING",
+    "HTTP_ACCEPT_LANGUAGE", "HTTP_CACHE_CONTROL",  "HTTP_CONNECTION",     "HTTP_COOKIE",
+    "HTTP_CONTENT_LENGTH",  "HTTP_CONTENT_TYPE",   "HTTP_AUTHORIZATION",  "HTTP_REFERER",
+    "HTTP_ORIGIN",          "HTTP_UPGRADE",        "HTTP_X_FORWARDED_FOR","HTTP_X_FORWARDED_PROTO",
+    "HTTP_X_FORWARDED_HOST","HTTP_X_REAL_IP",      "HTTP_X_REQUEST_ID",   "HTTP_IF_NONE_MATCH",
+    "HTTP_IF_MODIFIED_SINCE","HTTP_IF_MATCH",      "HTTP_ETAG",           "HTTP_RANGE",
+    "HTTP_PRAGMA",          "HTTP_DNT",            "HTTP_SEC_CH_UA",      "HTTP_SEC_FETCH_DEST",
+    "HTTP_SEC_FETCH_MODE",  "HTTP_SEC_FETCH_SITE"
+};
+static VALUE header_table_lc_v[HEADER_TABLE_PAIRS];   /* parallel cached frozen Strings */
+static long  header_table_lc_len[HEADER_TABLE_PAIRS]; /* cached strlen for fast compare */
+
+/* Case-insensitive lookup against the pre-interned header table. Returns
+ * the table index on hit, -1 on miss. Bounded O(30) — vastly faster than
+ * spawning a `String#downcase` allocation per header. */
+static int header_table_lookup(const char *name, long len) {
+    for (int i = 0; i < HEADER_TABLE_PAIRS; i++) {
+        if (header_table_lc_len[i] != len) continue;
+        const char *cand = header_table_lc[i];
+        int match = 1;
+        for (long j = 0; j < len; j++) {
+            unsigned char c = (unsigned char)name[j];
+            if (c >= 'A' && c <= 'Z') c |= 0x20;
+            if (c != (unsigned char)cand[j]) { match = 0; break; }
+        }
+        if (match) return i;
+    }
+    return -1;
+}
+
 typedef struct {
     /* Request line + headers */
     VALUE method;
@@ -89,8 +144,21 @@ static void state_init(parser_state_t *s) {
 
 static void stash_pending_header(parser_state_t *s) {
     if (RSTRING_LEN(s->current_header_name) > 0) {
-        VALUE downcased = rb_funcall(s->current_header_name, id_downcase, 0);
-        rb_hash_aset(s->headers, downcased, s->current_header_value);
+        /* Phase 2c (1.7.1): try the pre-interned table first. On a hit
+         * we reuse the frozen lowercase VALUE — saves a String allocation
+         * per common header. On a miss, fall back to the original
+         * `String#downcase` path so unusual / vendor-specific headers
+         * still flow through unmolested. */
+        const char *name_ptr = RSTRING_PTR(s->current_header_name);
+        long        name_len = RSTRING_LEN(s->current_header_name);
+        int         idx      = header_table_lookup(name_ptr, name_len);
+        VALUE key;
+        if (idx >= 0) {
+            key = header_table_lc_v[idx];
+        } else {
+            key = rb_funcall(s->current_header_name, id_downcase, 0);
+        }
+        rb_hash_aset(s->headers, key, s->current_header_value);
         s->current_header_name  = rb_str_new_cstr("");
         s->current_header_value = rb_str_new_cstr("");
     }
@@ -888,6 +956,29 @@ void Init_hyperion_http(void) {
     id_http_version_kw = rb_intern("http_version");
     id_headers_kw      = rb_intern("headers");
     id_body_kw         = rb_intern("body");
+
+    /* Phase 2c (1.7.1): build the 30-entry pre-interned header table.
+     * Each entry caches the frozen lowercase header name (used as the
+     * env-hash key by stash_pending_header) and the corresponding frozen
+     * "HTTP_<UPCASED_UNDERSCORED>" Rack key (consumed by the Ruby-side
+     * Hyperion::Adapter::Rack via a class-level constant lookup, so all
+     * three layers — parser, adapter, env hash — share string identity).
+     * `rb_aHeaderTable` is registered as a global so the GC doesn't
+     * reclaim its members. */
+    rb_aHeaderTable = rb_ary_new_capa(HEADER_TABLE_PAIRS * 2);
+    rb_global_variable(&rb_aHeaderTable);
+    for (int i = 0; i < HEADER_TABLE_PAIRS; i++) {
+        VALUE lc   = rb_str_new_cstr(header_table_lc[i]);
+        VALUE http = rb_str_new_cstr(header_table_http[i]);
+        rb_obj_freeze(lc);
+        rb_obj_freeze(http);
+        header_table_lc_v[i]   = lc;
+        header_table_lc_len[i] = (long)strlen(header_table_lc[i]);
+        rb_ary_push(rb_aHeaderTable, lc);
+        rb_ary_push(rb_aHeaderTable, http);
+    }
+    rb_obj_freeze(rb_aHeaderTable);
+    rb_define_const(rb_cCParser, "PREINTERNED_HEADERS", rb_aHeaderTable);
 
     /* Phase 1 (1.7.0) — sibling C unit owns Hyperion::Http::Sendfile.
      * Defined in sendfile.c; both objects link into the same .bundle/.so
