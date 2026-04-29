@@ -182,9 +182,6 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
                           max_request_read_seconds: config.max_request_read_seconds,
                           h2_settings: Master.build_h2_settings(config),
                           async_io: config.async_io)
-      server.listen
-      scheme = tls ? 'https' : 'http'
-      Hyperion.logger.info { { message: 'listening', url: "#{scheme}://#{server.host}:#{server.port}" } }
       warn_c_parser_unavailable
 
       # Pre-allocate Rack env-pool entries and eager-touch lazy constants.
@@ -197,7 +194,16 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
       # here (no fork happens), and on_worker_boot/on_worker_shutdown fire
       # for the lone in-process "worker" so app code that opens DB pools etc.
       # gets the same lifecycle whether you run 1 or N workers.
+      #
+      # `on_worker_boot` fires BEFORE the listener is bound — same contract
+      # as the cluster path (Worker#run): the operator's boot hook runs
+      # against a process with no inbound socket yet, so DB/Redis warmup
+      # finishes before the kernel can queue any connections.
       config.on_worker_boot.each { |h| h.call(0) }
+
+      server.listen
+      scheme = tls ? 'https' : 'http'
+      Hyperion.logger.info { { message: 'listening', url: "#{scheme}://#{server.host}:#{server.port}" } }
 
       shutdown_r, shutdown_w = IO.pipe
       %w[INT TERM].each do |sig|

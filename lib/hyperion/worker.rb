@@ -54,17 +54,27 @@ module Hyperion
                           max_request_read_seconds: @max_request_read_seconds,
                           h2_settings: @h2_settings,
                           async_io: @async_io)
+
+      # `on_worker_boot` runs in the child after fork, BEFORE the worker
+      # adopts/binds its listener and before any accept. App code reconnects
+      # DB/Redis pools here so each worker has its own. Index identifies the
+      # slot (0..workers-1) so apps can shard background work if they want.
+      #
+      # Pre-1.6.3 this hook fired AFTER the listener was adopted (`:share`)
+      # or freshly bound with SO_REUSEPORT (`:reuseport`). On `:reuseport`
+      # that meant the kernel could queue inbound connections to the
+      # worker's listen socket while the operator's hook was still warming
+      # up DB pools — observable as first-request latency spikes against
+      # an unready handler. Firing the hook before listener setup makes the
+      # two worker models behave identically: no socket exists for this
+      # worker until the boot hook has returned.
+      @config.on_worker_boot.each { |h| h.call(@worker_index) }
+
       tcp_server = @listener || build_reuseport_listener
       server.adopt_listener(tcp_server)
 
       Signal.trap('TERM') { server.stop }
       Signal.trap('INT')  { server.stop }
-
-      # `on_worker_boot` runs in the child after fork, after the listener is
-      # ready, and before we start accepting. App code reconnects DB/Redis
-      # pools here so each worker has its own. Index identifies the slot
-      # (0..workers-1) so apps can shard background work if they want.
-      @config.on_worker_boot.each { |h| h.call(@worker_index) }
 
       begin
         server.start

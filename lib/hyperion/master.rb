@@ -86,7 +86,6 @@ module Hyperion
 
     def run
       install_signal_handlers
-      bind_master_listener if @worker_model == :share
       Hyperion.logger.info do
         {
           message: 'master starting',
@@ -108,7 +107,19 @@ module Hyperion
       # Operators use it to close shared resources (DB pools, Redis sockets)
       # so each child gets fresh connections rather than inheriting the
       # parent's open fds. Mirrors Puma's hook of the same name.
+      #
+      # IMPORTANT: must fire BEFORE the master binds its listening socket on
+      # `:share` mode. In `:reuseport` mode the master never binds — workers
+      # bind their own SO_REUSEPORT sockets after fork — so `before_fork`
+      # there trivially runs "before any listener exists." Pre-1.6.3 we
+      # bound the master listener first on `:share` and ran `before_fork`
+      # afterwards, which made the two worker models hand off the lifecycle
+      # asymmetrically: an operator using `before_fork` to mutate listening
+      # behaviour saw a different world depending on host OS. Binding here
+      # restores symmetry — in both modes `before_fork` precedes any socket.
       @config.before_fork.each(&:call)
+
+      bind_master_listener if @worker_model == :share
 
       @workers.times { spawn_worker }
 
