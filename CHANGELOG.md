@@ -1,10 +1,13 @@
 # Changelog
 
-## [Unreleased] — 1.7.1
+## [1.7.1] - 2026-04-29
 
-Perf-only point release. No behavioural changes; no deprecation warns; no
-new public DSL surface. Three small streams move the hottest header /
-adapter paths out of pure Ruby and into the C extension.
+Perf-only point release approaching Falcon parity on CPU-bound JSON.
+Phase 2 pools the per-request Lint wrapper, reuses one parser inbuf per
+connection, and widens the pre-interned header table 16 → 30; Phase 3
+moves the env-construction loop and the cookie split-parse out of pure
+Ruby and into the C extension. No behavioural changes, no deprecation
+warns, no new public DSL surface.
 
 ### Phase 2 — per-worker Lint pool + reused inbuf + 30-header intern table
 
@@ -106,7 +109,6 @@ key, as Ruby's `.strip` would.
   opt-in via the lazy `c_build_env_available?` probe.
 - Spec count 432 → 475 (+43 across Phase 2 and Phase 3). 432 1.7.0
   specs unchanged.
-- No version bump in this commit — `1.7.1` lands in the release task.
 
 ## [1.7.0] - 2026-04-29
 
