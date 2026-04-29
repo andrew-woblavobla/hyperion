@@ -18,7 +18,20 @@ module Hyperion
     HEADER_TERM                     = "\r\n\r\n"
     TIMEOUT_SENTINEL                = :__hyperion_read_timeout__
     DEADLINE_SENTINEL               = :__hyperion_request_deadline__
+    OVERSIZED_BODY_SENTINEL         = :__hyperion_oversized_body__
     IDLE_KEEPALIVE_TIMEOUT_SECONDS  = 5
+
+    # Pre-built canned 413 — body is small + plain text, connection forced
+    # closed. Reused across every oversized-CL rejection so the DOS-defense
+    # path stays allocation-free and never has to dip into ResponseWriter
+    # (which would require a full Rack-style headers hash for an error
+    # we can answer with frozen bytes).
+    REJECT_413_PAYLOAD_TOO_LARGE = (+"HTTP/1.1 413 Payload Too Large\r\n" \
+                                     "content-type: text/plain\r\n" \
+                                     "content-length: 18\r\n" \
+                                     "connection: close\r\n" \
+                                     "\r\n" \
+                                     "payload too large\n").freeze
 
     # Default parser is the C-extension `CParser` when the extension built;
     # otherwise we fall back to the pure-Ruby `Parser`. Evaluated each call
@@ -28,10 +41,11 @@ module Hyperion
     end
 
     def initialize(parser: self.class.default_parser, writer: ResponseWriter.new, thread_pool: nil,
-                   log_requests: nil)
-      @parser      = parser
-      @writer      = writer
-      @thread_pool = thread_pool
+                   log_requests: nil, max_body_bytes: MAX_BODY_BYTES)
+      @parser         = parser
+      @writer         = writer
+      @thread_pool    = thread_pool
+      @max_body_bytes = max_body_bytes
       # Cache module-level singletons once per Connection instance so the hot
       # path doesn't re-dispatch through Hyperion.metrics / Hyperion.logger
       # (each was a method call + ivar nil-check on every request).
@@ -75,6 +89,11 @@ module Hyperion
         # Slowloris-style abort: deadline tripped during read. We've already
         # written the 408 (best-effort) inside read_request; close out here.
         return if buffer == DEADLINE_SENTINEL
+
+        # DOS-defense: client declared a Content-Length larger than
+        # max_body_bytes. We've already written the canned 413 + close inside
+        # read_request, BEFORE reading any body bytes. Drop the connection.
+        return if buffer == OVERSIZED_BODY_SENTINEL
 
         request, body_end = @parser.parse(buffer)
         carry = +(buffer.byteslice(body_end, buffer.bytesize - body_end) || '')
@@ -239,6 +258,17 @@ module Hyperion
         end
       else
         content_length = headers_part[/^content-length:\s*(\d+)/i, 1].to_i
+        # DOS-defense: cap declared Content-Length at max_body_bytes BEFORE
+        # we touch the socket again. An attacker advertising
+        # `Content-Length: 99999999999` should not get us to allocate a
+        # multi-GB read buffer or sit in the read loop draining their
+        # body. The pure-int comparison itself is bounded — Ruby's `to_i`
+        # on the regex capture stops at the first non-digit, so even an
+        # adversarial header value can't blow up here. Negative or
+        # malformed values fall through to the parser (which raises
+        # ParseError → 400) so existing behaviour is preserved.
+        return abort_for_oversized_body(socket, content_length, peer_addr) if content_length > @max_body_bytes
+
         while buffer.bytesize < header_end + content_length
           if deadline_exceeded?(deadline_started_at, max_request_read_seconds)
             return abort_for_deadline(socket, deadline_started_at, peer_addr)
@@ -279,6 +309,30 @@ module Hyperion
       end
       @metrics.increment_status(408)
       DEADLINE_SENTINEL
+    end
+
+    # DOS-defense fallback: declared Content-Length exceeds the configured
+    # max_body_bytes. Emit a canned 413 + close BEFORE reading any body
+    # bytes off the socket — that's the whole point of the cap. Best-effort
+    # write so a peer that's already gone away doesn't trip an exception
+    # we'd swallow in the rescue clause anyway.
+    def abort_for_oversized_body(socket, declared_length, peer_addr)
+      @metrics.increment(:oversized_body_rejects)
+      @logger.warn do
+        {
+          message: 'rejected oversized Content-Length',
+          remote_addr: peer_addr,
+          declared_length: declared_length,
+          max_body_bytes: @max_body_bytes
+        }
+      end
+      begin
+        socket.write(REJECT_413_PAYLOAD_TOO_LARGE)
+      rescue StandardError
+        # Peer may have already gone — nothing to do.
+      end
+      @metrics.increment_status(413)
+      OVERSIZED_BODY_SENTINEL
     end
 
     def chunked?(headers_part)
