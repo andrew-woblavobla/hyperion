@@ -97,12 +97,16 @@ module Hyperion
       head = build_head(status, reason, headers, content_length, keep_alive, date_str)
 
       io.write(head)
-      # IO.copy_stream copies up to file_size bytes from the file to the socket.
-      # On Linux + plain TCPSocket this triggers sendfile(2) — kernel-level
-      # zero-copy. On TLS sockets and non-Linux platforms it falls back to
-      # internal read+write loops, but we still avoid building a String the
-      # size of the file in Ruby.
-      copied = IO.copy_stream(file, io, file_size)
+      # 1.7.0 Phase 1 — Hyperion::Http::Sendfile picks the best path:
+      #   * Linux + plain TCPSocket → native sendfile(2) (true zero-copy,
+      #     page cache → socket buffer, no userspace intermediate).
+      #   * Darwin / *BSD + plain TCPSocket → BSD sendfile(2).
+      #   * TLS-wrapped sockets → 64 KiB IO.copy_stream loop (kernel can't
+      #     encrypt for us; we still bypass the per-chunk fiber-hop).
+      #   * Hosts where the C ext didn't compile → IO.copy_stream fallback.
+      # The helper loops on partial writes and yields to the fiber scheduler
+      # on EAGAIN, so we don't busy-spin under slow-client backpressure.
+      copied = ::Hyperion::Http::Sendfile.copy_to_socket(io, file, 0, file_size)
 
       record_zero_copy_metric(io)
       Hyperion.metrics.increment(:bytes_written, head.bytesize + copied)

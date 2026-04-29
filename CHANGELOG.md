@@ -2,7 +2,96 @@
 
 ## [Unreleased] — 1.7.0
 
-First wave of additive ships from `docs/RFC_2_0_DESIGN.md`. All changes are backwards-compatible: every 1.6.3 spec passes without modification, every flat DSL form still works without warns (deprecation lands in 1.8.0), every 1.6.x test stub seam (`allow(Hyperion).to receive(:metrics)`, `Hyperion.instance_variable_set(:@metrics, …)`) keeps working. Spec count 325 → 411 (+86 across the wave).
+First wave of additive ships from `docs/RFC_2_0_DESIGN.md` plus Phase 1 of the perf roadmap (sendfile fast path). All changes are backwards-compatible: every 1.6.3 spec passes without modification, every flat DSL form still works without warns (deprecation lands in 1.8.0), every 1.6.x test stub seam (`allow(Hyperion).to receive(:metrics)`, `Hyperion.instance_variable_set(:@metrics, …)`) keeps working. Spec count 325 → 419 (+94 across the wave: +86 RFC additive, +8 Phase 1).
+
+### Phase 1 — sendfile fast path (close Puma rps gap on static files)
+
+Per `docs/BENCH_2026_04_27.md` the static 1 MiB row left ~8% rps on the
+table vs Puma (Hyperion `-t 5 -w 1` 1,919 r/s vs Puma `-t 5:5` 2,074 r/s)
+even though Hyperion already won the p99 race 13× over. Root cause: the
+Phase-0 static path went through `IO.copy_stream`, which on macOS / non-
+Linux hosts and on TLS sockets falls back to a per-chunk userspace
+read+write loop — each chunk takes the connection's writer mutex and a
+fiber yield. We close that gap with a native zero-copy primitive that
+bypasses the chunk-fiber pipeline entirely.
+
+- **New C unit `ext/hyperion_http/sendfile.c`.** Defines
+  `Hyperion::Http::Sendfile.copy(out_io, in_io, offset, len) -> [bytes, status]`
+  alongside `Sendfile.supported?` / `Sendfile.platform_tag`. Picks the
+  best kernel call at compile time:
+  - **Linux:** `sendfile(2)` with `off_t*` for in-place cursor advance.
+    `splice(2)`-through-pipe support is wired behind the same surface for
+    a follow-up if a host's `sendfile` returns `:unsupported`.
+  - **Darwin / FreeBSD / NetBSD / DragonFly:** native `sendfile(2)` with
+    the BSD signature (offset by value, sent-bytes by `*len` on Darwin
+    and `*sbytes` on the BSDs).
+  - **Other:** raises `NotImplementedError`; Ruby caller drops to the
+    userspace fallback automatically.
+
+  GVL discipline: every kernel call runs under
+  `rb_thread_call_without_gvl` so siblings can run while the socket
+  drains. `EAGAIN` / `EWOULDBLOCK` / `EINTR` return `:eagain` (no busy-
+  spin in C); the Ruby caller yields to the fiber scheduler before
+  retrying. `ENOSYS` / `EINVAL` / `EOPNOTSUPP` return `:unsupported` so
+  the userspace fallback kicks in mid-stream without losing the
+  position cursor.
+
+- **`Hyperion::Http::Sendfile` Ruby façade
+  (`lib/hyperion/http/sendfile.rb`).** Wraps the C primitive with the
+  three behaviours that don't belong in C:
+  - Loops on `:partial` short writes.
+  - Yields on `:eagain` via `IO#wait_writable` (Async-aware) or
+    `IO.select` when no scheduler is active.
+  - Detects TLS sockets (`OpenSSL::SSL::SSLSocket`) and routes them to
+    a 64 KiB `IO.copy_stream` userspace loop — kernel TLS is rarely
+    available, but bypassing the per-chunk WriterContext-style mutex
+    hop still wins a measurable margin over Phase 0. Same fallback fires
+    on hosts where the C ext didn't compile (`Sendfile.supported?` is
+    false), so the contract is portable.
+
+- **`ResponseWriter#write_sendfile` rewired.** Same trigger condition
+  (body responds to `#to_path`) and same metrics (`:sendfile_responses` /
+  `:tls_zerobuf_responses`); the actual byte-pump now goes through
+  `Hyperion::Http::Sendfile.copy_to_socket` so the fast path is
+  available on Darwin (was previously falling back to a userspace copy
+  inside `IO.copy_stream`) and on hosts where Ruby's stdlib `IO.copy_stream`
+  picks a slower path.
+
+- **Specs (`spec/hyperion/http_sendfile_spec.rb`).** Round-trips
+  through a real `TCPSocket` pair — 1 MiB byte-perfect, 1-byte boundary,
+  0-byte short-circuit, mid-file Range slice, simulated `EAGAIN` that
+  asserts the loop yields exactly once and resumes from the right
+  cursor, and a connection-closed-mid-transfer scenario that surfaces
+  `Errno::*` rather than crashing. The existing
+  `spec/hyperion/response_writer_sendfile_spec.rb` keeps passing —
+  `ResponseWriter#write_sendfile`'s public surface is unchanged.
+
+- **Bench result (macOS arm64, `-t 5 -w 1`, `wrk -t4 -c100 -d20s`,
+  bench/static.ru on a 1 MiB asset):**
+
+  | | r/s | p99 |
+  |---|---:|---:|
+  | Puma 7.2 `-t 5:5` (Phase 0 reference) | 2,074 | 55 ms |
+  | Hyperion 1.7.0-pre Phase 0 (`IO.copy_stream` only) | 1,919 | 4.22 ms |
+  | **Hyperion 1.7.0 Phase 1 (Sendfile.copy)** | **2,203 – 2,392** | **2.76 – 2.90 ms** |
+
+  **+15-25% rps over Phase 0, +6-15% rps over Puma, ~20× lower p99 than
+  Puma.** Closes (and reverses) the 8% rps gap. Linux numbers will land
+  in the pre-tag bench sweep (task #112) — Linux's `sendfile(64)` on
+  plain TCP is the same syscall `IO.copy_stream` already picks under
+  the hood, so the Linux delta should be smaller than the Darwin delta;
+  the win there comes from skipping the Ruby-level chunk loop and the
+  ResponseWriter mutex hop (the WriterContext analogue) rather than from
+  trading userspace for kernel zero-copy.
+
+- **Forward-compat note for Phase 5 (chunked-write coalescing).**
+  `Sendfile.copy_to_socket` shares no state with the upcoming
+  `WriterContext` chunk batcher — the static-file path bypasses it
+  entirely, so Phase 5's per-chunk coalescing still composes cleanly:
+  small chunked / Transfer-Encoding bodies get the new io_buffer
+  batching, large `to_path` bodies keep the kernel zero-copy. h2
+  sendfile is deliberately out of scope (writer-fiber single-writer
+  invariant + per-stream window updates make it a 2.0 RFC item).
 
 ### Added
 - **`Hyperion::Runtime` constructor injection (RFC A3).** New `Hyperion::Runtime` class holds `metrics`, `logger`, `clock`. `Runtime.default` is the process-wide singleton (lazy, mutable, NOT frozen — RFC §5 Q4). Module-level `Hyperion.metrics` / `Hyperion.logger` (and their `=` setters) keep working — they delegate to `Runtime.default`. New `runtime:` kwarg on `Hyperion::Server`, `Hyperion::Connection`, `Hyperion::Http2Handler` (default nil → fall through to module accessors so 1.6.x specs pass; non-nil → that runtime is used exclusively, no implicit fallback to module overrides). Multi-tenant deployments can now give each `Server` its own metrics sink.

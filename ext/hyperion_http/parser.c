@@ -888,4 +888,11 @@ void Init_hyperion_http(void) {
     id_http_version_kw = rb_intern("http_version");
     id_headers_kw      = rb_intern("headers");
     id_body_kw         = rb_intern("body");
+
+    /* Phase 1 (1.7.0) — sibling C unit owns Hyperion::Http::Sendfile.
+     * Defined in sendfile.c; both objects link into the same .bundle/.so
+     * so a single `require 'hyperion_http/hyperion_http'` brings up the
+     * full surface. */
+    extern void Init_hyperion_sendfile(void);
+    Init_hyperion_sendfile();
 }
