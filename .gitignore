@@ -10,9 +10,14 @@ Gemfile.lock
 ext/**/*.o
 ext/**/*.bundle
 ext/**/*.so
+ext/**/*.dylib
 ext/**/Makefile
 ext/**/mkmf.log
 lib/hyperion_http/
+lib/hyperion_h2_codec/
+
+# Rust extension build artifacts
+ext/hyperion_h2_codec/target/
 
 # bench output
 bench/keepalive_memory_results/

@@ -20,11 +20,30 @@ Gem::Specification.new do |spec|
     'changelog_uri'   => 'https://github.com/andrew-woblavobla/hyperion/blob/main/CHANGELOG.md'
   }
 
-  spec.files = Dir['lib/**/*.rb', 'bin/*', 'ext/**/*.{rb,c,h}', 'CHANGELOG.md', 'README.md', 'LICENSE']
+  spec.files = Dir[
+    'lib/**/*.rb',
+    'bin/*',
+    'ext/**/*.{rb,c,h,rs}',
+    'ext/hyperion_h2_codec/Cargo.toml',
+    'ext/hyperion_h2_codec/Cargo.lock',
+    'CHANGELOG.md',
+    'README.md',
+    'LICENSE'
+  ]
   spec.bindir = 'bin'
   spec.executables = ['hyperion']
   spec.require_paths = ['lib']
-  spec.extensions = ['ext/hyperion_http/extconf.rb']
+  # Two extensions:
+  #   * `hyperion_http` — llhttp + sendfile + Rack-env builder (C, since 1.x).
+  #   * `hyperion_h2_codec` — Rust HPACK + frame primitives (new in 2.0).
+  #     The Rust extension's extconf.rb gracefully handles a missing
+  #     cargo toolchain by writing a no-op Makefile, so `gem install`
+  #     succeeds on hosts without Rust and Hyperion falls back to
+  #     `protocol-http2`'s Ruby HPACK at runtime.
+  spec.extensions = [
+    'ext/hyperion_http/extconf.rb',
+    'ext/hyperion_h2_codec/extconf.rb'
+  ]
 
   spec.add_dependency 'rack', '>= 3.0', '< 4.0'
   spec.add_dependency 'async', '>= 2.0', '< 3.0'

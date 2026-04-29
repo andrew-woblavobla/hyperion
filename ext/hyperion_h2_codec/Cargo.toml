@@ -1,0 +1,33 @@
+[package]
+name = "hyperion_h2_codec"
+version = "2.0.0"
+edition = "2021"
+publish = false
+description = "Native HPACK + HTTP/2 frame codec for Hyperion (Phase 6)"
+
+[lib]
+crate-type = ["cdylib"]
+name = "hyperion_h2_codec"
+
+# Phase 6 takes the simplest reliable path: a self-contained,
+# zero-dependency RFC 7541 / RFC 7540 implementation in Rust, exposed
+# to Ruby via a thin extern "C" surface and called from MRI through
+# Fiddle. This avoids the magnus toolchain dependency tree (which
+# pulls in 10+ transitive crates and sometimes locks to newer rustc
+# than what `rustup show` reports), at the cost of slightly more
+# verbose Ruby-side glue. The trade-off was right for 2.0: the
+# alternative was deferring Phase 6 because a build-time `cargo fetch`
+# could fail in air-gapped or CI-cache-cold environments.
+#
+# If/when we want a richer Ruby-Rust API surface, the next step is to
+# add `magnus = "0.6"` here and rewrite `lib.rs::ffi` as a magnus
+# `#[magnus::init]` block; the inner pure-Rust modules
+# (`hpack`/`frames`) are deliberately decoupled from the FFI shape so
+# that swap is local.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
