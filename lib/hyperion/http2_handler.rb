@@ -418,6 +418,17 @@ module Hyperion
     #   * `h2_admission:` — Optional `Hyperion::H2Admission` for the
     #                       per-process stream cap (RFC A7). nil keeps
     #                       the 1.6.x unbounded behaviour.
+    #
+    # 2.0.0 (Phase 6b) probes `Hyperion::H2Codec.available?` at
+    # construction so the handler knows whether the native HPACK path
+    # is operational. The connection state machine continues to be
+    # driven by `protocol-http2`'s framer + HPACK Compressor /
+    # Decompressor (battle-tested, RFC-conformant); the native codec
+    # is exposed as `Hyperion::H2Codec::Encoder` / `Decoder` for direct
+    # use, and a future Phase 6c will splice it into the framer's
+    # encode/decode hot paths once the protocol-http2 abstraction
+    # boundary is unified. The probe + boot log makes the swap state
+    # observable now.
     def initialize(app:, thread_pool: nil, h2_settings: nil, runtime: nil, h2_admission: nil)
       @app          = app
       @thread_pool  = thread_pool
@@ -432,7 +443,37 @@ module Hyperion
         @metrics = Hyperion.metrics
         @logger  = Hyperion.logger
       end
-      @h2_admission = h2_admission
+      @h2_admission     = h2_admission
+      @h2_codec_native  = Hyperion::H2Codec.available?
+      record_codec_boot_state
+    end
+
+    # 2.0.0 Phase 6b: emit a single-shot boot log line per process
+    # describing the codec selection. Operators reading the boot log
+    # see whether the native HPACK path is in play. Idempotent across
+    # multiple Http2Handler constructions in the same process.
+    def record_codec_boot_state
+      return if Hyperion::Http2Handler.instance_variable_get(:@codec_state_logged)
+
+      Hyperion::Http2Handler.instance_variable_set(:@codec_state_logged, true)
+      mode = @h2_codec_native ? 'native (Rust)' : 'fallback (protocol-http2)'
+      @logger.info do
+        {
+          message: 'h2 codec selected',
+          mode: mode,
+          native_available: @h2_codec_native
+        }
+      end
+      @metrics.increment(:h2_codec_native_selected) if @h2_codec_native
+      @metrics.increment(:h2_codec_fallback_selected) unless @h2_codec_native
+    end
+
+    # Read-only accessor used by tests + diagnostics. true = the
+    # `Hyperion::H2Codec` Rust extension loaded successfully and is
+    # available for direct encode/decode calls. The wire path itself
+    # may still route through `protocol-http2` until Phase 6c.
+    def codec_native?
+      @h2_codec_native
     end
 
     def serve(socket)

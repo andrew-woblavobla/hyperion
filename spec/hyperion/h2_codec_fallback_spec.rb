@@ -57,8 +57,31 @@ RSpec.describe 'H2Codec fallback (Ruby protocol-http2 path)' do
         h2_settings: { max_concurrent_streams: 8 }
       )
       expect(handler).to be_a(Hyperion::Http2Handler)
+      expect(handler.codec_native?).to be(false)
     ensure
       Hyperion::H2Codec.reset!
+    end
+
+    it 'reports codec_native? true when H2Codec is available' do
+      Hyperion::H2Codec.reset!
+      allow(Hyperion::H2Codec).to receive(:available?).and_return(true)
+      handler = Hyperion::Http2Handler.new(app: ->(_) { [200, {}, ['']] })
+      expect(handler.codec_native?).to be(true)
+    ensure
+      Hyperion::H2Codec.reset!
+    end
+
+    it 'logs the codec selection state at most once per process' do
+      Hyperion::Http2Handler.instance_variable_set(:@codec_state_logged, nil)
+      sink = StringIO.new
+      runtime = Hyperion::Runtime.new(logger: Hyperion::Logger.new(io: sink, format: :json))
+      3.times do
+        Hyperion::Http2Handler.new(app: ->(_) { [200, {}, ['']] }, runtime: runtime)
+      end
+      occurrences = sink.string.scan(/h2 codec selected/).length
+      expect(occurrences).to eq(1)
+    ensure
+      Hyperion::Http2Handler.instance_variable_set(:@codec_state_logged, nil)
     end
   end
 end
