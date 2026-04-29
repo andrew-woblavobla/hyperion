@@ -23,7 +23,9 @@ module Hyperion
                    h2_settings: nil, async_io: nil, runtime: nil,
                    accept_fibers_per_worker: 1, h2_max_total_streams: nil,
                    admin_listener_port: nil, admin_listener_host: '127.0.0.1',
-                   admin_token: nil)
+                   admin_token: nil,
+                   tls_session_cache_size: TLS::DEFAULT_SESSION_CACHE_SIZE,
+                   tls_ticket_key_rotation_signal: :USR2)
       @host                     = host
       @port                     = port
       @app                      = app
@@ -43,6 +45,8 @@ module Hyperion
       @admin_listener_port      = admin_listener_port
       @admin_listener_host      = admin_listener_host
       @admin_token              = admin_token
+      @tls_session_cache_size            = tls_session_cache_size
+      @tls_ticket_key_rotation_signal    = tls_ticket_key_rotation_signal
     end
 
     def run
@@ -68,7 +72,8 @@ module Hyperion
                           h2_max_total_streams: @h2_max_total_streams,
                           admin_listener_port: @admin_listener_port,
                           admin_listener_host: @admin_listener_host,
-                          admin_token: @admin_token)
+                          admin_token: @admin_token,
+                          tls_session_cache_size: @tls_session_cache_size)
 
       # `on_worker_boot` runs in the child after fork, BEFORE the worker
       # adopts/binds its listener and before any accept. App code reconnects
@@ -90,6 +95,7 @@ module Hyperion
 
       Signal.trap('TERM') { server.stop }
       Signal.trap('INT')  { server.stop }
+      install_tls_rotation_signal_handler(server)
 
       begin
         server.start
@@ -112,7 +118,8 @@ module Hyperion
       sock.listen(::Socket::SOMAXCONN)
 
       if @tls
-        ctx = Hyperion::TLS.context(cert: @tls[:cert], key: @tls[:key], chain: @tls[:chain])
+        ctx = Hyperion::TLS.context(cert: @tls[:cert], key: @tls[:key], chain: @tls[:chain],
+                                    session_cache_size: @tls_session_cache_size)
         ssl = ::OpenSSL::SSL::SSLServer.new(sock, ctx)
         ssl.start_immediately = false
         ssl
@@ -120,6 +127,43 @@ module Hyperion
         # Hyperion::Server#adopt_listener accepts any object responding to
         # #accept_nonblock, #accept, #close — which Socket does.
         sock
+      end
+    end
+
+    # Wire the TLS ticket-key rotation signal (default SIGUSR2) to call
+    # `Hyperion::TLS.rotate!` against the per-worker SSLContext. The
+    # signal is broadcast by the master on operator demand or on the
+    # worker's own initiative; either way the receiving worker flushes
+    # its session cache so subsequent connections can no longer resume
+    # against pre-rotation entries.
+    #
+    # When the operator picks `:NONE` the trap is skipped — the default
+    # SIG_DFL handler stays in place and the worker keeps the original
+    # session cache for its full lifetime.
+    def install_tls_rotation_signal_handler(server)
+      return unless @tls
+      return if @tls_ticket_key_rotation_signal.nil?
+      return if @tls_ticket_key_rotation_signal == :NONE
+
+      sig = @tls_ticket_key_rotation_signal.to_s
+      Signal.trap(sig) do
+        ctx = server.ssl_ctx
+        ::Hyperion::TLS.rotate!(ctx) if ctx
+      rescue StandardError
+        # Signal handlers run in the main thread context; swallowing
+        # here avoids a corrupted-trap state if `flush_sessions` raises
+        # against an in-progress flush from a previous signal.
+        nil
+      end
+    rescue ArgumentError
+      # Operator passed a bogus signal name (`:DOES_NOT_EXIST`). Log
+      # and continue — rotation off is acceptable, the worker should
+      # not refuse to boot over a knob typo.
+      Hyperion.logger.warn do
+        {
+          message: 'invalid tls_ticket_key_rotation_signal; rotation disabled',
+          signal: @tls_ticket_key_rotation_signal
+        }
       end
     end
   end

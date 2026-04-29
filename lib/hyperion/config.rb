@@ -52,7 +52,7 @@ module Hyperion
     # Nested subconfig readers. The DSL exposes them as block forms
     # (`h2 do |h| ... end`) and the legacy flat forms (`h2_max_concurrent_streams 256`)
     # both write into the same backing object.
-    attr_reader :h2, :admin, :worker_health, :logging
+    attr_reader :h2, :admin, :worker_health, :logging, :tls
 
     # H2 settings subconfig. RFC 7540 §6.5.2 settings + the new-in-1.7
     # per-process `max_total_streams` admission cap (RFC A7).
@@ -113,6 +113,32 @@ module Hyperion
       end
     end
 
+    # TLS subconfig. New in 1.8.0 (Phase 4 — TLS session resumption).
+    # `session_cache_size` controls the size of the in-process server-
+    # side session cache used to short-circuit the full handshake when a
+    # client returns with a previously-issued session id. The default of
+    # 20_480 is sized for ~16 MiB of cache memory at 800 B/session — well
+    # under the workload-default 128 MiB worker RSS cap.
+    #
+    # `ticket_key_rotation_signal` selects the OS signal that triggers
+    # a session-cache flush + ticket-key roll on the master. `:USR2`
+    # (default) is conventional for "rotate keys" signals (nginx uses
+    # SIGUSR2 for binary-upgrade, but here it's the rotation event).
+    # Set to `:NONE` to disable rotation entirely (workloads that don't
+    # care about ticket-key rotation security guarantees).
+    class TlsConfig
+      ATTRS = %i[session_cache_size ticket_key_rotation_signal].freeze
+      attr_accessor(*ATTRS)
+
+      DEFAULT_SESSION_CACHE_SIZE = 20_480
+      DEFAULT_ROTATION_SIGNAL    = :USR2
+
+      def initialize
+        @session_cache_size         = DEFAULT_SESSION_CACHE_SIZE
+        @ticket_key_rotation_signal = DEFAULT_ROTATION_SIGNAL
+      end
+    end
+
     # Map flat setter name → [subconfig accessor, nested attribute].
     # Used by both the flat-named DSL methods and the `Config#xxx=`
     # forwarders below so there's one source of truth.
@@ -147,6 +173,7 @@ module Hyperion
       @admin         = AdminConfig.new
       @worker_health = WorkerHealthConfig.new
       @logging       = LoggingConfig.new
+      @tls           = TlsConfig.new
     end
 
     # Generate flat-name forwarders so callers reading
@@ -248,7 +275,7 @@ module Hyperion
       # eval'd against a BlockProxy that proxies bareword method calls
       # into the subconfig's accessors; explicit-arg form (`|h|`) gives
       # callers the proxy directly so they can pass it around.
-      %i[h2 admin worker_health logging].each do |group|
+      %i[h2 admin worker_health logging tls].each do |group|
         define_method(group) do |&block|
           subconfig = @config.public_send(group)
           if block.nil?

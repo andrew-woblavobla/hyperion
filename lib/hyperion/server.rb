@@ -68,7 +68,8 @@ module Hyperion
                    max_request_read_seconds: 60, h2_settings: nil, async_io: nil,
                    runtime: nil, accept_fibers_per_worker: 1,
                    h2_max_total_streams: nil, admin_listener_port: nil,
-                   admin_listener_host: '127.0.0.1', admin_token: nil)
+                   admin_listener_host: '127.0.0.1', admin_token: nil,
+                   tls_session_cache_size: TLS::DEFAULT_SESSION_CACHE_SIZE)
       validate_async_io!(async_io)
       @host                     = host
       @port                     = port
@@ -97,7 +98,14 @@ module Hyperion
       @admin_listener           = nil
       @thread_pool              = nil
       @stopped                  = false
+      @tls_session_cache_size   = tls_session_cache_size
     end
+
+    # Read-only handle to the per-worker SSL context (nil when the
+    # listener is plain TCP). Exposed so the worker can call
+    # `Hyperion::TLS.rotate!(server.ssl_context)` from its SIGUSR2
+    # handler without reaching into Server internals.
+    attr_reader :ssl_ctx
 
     # Strict validation of the tri-state `async_io` flag (RFC A9). Pre-1.7
     # the Server constructor accepted any object; `1`, `:yes`, `'true'`
@@ -116,7 +124,8 @@ module Hyperion
       @port = tcp.addr[1]
 
       if @tls
-        @ssl_ctx = TLS.context(cert: @tls[:cert], key: @tls[:key], chain: @tls[:chain])
+        @ssl_ctx = TLS.context(cert: @tls[:cert], key: @tls[:key], chain: @tls[:chain],
+                               session_cache_size: @tls_session_cache_size)
         ssl_server = ::OpenSSL::SSL::SSLServer.new(tcp, @ssl_ctx)
         ssl_server.start_immediately = false
         @server = ssl_server
@@ -144,7 +153,10 @@ module Hyperion
               else
                 sock.local_address.ip_port
               end
-      @ssl_ctx = TLS.context(cert: @tls[:cert], key: @tls[:key], chain: @tls[:chain]) if @tls
+      if @tls
+        @ssl_ctx = TLS.context(cert: @tls[:cert], key: @tls[:key], chain: @tls[:chain],
+                               session_cache_size: @tls_session_cache_size)
+      end
       self
     end
 

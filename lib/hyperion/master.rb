@@ -154,6 +154,41 @@ module Hyperion
         end
       end
       @shutdown_pipe = shutdown_r
+      install_tls_rotation_handler
+    end
+
+    # Wire the master-side handler for the configured TLS ticket-key
+    # rotation signal (default SIGUSR2). When the operator (or an
+    # automated rotation cron) sends SIGUSR2 to the master, we re-emit
+    # it to every live child so each worker flushes its session cache
+    # and OpenSSL rolls a fresh ticket-encryption key.
+    #
+    # The master deliberately does NOT mutate its own listener context
+    # in `:share` mode — the listening fd is shared across children, so
+    # the children's per-context flushes already cover the resumption
+    # pool. This keeps the master accept-loop free.
+    def install_tls_rotation_handler
+      return unless @tls
+
+      sig = @config.tls.ticket_key_rotation_signal
+      return if sig.nil? || sig == :NONE
+
+      Signal.trap(sig.to_s) do
+        @children.each_key do |pid|
+          Process.kill(sig.to_s, pid)
+        rescue StandardError
+          # Worker already exiting / reaped — the next reap_and_respawn
+          # cycle will replace it; rotation does not block on liveness.
+          nil
+        end
+      end
+    rescue ArgumentError
+      Hyperion.logger.warn do
+        {
+          message: 'invalid tls.ticket_key_rotation_signal on master; rotation disabled',
+          signal: @config.tls.ticket_key_rotation_signal
+        }
+      end
     end
 
     # Bind the listening socket in the master so children inherit the fd
@@ -165,7 +200,8 @@ module Hyperion
       @port = tcp.addr[1]
 
       if @tls
-        ctx = TLS.context(cert: @tls[:cert], key: @tls[:key])
+        ctx = TLS.context(cert: @tls[:cert], key: @tls[:key],
+                          session_cache_size: @config.tls.session_cache_size)
         ssl_server = ::OpenSSL::SSL::SSLServer.new(tcp, ctx)
         ssl_server.start_immediately = false
         @listener = ssl_server
@@ -196,7 +232,10 @@ module Hyperion
           h2_max_total_streams: @config.h2.max_total_streams,
           admin_listener_port: @config.admin.listener_port,
           admin_listener_host: @config.admin.listener_host,
-          admin_token: @config.admin.token
+          admin_token: @config.admin.token,
+          # 1.8.0 Phase 4 — TLS session resumption knobs.
+          tls_session_cache_size: @config.tls.session_cache_size,
+          tls_ticket_key_rotation_signal: @config.tls.ticket_key_rotation_signal
         }
         # Hand the inherited socket to the worker in :share mode. In
         # :reuseport mode the worker binds its own with SO_REUSEPORT.
