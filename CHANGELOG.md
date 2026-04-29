@@ -1,8 +1,14 @@
 # Changelog
 
-## [Unreleased] — 1.7.0
+## [1.7.0] - 2026-04-29
 
-First wave of additive ships from `docs/RFC_2_0_DESIGN.md` plus Phase 1 (sendfile fast path) and Phase 5 (chunked-write coalescing) of the perf roadmap. All changes are backwards-compatible: every 1.6.3 spec passes without modification, every flat DSL form still works without warns (deprecation lands in 1.8.0), every 1.6.x test stub seam (`allow(Hyperion).to receive(:metrics)`, `Hyperion.instance_variable_set(:@metrics, …)`) keeps working. Spec count 325 → 432 (+107 across the wave: +86 RFC additive, +8 Phase 1, +13 Phase 5).
+**Spec count 325 → 432 (+107)** across three parallel streams: +86 RFC additive items, +8 Phase 1 (sendfile fast path), +13 Phase 5 (chunked-write coalescing).
+
+First wave of additive ships from `docs/RFC_2_0_DESIGN.md` plus Phase 1 (sendfile fast path) and Phase 5 (chunked-write coalescing) of the perf roadmap. All changes are backwards-compatible: every 1.6.3 spec passes without modification, every flat DSL form still works without warns (deprecation lands in 1.8.0), every 1.6.x test stub seam (`allow(Hyperion).to receive(:metrics)`, `Hyperion.instance_variable_set(:@metrics, …)`) keeps working.
+
+**Headline numbers:**
+- **Phase 1 sendfile** — closes Puma static-file rps gap on 1 MiB asset: 2,392 r/s vs Puma 2,074 (**+15% rps over Puma, ~20× lower p99**).
+- **Phase 5 chunked coalescing** — 1000×50 B SSE workload: 1001 → 11 syscalls (**~91× syscall reduction**).
 
 ### Phase 1 — sendfile fast path (close Puma rps gap on static files)
 
