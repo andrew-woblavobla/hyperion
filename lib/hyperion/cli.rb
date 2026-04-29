@@ -22,8 +22,12 @@ module Hyperion
 
       # Install logger early so every subsequent log call honours the operator's
       # chosen format/level (config file or CLI) before anything else logs.
+      # 1.8.0: write directly to the default Runtime — `Hyperion.logger=` now
+      # emits a deprecation warn aimed at out-of-tree callers, and CLI bootstrap
+      # is the canonical in-tree caller, so we sidestep the warn here.
       if config.log_level || config.log_format
-        Hyperion.logger = Hyperion::Logger.new(level: config.log_level, format: config.log_format)
+        Hyperion::Runtime.default.logger =
+          Hyperion::Logger.new(level: config.log_level, format: config.log_format)
       end
 
       # Advisory: operators frequently flip --async-io expecting "fast mode"

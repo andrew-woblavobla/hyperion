@@ -4,6 +4,7 @@ require_relative 'hyperion/version'
 require_relative 'hyperion/logger'
 require_relative 'hyperion/metrics'
 require_relative 'hyperion/runtime'
+require_relative 'hyperion/deprecations'
 require_relative 'hyperion/dispatch_mode'
 require_relative 'hyperion/config'
 require_relative 'hyperion/h2_admission'
@@ -45,6 +46,14 @@ module Hyperion
     end
 
     def logger=(value)
+      Hyperion::Deprecations.warn_once(
+        :hyperion_logger_setter,
+        '`Hyperion.logger = ...` writes into `Runtime.default` and will be removed in 2.0. ' \
+        'New code should construct a Runtime explicitly: ' \
+        '`Hyperion::Runtime.new(logger: my_logger)` and pass it to `Hyperion::Server.new(runtime:)`. ' \
+        'In-tree code wanting to mutate the default Runtime should call ' \
+        '`Hyperion::Runtime.default.logger = ...` directly.'
+      )
       @logger = value
       Runtime.default.logger = value if value
     end
@@ -56,6 +65,14 @@ module Hyperion
     end
 
     def metrics=(value)
+      Hyperion::Deprecations.warn_once(
+        :hyperion_metrics_setter,
+        '`Hyperion.metrics = ...` writes into `Runtime.default` and will be removed in 2.0. ' \
+        'New code should construct a Runtime explicitly: ' \
+        '`Hyperion::Runtime.new(metrics: my_metrics)` and pass it to `Hyperion::Server.new(runtime:)`. ' \
+        'In-tree code wanting to mutate the default Runtime should call ' \
+        '`Hyperion::Runtime.default.metrics = ...` directly.'
+      )
       @metrics = value
       Runtime.default.metrics = value if value
     end

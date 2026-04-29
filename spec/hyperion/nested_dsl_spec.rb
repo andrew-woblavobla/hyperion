@@ -3,6 +3,12 @@
 require 'tempfile'
 
 RSpec.describe 'Config nested DSL (RFC A4)' do
+  # 1.8.0: flat DSL emits deprecation warns. Silence them in this file so
+  # the existing nested/flat-parity assertions don't drown in stderr noise;
+  # the dedicated `deprecation_warns_spec` exercises the warn behaviour.
+  before { Hyperion::Deprecations.silence! }
+  after { Hyperion::Deprecations.unsilence! }
+
   def write_config(contents)
     Tempfile.create(['hyperion', '.rb']) do |f|
       f.write(contents)
@@ -108,21 +114,14 @@ RSpec.describe 'Config nested DSL (RFC A4)' do
       expect(cfg.h2.max_concurrent_streams).to eq(256)
     end
 
-    it 'does NOT emit a deprecation warn on flat keys (warns land in 1.8)' do
+    it 'still produces an equivalent Config when flat keys are used (1.8 warns but does not change behaviour)' do
       write_config(<<~RUBY) do |path|
         h2_max_concurrent_streams 64
         admin_token 'x'
       RUBY
-        # Capture stderr around the load — warn() goes there.
-        original_stderr = $stderr
-        $stderr = StringIO.new
-        begin
-          Hyperion::Config.load(path)
-        ensure
-          captured = $stderr.string
-          $stderr = original_stderr
-        end
-        expect(captured).not_to match(/deprecat/i)
+        cfg = Hyperion::Config.load(path)
+        expect(cfg.h2.max_concurrent_streams).to eq(64)
+        expect(cfg.admin.token).to eq('x')
       end
     end
   end

@@ -132,6 +132,14 @@ module Hyperion
       log_requests: %i[logging requests]
     }.freeze
 
+    # Pre-rendered "use the nested DSL instead" snippet per flat key.
+    # Computed once at load time so the deprecation warn doesn't pay a
+    # string-build cost on every flat-DSL invocation.
+    FLAT_TO_NESTED_DEPRECATION = FLAT_TO_NESTED.each_with_object({}) do |(flat, (group, nested)), h|
+      h[flat] = "use `#{group} do |#{group[0]}|; #{group[0]}.#{nested} = ...; end` instead — " \
+                "flat `#{flat}` removed in 2.0"
+    end.freeze
+
     def initialize
       DEFAULTS.each { |k, v| public_send(:"#{k}=", v) }
       HOOKS.each { |h| instance_variable_set(:"@#{h}", []) }
@@ -214,8 +222,17 @@ module Hyperion
       # through `Config#flat_setter=` which proxies into the nested
       # subconfig. The DSL surface is unchanged for operators on the
       # 1.6.x flat shape.
+      #
+      # 1.8.0 (RFC §3): each flat-DSL key now emits a one-shot
+      # deprecation warn through `Hyperion::Deprecations`. Behaviour is
+      # unchanged — the value still lands in the same nested slot. The
+      # warn dedup key is the flat name itself, so each key warns once
+      # per process regardless of how many config files / hot-reloads
+      # call into it.
       Config::FLAT_TO_NESTED.each_key do |flat|
+        message = Config::FLAT_TO_NESTED_DEPRECATION[flat]
         define_method(flat) do |value|
+          ::Hyperion::Deprecations.warn_once(:"flat_dsl_#{flat}", message)
           @config.public_send(:"#{flat}=", value)
         end
       end
