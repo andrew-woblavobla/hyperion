@@ -2,7 +2,7 @@
 
 ## [Unreleased] — 1.7.0
 
-First wave of additive ships from `docs/RFC_2_0_DESIGN.md` plus Phase 1 of the perf roadmap (sendfile fast path). All changes are backwards-compatible: every 1.6.3 spec passes without modification, every flat DSL form still works without warns (deprecation lands in 1.8.0), every 1.6.x test stub seam (`allow(Hyperion).to receive(:metrics)`, `Hyperion.instance_variable_set(:@metrics, …)`) keeps working. Spec count 325 → 419 (+94 across the wave: +86 RFC additive, +8 Phase 1).
+First wave of additive ships from `docs/RFC_2_0_DESIGN.md` plus Phase 1 (sendfile fast path) and Phase 5 (chunked-write coalescing) of the perf roadmap. All changes are backwards-compatible: every 1.6.3 spec passes without modification, every flat DSL form still works without warns (deprecation lands in 1.8.0), every 1.6.x test stub seam (`allow(Hyperion).to receive(:metrics)`, `Hyperion.instance_variable_set(:@metrics, …)`) keeps working. Spec count 325 → 432 (+107 across the wave: +86 RFC additive, +8 Phase 1, +13 Phase 5).
 
 ### Phase 1 — sendfile fast path (close Puma rps gap on static files)
 
@@ -92,6 +92,107 @@ bypasses the chunk-fiber pipeline entirely.
   batching, large `to_path` bodies keep the kernel zero-copy. h2
   sendfile is deliberately out of scope (writer-fiber single-writer
   invariant + per-stream window updates make it a 2.0 RFC item).
+
+### Phase 5 — chunked-write coalescing (cut SSE / streaming-JSON syscalls 90×+)
+
+Streaming workloads (SSE event feeds, streaming JSON, log-tail
+responses) push tiny payloads — a typical SSE event is ~50 B. Pre-
+Phase-5 the only multi-write path was `body.each` inside the
+buffered `Content-Length` writer, which accumulated everything in
+userspace before emitting one syscall: real streams couldn't push
+bytes downstream until the body finished, so SSE was structurally
+broken. Phase 5 adds an opt-in `Transfer-Encoding: chunked`
+streaming path with per-response coalescing so each tiny `body.each`
+chunk doesn't translate to its own syscall.
+
+- **`ResponseWriter#write` opt-in branch.** App sets
+  `Transfer-Encoding: chunked` on the response → ResponseWriter
+  takes the streaming path: emit head, iterate `body.each`, frame
+  each chunk per RFC 7230 §4.1, drain into the socket through a
+  per-response coalescing buffer, append `0\r\n\r\n` terminator
+  on close. Apps that don't opt in keep the 1.6.x single-syscall
+  Content-Length path verbatim (one new spec locks this — 100×50 B
+  non-chunked body still emits exactly 1 syscall).
+
+- **`ResponseWriter::ChunkedCoalescer` per-response buffer.**
+  - Chunks `< 512 B` accumulate in a 4 KiB-capacity ASCII-8BIT
+    `String.new(capacity: 4096)` (matches the existing build-head
+    buffer style).
+  - Buffer drains on `>= 4096 B` filled (mid-stream flush) or on
+    end-of-body (`0\r\n\r\n` terminator concatenated into the
+    buffer's final drain so peers never see a half-flushed
+    response between drain + terminator syscalls).
+  - Chunks `>= 512 B` drain the buffer first (preserves byte order
+    on the wire) then write directly — no point coalescing a
+    payload already past the threshold.
+  - Best-effort 1 ms tick: `Process.clock_gettime` check on each
+    chunk arrival; if the buffer has been sitting >= 1 ms since
+    the last drain, flush. Under Async this gives natural
+    flushes between sparse chunks; not a real timer fiber per
+    response (the bookkeeping would cost more than the syscall
+    savings on a short-lived coalescer).
+  - `body.flush` / `:__hyperion_flush__` sentinel honoured —
+    SSE servers use this to push events past the coalescing
+    latency on demand.
+
+- **`build_head_chunked`.** Mirrors `build_head_ruby` but emits
+  `transfer-encoding: chunked` and explicitly drops any
+  app-supplied `content-length` (mutually exclusive per RFC 7230
+  §3.3.3). Pure Ruby — the C builder still always emits
+  content-length and isn't on this branch (low-volume opt-in
+  path; no measurable win from a C builder here).
+
+- **h2 path deliberately untouched.** `Http2Handler::WriterContext`
+  already coalesces at the kernel send-buffer boundary: every
+  encoder fiber enqueues onto the per-connection `Thread::Queue`
+  and a single writer fiber drains it onto the socket. Multiple
+  small DATA frames buffered onto the queue between writer-fiber
+  resumptions get drained back-to-back — TCP's Nagle-style send
+  coalescing (default ON without `TCP_NODELAY`) folds them into
+  the same on-wire packet. Adding a userspace coalescer on top
+  of the queue would interact awkwardly with per-stream window
+  updates and the writer-fiber single-writer invariant; deferred
+  to 2.0 (Rust h2 codec rewrite, RFC §6).
+
+- **Sendfile path (Phase 1) bypasses the coalescer entirely.**
+  Bodies that respond to `#to_path` still take the
+  `IO.copy_stream` / native-sendfile branch. The file IS the
+  body buffer — there are no userspace chunks to coalesce. Phase 1
+  spec sweep (`response_writer_sendfile_spec.rb`,
+  `http_sendfile_spec.rb`) still green.
+
+- **New metrics.** `:chunked_responses` (count of streamed
+  responses), `:chunked_total_writes` (total `socket.write` calls
+  on the chunked path), `:chunked_coalesced_writes` (subset that
+  drained the coalescing buffer rather than passing a large chunk
+  straight through). Operators get
+  `chunked_total_writes / chunked_responses` as the syscall-per-
+  response gauge.
+
+- **Specs (`spec/hyperion/chunked_coalescing_spec.rb`, +13
+  examples).** Lock the syscall-count properties: 100×50 B
+  yields 1 head + 2 body writes (was 1 + 100 = 101 without
+  coalescing — **~33× reduction**); 1000×50 B SSE bench yields 1
+  head + 10 body writes (vs 1 + 1000 = 1001 without coalescing —
+  **~91× reduction**); 10 KiB single chunk = 1 head + 1 body + 1
+  terminator = 3 syscalls; mixed 50/600/50 = 4 syscalls (head +
+  buffer drain + 600 direct + final drain); body.close edge
+  asserts the terminator + buffered payload land in the same
+  syscall; flush sentinel forces an extra mid-stream drain;
+  Async-driven 5 ms quiet period asserts the 1 ms tick fires
+  before chunk #2 arrives; non-chunked Content-Length path stays
+  at exactly 1 syscall (no regression).
+
+- **Bench (`bench/sse.ru`).** New Rack app: streams 1000 SSE
+  events of ~50 B each over a single keep-alive connection,
+  yielding the flush sentinel every 50 events. `wrk -t1 -c1
+  -d10s` measures sustained event throughput; pair with `strace
+  -c -e write` (Linux) or `dtruss -c -t write` (macOS) for the
+  syscall headline. Bench-host numbers land in the pre-tag bench
+  sweep (task #112).
+
+- **Spec sweep delta:** 419 → 432 (+13). All 1.6.x and
+  Phase 1 specs untouched.
 
 ### Added
 - **`Hyperion::Runtime` constructor injection (RFC A3).** New `Hyperion::Runtime` class holds `metrics`, `logger`, `clock`. `Runtime.default` is the process-wide singleton (lazy, mutable, NOT frozen — RFC §5 Q4). Module-level `Hyperion.metrics` / `Hyperion.logger` (and their `=` setters) keep working — they delegate to `Runtime.default`. New `runtime:` kwarg on `Hyperion::Server`, `Hyperion::Connection`, `Hyperion::Http2Handler` (default nil → fall through to module accessors so 1.6.x specs pass; non-nil → that runtime is used exclusively, no implicit fallback to module overrides). Multi-tenant deployments can now give each `Server` its own metrics sink.
