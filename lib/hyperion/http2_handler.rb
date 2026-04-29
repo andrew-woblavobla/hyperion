@@ -655,8 +655,20 @@ module Hyperion
       body_chunks.each { |c| payload << c.to_s }
       body_chunks.close if body_chunks.respond_to?(:close)
 
-      writer_ctx.encode_mutex.synchronize { stream.send_headers(out_headers) }
-      send_body(stream, payload, writer_ctx)
+      # Hotfix C2: empty-body responses (RFC 7230 §3.3.3 — 204/304 + HEAD)
+      # MUST NOT carry a DATA frame. Folding END_STREAM onto the HEADERS
+      # frame collapses the response to one encoder-mutex acquisition and
+      # one writer-fiber wakeup instead of two. Any body the app returned
+      # for HEAD is discarded here per spec (the bytes were already
+      # built — that's a Rack-app smell, not our problem to fix).
+      if body_suppressed?(method, status)
+        writer_ctx.encode_mutex.synchronize do
+          stream.send_headers(out_headers, ::Protocol::HTTP2::END_STREAM)
+        end
+      else
+        writer_ctx.encode_mutex.synchronize { stream.send_headers(out_headers) }
+        send_body(stream, payload, writer_ctx)
+      end
       @metrics.increment_status(status)
     rescue StandardError => e
       @metrics.increment(:app_errors)
@@ -675,6 +687,20 @@ module Hyperion
       rescue StandardError
         nil
       end
+    end
+
+    # RFC 7230 §3.3.3: status codes that prohibit a response body, plus
+    # the HEAD method which always suppresses the body regardless of what
+    # the application returned. The h2 dispatch path uses this to fold
+    # END_STREAM onto the HEADERS frame and skip the DATA-frame write
+    # entirely (see Hotfix C2).
+    BODY_SUPPRESSED_STATUSES = [204, 304].freeze
+
+    def body_suppressed?(method, status)
+      return true if BODY_SUPPRESSED_STATUSES.include?(status)
+      return true if method == 'HEAD'
+
+      false
     end
 
     # Send the response body, respecting the peer's max frame size and
