@@ -3,22 +3,61 @@
 require_relative 'hyperion/version'
 require_relative 'hyperion/logger'
 require_relative 'hyperion/metrics'
+require_relative 'hyperion/runtime'
+require_relative 'hyperion/dispatch_mode'
 require_relative 'hyperion/config'
+require_relative 'hyperion/h2_admission'
 
 module Hyperion
   class Error < StandardError; end
   class ParseError < Error; end
   class UnsupportedError < Error; end
 
+  # Probe table for fiber-cooperative I/O libraries. 1.7.0 expanded
+  # the validation surface (RFC A9): `async_io: true` now requires at
+  # least one of these to be loaded, otherwise CLI bootstrap raises
+  # at `Hyperion.validate_async_io_loaded_libs!`. The CLI's pre-fork
+  # `warn_orphan_async_io` (1.6.1) still emits a soft warn for the
+  # nil-default case so existing operators see the same advisory log.
+  FIBER_IO_PROBES = {
+    'hyperion-async-pg' => -> { defined?(::Hyperion::AsyncPg) },
+    'async-redis' => -> { defined?(::Async::Redis) },
+    'async-http' => -> { defined?(::Async::HTTP) }
+  }.freeze
+
   class << self
+    # 1.7.0: legacy module-level accessors are now thin delegators to
+    # `Runtime.default`. Pre-1.7 they each owned their own ivar; the
+    # delegate keeps the existing surface (`Hyperion.metrics`, the `=`
+    # writers) working untouched while the new constructor-injection
+    # path (`Hyperion::Runtime.new(...)` + `Server.new(runtime: …)`) is
+    # the recommended shape going forward. Deprecation warns land in
+    # 1.8.0; removal in 2.0.
+    #
+    # The default Runtime's getters honour any module-level `@metrics`
+    # / `@logger` ivar override (see Runtime#metrics / Runtime#logger),
+    # so 1.6.x specs that swap via `Hyperion.instance_variable_set(:@metrics, …)`
+    # — reaching into private internals — keep working unchanged. The
+    # `=` setters write the ivar AND propagate; that way an explicit
+    # `Hyperion.metrics = nil` clears the override cleanly.
     def logger
-      @logger ||= Logger.new
+      Runtime.default.logger
     end
 
-    attr_writer :logger, :log_requests
+    def logger=(value)
+      @logger = value
+      Runtime.default.logger = value if value
+    end
+
+    attr_writer :log_requests
 
     def metrics
-      @metrics ||= Metrics.new
+      Runtime.default.metrics
+    end
+
+    def metrics=(value)
+      @metrics = value
+      Runtime.default.metrics = value if value
     end
 
     def stats
@@ -116,6 +155,54 @@ module Hyperion
       pid
     end
 
+    # Returns the list of currently-loaded fiber-cooperative I/O
+    # libraries. Reads `Hyperion::FIBER_IO_PROBES` via `const_get` so
+    # `stub_const('Hyperion::FIBER_IO_PROBES', ...)` works for the
+    # strict-validation specs without needing a method-injection seam.
+    def fiber_io_libs_loaded
+      probes = Hyperion.const_get(:FIBER_IO_PROBES)
+      probes.select { |_name, probe| probe.call }.keys
+    end
+
+    # Strict tri-state validation of `async_io` at warmup time (RFC A9).
+    # Run after `Hyperion.warmup!`'s eager-load section so any library
+    # that monkey-patches in fiber-cooperative I/O during boot has had
+    # the chance to install itself.
+    #
+    # - `true`  → MUST have at least one fiber-IO library loaded; raise
+    #            ArgumentError otherwise. The error message lists the
+    #            checked libraries so operators can pick one.
+    # - `false` → No fiber-IO library should be loaded; if one is, emit
+    #            a warn (the operator may still want this for some
+    #            edge case, so we don't raise).
+    # - `nil`   → Default. The CLI's existing soft-warn path covers
+    #            this; warmup is a no-op.
+    def validate_async_io_loaded_libs!(setting)
+      probes = Hyperion.const_get(:FIBER_IO_PROBES)
+      case setting
+      when true
+        loaded = fiber_io_libs_loaded
+        if loaded.empty?
+          raise ArgumentError,
+                'async_io: true requires a fiber-cooperative I/O library to be loaded ' \
+                "(checked: #{probes.keys.join(', ')}); none detected. " \
+                'See https://github.com/andrew-woblavobla/hyperion#operator-guidance'
+        end
+      when false
+        loaded = fiber_io_libs_loaded
+        unless loaded.empty?
+          Hyperion.logger.warn do
+            {
+              message: 'async_io: false but fiber-cooperative I/O library is loaded',
+              loaded: loaded,
+              impact: 'the library will not yield to a scheduler under async_io: false; verify this is intentional'
+            }
+          end
+        end
+      end
+      nil
+    end
+
     def warmup!
       return if @warmed
 
@@ -138,9 +225,21 @@ module Hyperion
       # Subsequent calls hit the per-thread `cached_date` slot in response_writer.
       Time.now.httpdate
       nil
+    rescue ArgumentError
+      # Strict-validation error from `validate_async_io_loaded_libs!` —
+      # propagate so operators see the boot-time abort, not a warn-and-
+      # continue.
+      raise
     rescue StandardError => e
       Hyperion.logger.warn { { message: 'warmup failed (non-fatal)', error: e.message } }
       nil
+    end
+
+    # Test seam: clear the warmup flag so a fresh `warmup!` call can
+    # re-run. Used by the async_io strict-validation specs that need to
+    # exercise the raise/warn paths multiple times in one process.
+    def reset_warmup!
+      @warmed = false
     end
   end
 end
@@ -170,6 +269,7 @@ require_relative 'hyperion/c_parser'
 require_relative 'hyperion/adapter/rack'
 require_relative 'hyperion/prometheus_exporter'
 require_relative 'hyperion/admin_middleware'
+require_relative 'hyperion/admin_listener'
 require_relative 'hyperion/response_writer'
 require_relative 'hyperion/thread_pool'
 require_relative 'hyperion/connection'

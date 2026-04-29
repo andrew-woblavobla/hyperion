@@ -412,12 +412,27 @@ module Hyperion
     # MAXIMUM_ALLOWED_WINDOW_SIZE).
     H2_MAX_WINDOW_SIZE = 0x7FFFFFFF
 
-    def initialize(app:, thread_pool: nil, h2_settings: nil)
-      @app         = app
-      @thread_pool = thread_pool
-      @h2_settings = h2_settings
-      @metrics     = Hyperion.metrics
-      @logger      = Hyperion.logger
+    # 1.7.0 added kwargs:
+    #   * `runtime:`      — `Hyperion::Runtime` for metrics/logger
+    #                       isolation (default `Runtime.default`).
+    #   * `h2_admission:` — Optional `Hyperion::H2Admission` for the
+    #                       per-process stream cap (RFC A7). nil keeps
+    #                       the 1.6.x unbounded behaviour.
+    def initialize(app:, thread_pool: nil, h2_settings: nil, runtime: nil, h2_admission: nil)
+      @app          = app
+      @thread_pool  = thread_pool
+      @h2_settings  = h2_settings
+      if runtime
+        @runtime = runtime
+        @metrics = runtime.metrics
+        @logger  = runtime.logger
+      else
+        # 1.6.x compat path — see Connection#initialize for rationale.
+        @runtime = Hyperion::Runtime.default
+        @metrics = Hyperion.metrics
+        @logger  = Hyperion.logger
+      end
+      @h2_admission = h2_admission
     end
 
     def serve(socket)
@@ -608,6 +623,25 @@ module Hyperion
         return
       end
 
+      # RFC A7: process-wide stream admission control. nil admission =
+      # unbounded (current behaviour). When the cap is hit we send
+      # REFUSED_STREAM (RFC 7540 §11 / RFC 9113 §5.4.1) — the spec-
+      # defined response for "this stream cannot be processed; client
+      # may retry on a different stream id". Bumps a counter so
+      # operators can alert on sustained refusal volume.
+      if @h2_admission && !@h2_admission.admit
+        @metrics.increment(:h2_streams_refused)
+        begin
+          writer_ctx.encode_mutex.synchronize do
+            stream.send_reset_stream(::Protocol::HTTP2::Error::REFUSED_STREAM) unless stream.closed?
+          end
+        rescue StandardError
+          nil
+        end
+        return
+      end
+      @h2_admission.nil?
+
       pseudo, regular = partition_pseudo(stream.request_headers)
 
       method    = pseudo[':method'] || 'GET'
@@ -687,6 +721,12 @@ module Hyperion
       rescue StandardError
         nil
       end
+    ensure
+      # Release the admission slot once the stream's served (success or
+      # error). h2_admitted is local-set above the slot acquisition, so
+      # the protocol-error / pre-admission early-returns above don't
+      # double-release.
+      @h2_admission.release if defined?(h2_admitted) && h2_admitted
     end
 
     # RFC 7230 §3.3.3: status codes that prohibit a response body, plus

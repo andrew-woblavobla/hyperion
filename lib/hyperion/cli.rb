@@ -33,6 +33,10 @@ module Hyperion
       # once at boot pointing at the operator-guidance docs; the operator's
       # setting is still honoured.
       warn_orphan_async_io(config)
+      # 1.7.0 (RFC A9): hard validation of `async_io: true` (and a soft
+      # warn for `false` with a fiber lib loaded). The nil-default keeps
+      # the 1.6.1 advisory shape — see Hyperion.validate_async_io_loaded_libs!.
+      Hyperion.validate_async_io_loaded_libs!(config.async_io)
 
       # Propagate log_requests so every Connection picks it up via
       # `Hyperion.log_requests?` without needing to thread it through
@@ -190,7 +194,12 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
                           max_pending: config.max_pending,
                           max_request_read_seconds: config.max_request_read_seconds,
                           h2_settings: Master.build_h2_settings(config),
-                          async_io: config.async_io)
+                          async_io: config.async_io,
+                          accept_fibers_per_worker: config.accept_fibers_per_worker,
+                          h2_max_total_streams: config.h2.max_total_streams,
+                          admin_listener_port: config.admin.listener_port,
+                          admin_listener_host: config.admin.listener_host,
+                          admin_token: config.admin.token)
       warn_c_parser_unavailable
 
       # Pre-allocate Rack env-pool entries and eager-touch lazy constants.

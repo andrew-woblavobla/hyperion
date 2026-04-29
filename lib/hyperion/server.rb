@@ -38,11 +38,38 @@ module Hyperion
       (head + body).freeze
     }.call
 
-    attr_reader :host, :port
+    attr_reader :host, :port, :runtime
 
+    # 1.7.0 added kwargs (all default to current behaviour):
+    #   * `runtime:`             — `Hyperion::Runtime` instance (default
+    #                               `Runtime.default`). Threaded through to
+    #                               every per-connection / per-stream code
+    #                               path so per-server metrics/logger
+    #                               isolation works.
+    #   * `accept_fibers_per_worker:` — Integer, default 1. When > 1 and the
+    #                               accept loop is async-wrapped, spawn N
+    #                               accept fibers that race on the same
+    #                               listening fd. Linear scaling on
+    #                               `:reuseport` (Linux); Darwin honours the
+    #                               knob silently with no scaling benefit
+    #                               (RFC §5 Q5).
+    #   * `h2_max_total_streams:` — Integer or nil (default nil). Process-
+    #                               wide cap on simultaneously-open h2
+    #                               streams across all connections. nil
+    #                               disables (current behaviour); set to
+    #                               opt into RFC A7 admission control.
+    #   * `admin_listener_port:`  — Integer or nil (default nil). When set,
+    #                               spawn a sibling HTTP listener on
+    #                               `127.0.0.1:<port>` that serves only
+    #                               `/-/quit` and `/-/metrics`. nil keeps
+    #                               admin mounted in-app (current shape).
     def initialize(app:, host: '127.0.0.1', port: 9292, read_timeout: DEFAULT_READ_TIMEOUT_SECONDS,
                    tls: nil, thread_count: DEFAULT_THREAD_COUNT, max_pending: nil,
-                   max_request_read_seconds: 60, h2_settings: nil, async_io: nil)
+                   max_request_read_seconds: 60, h2_settings: nil, async_io: nil,
+                   runtime: nil, accept_fibers_per_worker: 1,
+                   h2_max_total_streams: nil, admin_listener_port: nil,
+                   admin_listener_host: '127.0.0.1', admin_token: nil)
+      validate_async_io!(async_io)
       @host                     = host
       @port                     = port
       @app                      = app
@@ -53,9 +80,36 @@ module Hyperion
       @max_request_read_seconds = max_request_read_seconds
       @h2_settings              = h2_settings
       @async_io                 = async_io
+      # `@explicit_runtime` toggles between 1.7.0 isolation (an
+      # explicitly-passed Runtime) and 1.6.x compat (legacy module-level
+      # accessors honoured for stub seams). All record_dispatch /
+      # reject_connection / log lines route through `runtime_metrics` /
+      # `runtime_logger` helpers below.
+      @runtime                  = runtime || Hyperion::Runtime.default
+      @explicit_runtime         = !runtime.nil?
+      @accept_fibers_per_worker = [accept_fibers_per_worker.to_i, 1].max
+      @h2_admission             = if h2_max_total_streams
+                                    Hyperion::H2Admission.new(max_total_streams: h2_max_total_streams)
+                                  end
+      @admin_listener_port      = admin_listener_port
+      @admin_listener_host      = admin_listener_host
+      @admin_token              = admin_token
+      @admin_listener           = nil
       @thread_pool              = nil
       @stopped                  = false
     end
+
+    # Strict validation of the tri-state `async_io` flag (RFC A9). Pre-1.7
+    # the Server constructor accepted any object; `1`, `:yes`, `'true'`
+    # silently landed in the wrong matrix cell. Now: raise immediately so
+    # the operator's typo surfaces at boot, not as a "why is my fiber-pg
+    # config not behaving" report three hours later.
+    def validate_async_io!(value)
+      return if value.nil? || value == true || value == false
+
+      raise ArgumentError, "async_io must be nil, true, or false (got #{value.inspect})"
+    end
+    private :validate_async_io!
 
     def listen
       tcp = ::TCPServer.new(@host, @port)
@@ -107,6 +161,7 @@ module Hyperion
     def start
       listen unless @server
       @thread_pool = ThreadPool.new(size: @thread_count, max_pending: @max_pending) if @thread_count.positive?
+      maybe_start_admin_listener
 
       if @tls || @async_io
         # TLS path: ALPN may pick `h2`, and h2 spawns one fiber per stream
@@ -133,6 +188,7 @@ module Hyperion
       end
     ensure
       @thread_pool&.shutdown
+      @admin_listener&.stop
     end
 
     def stop
@@ -155,15 +211,22 @@ module Hyperion
 
         apply_timeout(socket)
         if @thread_pool
+          mode = DispatchMode.new(:threadpool_h1)
           if @thread_pool.submit_connection(socket, @app,
                                             max_request_read_seconds: @max_request_read_seconds)
-            Hyperion.metrics.increment(:requests_threadpool_dispatched)
+            record_dispatch(mode)
           else
             reject_connection(socket)
           end
         else
-          Hyperion.metrics.increment(:requests_threadpool_dispatched)
-          Connection.new.serve(socket, @app, max_request_read_seconds: @max_request_read_seconds)
+          # `-t 0` plain HTTP/1.1 — no pool, serve inline on the accept
+          # thread. RFC §5 Q3: `--async-io -t 0` keeps working — see
+          # start_async_loop's `inline_h1_no_pool` branch.
+          mode = DispatchMode.new(:inline_h1_no_pool)
+          record_dispatch(mode)
+          Connection.new(runtime: @explicit_runtime ? @runtime : nil).serve(
+            socket, @app, max_request_read_seconds: @max_request_read_seconds
+          )
         end
       end
     end
@@ -171,27 +234,58 @@ module Hyperion
     # TLS / h2-capable accept loop. The Async wrapper is required because
     # h2 streams (inside Http2Handler) and the ALPN handshake yield
     # cooperatively via the scheduler.
+    #
+    # 1.7.0 (RFC A6): `accept_fibers_per_worker > 1` spawns N accept
+    # fibers that each `IO.select` on the same listening fd. On `:reuseport`
+    # workers (Linux) the kernel hashes connections fairly across siblings;
+    # on `:share` (Darwin) the knob is silently honoured but shows no
+    # scaling benefit — operators already know Darwin is special.
     def start_async_loop
       Async do |task|
-        until @stopped
-          socket = accept_or_nil
-          next unless socket
-
-          apply_timeout(socket)
-          task.async { dispatch(socket) }
+        n = @accept_fibers_per_worker
+        n.times { task.async { run_accept_fiber(task) } }
+        # `task.children.each(&:wait)` would deadlock if no children — n is
+        # always >= 1, so we're safe; but use rescue-wait pattern in case
+        # one accept fiber raises.
+        task.children.each do |child|
+          child.wait
+        rescue StandardError
+          nil
         end
       end
     end
 
+    # Single accept fiber's run loop. Called N times (default 1) from
+    # `start_async_loop`. All accept fibers share `@server` / `@tcp_server`
+    # via closure; the kernel arbitrates which fiber wins each
+    # IO.select / accept_nonblock race.
+    def run_accept_fiber(task)
+      until @stopped
+        socket = accept_or_nil
+        next unless socket
+
+        apply_timeout(socket)
+        task.async { dispatch(socket) }
+      end
+    end
+
     def dispatch(socket)
-      if socket.is_a?(::OpenSSL::SSL::SSLSocket) && socket.alpn_protocol == 'h2'
-        # HTTP/2: each stream runs on a fiber inside Http2Handler. The
-        # handler still uses the pool's `#call` for app.call hops on each
-        # stream (one per stream, not one per connection). Per-stream
-        # counters live inside Http2Handler; we don't bump either of the
-        # H1 dispatch buckets here — neither fits the h2 model cleanly.
-        Http2Handler.new(app: @app, thread_pool: @thread_pool, h2_settings: @h2_settings).serve(socket)
-      elsif inline_h1_dispatch?
+      alpn = socket.is_a?(::OpenSSL::SSL::SSLSocket) ? socket.alpn_protocol : nil
+      mode = DispatchMode.resolve(tls: !@tls.nil?, async_io: @async_io,
+                                  thread_count: @thread_count, alpn: alpn)
+      case mode.name
+      when :tls_h2
+        # HTTP/2: each stream runs on a fiber inside Http2Handler. Per-
+        # stream counters live there. We bump the per-mode counter
+        # (`:requests_dispatch_tls_h2`) at connection-accept time so
+        # operators see the connection's chosen transport even when the
+        # h2 streams happen on later fibers.
+        record_dispatch(mode)
+        Http2Handler.new(app: @app, thread_pool: @thread_pool,
+                         h2_settings: @h2_settings,
+                         runtime: @explicit_runtime ? @runtime : nil,
+                         h2_admission: @h2_admission).serve(socket)
+      when :tls_h1_inline, :async_io_h1_inline
         # Inline-on-fiber HTTP/1.1 dispatch. Two ways to land here:
         #   1. async_io: true — operator explicitly opted into fiber I/O on
         #      the plain HTTP/1.1 path.
@@ -202,44 +296,87 @@ module Hyperion
         #      for no perf benefit (we paid the Async-loop cost already)
         #      and would defeat hyperion-async-pg / async-redis on the
         #      TLS h1 path.
-        # Operators who specifically want TLS+threadpool (e.g. CPU-heavy
-        # handlers competing for OS threads) can pass async_io: false to
-        # force the pool branch below.
-        Hyperion.metrics.increment(:requests_async_dispatched)
-        Connection.new.serve(socket, @app, max_request_read_seconds: @max_request_read_seconds)
-      elsif @thread_pool
+        record_dispatch(mode)
+        Connection.new(runtime: @explicit_runtime ? @runtime : nil).serve(
+          socket, @app, max_request_read_seconds: @max_request_read_seconds
+        )
+      when :threadpool_h1
         # HTTP/1.1 default plain-HTTP path, OR explicit async_io: false on
         # TLS (operator opted out of inline-on-fiber dispatch). Hand the
         # connection to a worker thread; the fiber that called dispatch
         # returns immediately. On overflow, reject with 503 + close.
-        if @thread_pool.submit_connection(socket, @app,
-                                          max_request_read_seconds: @max_request_read_seconds)
-          Hyperion.metrics.increment(:requests_threadpool_dispatched)
+        if @thread_pool
+          if @thread_pool.submit_connection(socket, @app,
+                                            max_request_read_seconds: @max_request_read_seconds)
+            record_dispatch(mode)
+          else
+            reject_connection(socket)
+          end
         else
-          reject_connection(socket)
+          # `run_one` / spec entry points dispatch without having
+          # started the pool — serve inline and count under
+          # threadpool_h1 (the connection's logical mode).
+          record_dispatch(mode)
+          Connection.new(runtime: @explicit_runtime ? @runtime : nil).serve(
+            socket, @app, max_request_read_seconds: @max_request_read_seconds
+          )
         end
-      else
-        # No pool (thread_count: 0) on the TLS / async-wrap path with
-        # async_io: false. Rare config — neither dispatch bucket fits
-        # cleanly. Leave un-counted rather than misclassify; the request
-        # still shows up in :requests_total via Connection.
-        Connection.new.serve(socket, @app, max_request_read_seconds: @max_request_read_seconds)
+      when :inline_h1_no_pool
+        # `-t 0` on the TLS / async-wrap path. Rare config — debug /
+        # spec aid (RFC §5 Q3 keeps `--async-io -t 0` valid). Counted
+        # under its own bucket now (pre-1.7 it was un-counted).
+        record_dispatch(mode)
+        Connection.new(runtime: @explicit_runtime ? @runtime : nil).serve(
+          socket, @app, max_request_read_seconds: @max_request_read_seconds
+        )
       end
     end
 
-    # Decide whether to serve HTTP/1.1 inline on the calling fiber instead
-    # of hopping through the worker thread pool. The matrix:
-    #   async_io == true       → inline always (plain h1 + TLS h1).
-    #   async_io == nil + TLS  → inline (TLS already runs Async loop, so
-    #                            the scheduler is current; preserve it).
-    #   async_io == nil + plain → pool (pure HTTP/1.1 fast path; no scheduler).
-    #   async_io == false       → pool always (explicit opt-out).
-    def inline_h1_dispatch?
-      return true if @async_io == true
-      return false if @async_io == false
+    # Resolve the metrics sink for write-side ops. When the operator
+    # passed an explicit `runtime:` we honour it; otherwise we read
+    # the module-level singleton (`Hyperion.metrics`) so 1.6.x test
+    # stubs (`allow(Hyperion).to receive(:metrics)`) keep working.
+    def runtime_metrics
+      @explicit_runtime ? @runtime.metrics : Hyperion.metrics
+    end
 
-      # @async_io.nil? — auto: inline on TLS, pool on plain.
-      !@tls.nil?
+    def runtime_logger
+      @explicit_runtime ? @runtime.logger : Hyperion.logger
+    end
+
+    # Bump per-mode dispatch counter + (transitionally, until 2.0) the
+    # legacy `:requests_async_dispatched` / `:requests_threadpool_dispatched`
+    # keys. Operators on Grafana dashboards from the 1.x line keep getting
+    # data; new dashboards should switch to `:requests_dispatch_<mode>`.
+    # 2.0 drops the dual-emit.
+    def record_dispatch(mode)
+      m = runtime_metrics
+      m.increment(mode.metric_key)
+      # Legacy-key dual emit. The h2 path historically wasn't counted in
+      # either legacy bucket — keep that behaviour so dashboards that
+      # ignore h2 don't suddenly see a spike.
+      case mode.name
+      when :threadpool_h1, :inline_h1_no_pool
+        m.increment(:requests_threadpool_dispatched)
+      when :tls_h1_inline, :async_io_h1_inline
+        m.increment(:requests_async_dispatched)
+      end
+    end
+
+    # Spawn the optional sibling admin listener (RFC A8). When
+    # `admin.listener_port` is unset (default), admin endpoints stay
+    # mounted in-app via `AdminMiddleware` — no behaviour change.
+    def maybe_start_admin_listener
+      return unless @admin_listener_port
+      return if @admin_token.nil? || @admin_token.empty?
+
+      @admin_listener = Hyperion::AdminListener.new(
+        host: @admin_listener_host,
+        port: @admin_listener_port,
+        token: @admin_token,
+        runtime: @runtime
+      )
+      @admin_listener.start
     end
 
     # Backpressure rejection. Emits a pre-built 503 + closes the socket.
@@ -249,7 +386,7 @@ module Hyperion
     # can alert on sustained overload.
     def reject_connection(socket)
       socket.write(REJECT_503)
-      Hyperion.metrics.increment(:rejected_connections)
+      runtime_metrics.increment(:rejected_connections)
     rescue StandardError
       # Client may have hung up between accept and our 503 write — that's
       # the failure mode we're protecting them from anyway, so swallow.
@@ -286,7 +423,7 @@ module Hyperion
       @stopped = true
       nil
     rescue OpenSSL::SSL::SSLError => e
-      Hyperion.logger.warn { { message: 'tls handshake failed', error: e.message } }
+      runtime_logger.warn { { message: 'tls handshake failed', error: e.message } }
       nil
     end
 
@@ -302,7 +439,7 @@ module Hyperion
         socket
       end
     rescue OpenSSL::SSL::SSLError => e
-      Hyperion.logger.warn { { message: 'tls handshake failed', error: e.message } }
+      runtime_logger.warn { { message: 'tls handshake failed', error: e.message } }
       nil
     end
 
@@ -318,7 +455,7 @@ module Hyperion
         target.setsockopt(::Socket::SOL_SOCKET, ::Socket::SO_RCVTIMEO, timeval)
       end
     rescue StandardError => e
-      Hyperion.logger.warn do
+      runtime_logger.warn do
         { message: 'failed to set read timeout', error: e.message, error_class: e.class.name }
       end
     end

@@ -20,7 +20,10 @@ module Hyperion
                    thread_count: Server::DEFAULT_THREAD_COUNT,
                    config: nil, worker_index: 0, listener: nil,
                    max_pending: nil, max_request_read_seconds: 60,
-                   h2_settings: nil, async_io: nil)
+                   h2_settings: nil, async_io: nil, runtime: nil,
+                   accept_fibers_per_worker: 1, h2_max_total_streams: nil,
+                   admin_listener_port: nil, admin_listener_host: '127.0.0.1',
+                   admin_token: nil)
       @host                     = host
       @port                     = port
       @app                      = app
@@ -34,6 +37,12 @@ module Hyperion
       @max_request_read_seconds = max_request_read_seconds
       @h2_settings              = h2_settings
       @async_io                 = async_io
+      @runtime                  = runtime
+      @accept_fibers_per_worker = accept_fibers_per_worker
+      @h2_max_total_streams     = h2_max_total_streams
+      @admin_listener_port      = admin_listener_port
+      @admin_listener_host      = admin_listener_host
+      @admin_token              = admin_token
     end
 
     def run
@@ -53,7 +62,13 @@ module Hyperion
                           max_pending: @max_pending,
                           max_request_read_seconds: @max_request_read_seconds,
                           h2_settings: @h2_settings,
-                          async_io: @async_io)
+                          async_io: @async_io,
+                          runtime: @runtime,
+                          accept_fibers_per_worker: @accept_fibers_per_worker,
+                          h2_max_total_streams: @h2_max_total_streams,
+                          admin_listener_port: @admin_listener_port,
+                          admin_listener_host: @admin_listener_host,
+                          admin_token: @admin_token)
 
       # `on_worker_boot` runs in the child after fork, BEFORE the worker
       # adopts/binds its listener and before any accept. App code reconnects

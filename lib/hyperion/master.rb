@@ -53,11 +53,16 @@ module Hyperion
     # place") doesn't accidentally send a SETTINGS entry with a nil value.
     # Empty hash → no override → Http2Handler skips the SETTINGS push.
     def self.build_h2_settings(config)
+      # 1.7.0 (RFC A4): read from the nested `H2Settings` subconfig.
+      # The flat-name forwarders on `Config` still work for callers
+      # holding a 1.6.x reference, but Master is in-tree so we point
+      # at the nested object directly to avoid the extra hop.
+      h2 = config.h2
       {
-        max_concurrent_streams: config.h2_max_concurrent_streams,
-        initial_window_size: config.h2_initial_window_size,
-        max_frame_size: config.h2_max_frame_size,
-        max_header_list_size: config.h2_max_header_list_size
+        max_concurrent_streams: h2.max_concurrent_streams,
+        initial_window_size: h2.initial_window_size,
+        max_frame_size: h2.max_frame_size,
+        max_header_list_size: h2.max_header_list_size
       }.compact
     end
 
@@ -184,7 +189,14 @@ module Hyperion
           max_pending: @config.max_pending,
           max_request_read_seconds: @config.max_request_read_seconds,
           h2_settings: Master.build_h2_settings(@config),
-          async_io: @config.async_io
+          async_io: @config.async_io,
+          # 1.7.0 RFC additive plumbing — all default to current
+          # behaviour when the operator hasn't opted in.
+          accept_fibers_per_worker: @config.accept_fibers_per_worker,
+          h2_max_total_streams: @config.h2.max_total_streams,
+          admin_listener_port: @config.admin.listener_port,
+          admin_listener_host: @config.admin.listener_host,
+          admin_token: @config.admin.token
         }
         # Hand the inherited socket to the worker in :share mode. In
         # :reuseport mode the worker binds its own with SO_REUSEPORT.

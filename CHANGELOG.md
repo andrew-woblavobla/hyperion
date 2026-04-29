@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased] — 1.7.0
+
+First wave of additive ships from `docs/RFC_2_0_DESIGN.md`. All changes are backwards-compatible: every 1.6.3 spec passes without modification, every flat DSL form still works without warns (deprecation lands in 1.8.0), every 1.6.x test stub seam (`allow(Hyperion).to receive(:metrics)`, `Hyperion.instance_variable_set(:@metrics, …)`) keeps working. Spec count 325 → 411 (+86 across the wave).
+
+### Added
+- **`Hyperion::Runtime` constructor injection (RFC A3).** New `Hyperion::Runtime` class holds `metrics`, `logger`, `clock`. `Runtime.default` is the process-wide singleton (lazy, mutable, NOT frozen — RFC §5 Q4). Module-level `Hyperion.metrics` / `Hyperion.logger` (and their `=` setters) keep working — they delegate to `Runtime.default`. New `runtime:` kwarg on `Hyperion::Server`, `Hyperion::Connection`, `Hyperion::Http2Handler` (default nil → fall through to module accessors so 1.6.x specs pass; non-nil → that runtime is used exclusively, no implicit fallback to module overrides). Multi-tenant deployments can now give each `Server` its own metrics sink.
+- **`Hyperion::DispatchMode` value object (RFC A2).** Internal value object replacing the 4-flag / 5-output `if/elsif` matrix in `Server#dispatch`. 5 modes: `:tls_h2`, `:tls_h1_inline`, `:async_io_h1_inline`, `:threadpool_h1`, `:inline_h1_no_pool`. Frozen, equality-by-name, predicates `#inline?` / `#threadpool?` / `#h2?` / `#async?` / `#pooled?`. Resolved per dispatch via `DispatchMode.resolve(tls:, async_io:, thread_count:, alpn:)`.
+- **Per-mode dispatch counters (RFC A2 + §3 1.7.0 dual-emit).** New keys: `:requests_dispatch_tls_h2`, `:requests_dispatch_tls_h1_inline`, `:requests_dispatch_async_io_h1_inline`, `:requests_dispatch_threadpool_h1`, `:requests_dispatch_inline_h1_no_pool`. **Operators on Grafana dashboards from the 1.x line: the legacy `:requests_async_dispatched` and `:requests_threadpool_dispatched` keys keep emitting in 1.7 + 1.8 (dual-emit) and are removed in 2.0. Migrate dashboards to the per-mode keys before 2.0.**
+- **Nested DSL blocks (RFC A4).** `h2 do |h| ... end`, `admin do ... end`, `worker_health do ... end`, `logging do ... end` — both bareword (`max_concurrent_streams 256`) and explicit-arg (`|h| h.max_concurrent_streams 256`) forms supported. New `Config::H2Settings`, `AdminConfig`, `WorkerHealthConfig`, `LoggingConfig` subclasses; `Config#h2`, `#admin`, `#worker_health`, `#logging` readers. Flat 1.6.x setters (`h2_max_concurrent_streams 256`, `admin_token "x"`, `worker_max_rss_mb 1024`, `log_level :info`, `log_format :json`, `log_requests false`) remain functional with no warns in 1.7. Deprecation warns land in 1.8.0; removal in 2.0. `BlockProxy` inherits from `BasicObject` so `format :json` inside a `logging do` block doesn't collide with `Kernel#format`.
+- **`accept_fibers_per_worker` config (RFC A6).** Default 1. When > 1 and the accept loop is async-wrapped, spawn N accept fibers that each `IO.select` on the same listening fd. Linear scaling on `:reuseport` (Linux); on Darwin (`:share` mode) the knob is honoured silently with no scaling benefit (RFC §5 Q5). Documented in the README "Operator guidance" section.
+- **`h2.max_total_streams` admission gate (RFC A7).** New `Hyperion::H2Admission` value object — process-wide stream cap shared across all `Http2Handler` instances within a worker. Default `nil` (no cap, current behaviour). When set, streams beyond the cap get `RST_STREAM REFUSED_STREAM` (RFC 7540 §11) and bump `:h2_streams_refused`. Default flips to `h2.max_concurrent_streams × workers × 4` in 2.0 (RFC §3 1.x-vs-2.0 split).
+- **`admin.listener_port` sibling listener (RFC A8).** New `Hyperion::AdminListener` — single-thread TCP server that handles only `/-/quit` and `/-/metrics` on a separate port. Default `nil` keeps admin mounted in-app via `AdminMiddleware`. When set, the sibling listener spawns alongside the application listener regardless of `:share` vs `:reuseport` worker model. Defence-in-depth for the bearer-token leak vector documented in RFC A8 (logging middlewares that dump request headers); runs alongside, not instead of, the in-app middleware.
+- **`async_io` strict validation (RFC A9).** `Server#initialize` raises `ArgumentError` on non-tri-state values (`1`, `:yes`, `'true'`, etc.) — pre-1.7 they silently landed in the wrong matrix cell. New `Hyperion.validate_async_io_loaded_libs!` is wired into the CLI bootstrap: `async_io: true` raises if no fiber-cooperative library (`hyperion-async-pg` / `async-redis` / `async-http`) is loaded; `async_io: false` warns (does not raise) if a fiber-IO library is loaded but unused; `async_io: nil` keeps the 1.6.1 soft-warn shape.
+
+### New specs (86 examples)
+- `spec/hyperion/runtime_spec.rb` — singleton lifecycle, mutable default, default? predicate, custom-runtime isolation, legacy override seam.
+- `spec/hyperion/dispatch_mode_spec.rb` — resolve matrix, predicate semantics, frozen value-object equality, `metric_key` shape.
+- `spec/hyperion/h2_admission_spec.rb` — admit/release/cap exhaustion + concurrent-thread safety.
+- `spec/hyperion/nested_dsl_spec.rb` — h2 / admin / worker_health / logging block forms (bareword + explicit-arg), flat-name forwarders, no-warn assertion, BlockProxy bareword behaviour.
+- `spec/hyperion/runtime_kwarg_spec.rb` — `runtime:` kwarg plumbing on Connection / Server / Http2Handler, isolation from module-level overrides when explicit.
+- `spec/hyperion/accept_fibers_spec.rb` — default 1, clamp on zero/negative, N-fiber spawn count under start_async_loop, Darwin no-error path.
+- `spec/hyperion/admin_listener_spec.rb` — live HTTP integration (token, /-/metrics, 404), Server's `maybe_start_admin_listener` gating on port + token presence.
+- `spec/hyperion/async_io_strict_spec.rb` — Server constructor raise paths, validate_async_io_loaded_libs! tri-state.
+- `spec/hyperion/per_mode_counters_spec.rb` — dual-emit assertions per mode, end-to-end live HTTP request that bumps both new and legacy keys.
+
+### Changed
+- `Hyperion::Master.build_h2_settings` reads from the nested `Config#h2` object directly (flat-name forwarders still work via `Config#h2_max_concurrent_streams`).
+- `Hyperion.metrics` / `Hyperion.logger` are now thin delegators to `Hyperion::Runtime.default` — preserves the public 1.6.x surface, new code path goes through Runtime.
+
+### Deprecation roadmap
+- **1.7.0 (this release):** all of the above ship as additive opt-ins. No deprecation warns. Old metric keys keep emitting alongside the new per-mode keys.
+- **1.8.0:** boot-time deprecation warns on flat DSL setters, `Hyperion.metrics=` / `Hyperion.logger=` setters, and per-call `Hyperion.metrics` reads from internal code paths.
+- **2.0.0:** flat DSL setters removed; `Hyperion.metrics=` / `Hyperion.logger=` setters removed; legacy `:requests_async_dispatched` / `:requests_threadpool_dispatched` keys retired; `h2.max_total_streams` default flips to `h2.max_concurrent_streams × workers × 4`.
+
 ## [1.6.3] - 2026-04-29
 
 5 audit-driven hotfixes flagged by the post-1.6.0 audits; spec count 290 → 325 (+35 across the wave). No RFC items here — those land in 1.7.0+. See [RFC_2_0_DESIGN.md](docs/RFC_2_0_DESIGN.md) for the larger architectural roadmap.

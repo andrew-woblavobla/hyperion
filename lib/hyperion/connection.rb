@@ -41,22 +41,50 @@ module Hyperion
     end
 
     def initialize(parser: self.class.default_parser, writer: ResponseWriter.new, thread_pool: nil,
-                   log_requests: nil, max_body_bytes: MAX_BODY_BYTES)
+                   log_requests: nil, max_body_bytes: MAX_BODY_BYTES, runtime: nil)
       @parser         = parser
       @writer         = writer
       @thread_pool    = thread_pool
       @max_body_bytes = max_body_bytes
-      # Cache module-level singletons once per Connection instance so the hot
-      # path doesn't re-dispatch through Hyperion.metrics / Hyperion.logger
-      # (each was a method call + ivar nil-check on every request).
-      @metrics     = Hyperion.metrics
-      @logger      = Hyperion.logger
+      # 1.7.0: explicit Runtime injection. When the caller passes
+      # `runtime:`, that runtime is the sole source of metrics + logger
+      # for this connection — no implicit fallback to module-level
+      # singletons. When omitted, fall back to `Runtime.default` so
+      # legacy callers keep working untouched.
+      #
+      # We still cache the metrics/logger refs in ivars (vs reading
+      # `runtime.metrics` per request) so the hot path doesn't pay a
+      # method-dispatch per increment. Long-lived keep-alive connections
+      # therefore see a Runtime swap only at construction — that's a
+      # 1.7.0 limitation; 2.0 drops the singleton entirely and the
+      # ivar cache becomes the only path.
+      if runtime
+        @runtime = runtime
+        @metrics = runtime.metrics
+        @logger  = runtime.logger
+      else
+        # No explicit runtime → keep the 1.6.x shape: ivars cache the
+        # module-level accessors. This preserves stub seams used by
+        # existing specs (`allow(Hyperion).to receive(:metrics)`) and
+        # the `Hyperion.instance_variable_set(:@metrics, ...)` swap.
+        @runtime = Hyperion::Runtime.default
+        @metrics = Hyperion.metrics
+        @logger  = Hyperion.logger
+      end
       # Per-request access logging is ON by default (matches Puma+Rails
       # operator expectation). The hot path is optimised end-to-end: one
       # Process.clock_gettime per request, per-thread cached timestamp,
       # hand-rolled line builder, lock-free emit. Operator disables via
       # `--no-log-requests` or `HYPERION_LOG_REQUESTS=0`.
-      @log_requests = log_requests.nil? ? Hyperion.log_requests? : log_requests
+      @log_requests = if log_requests.nil?
+                        # Per-Connection override absent → consult the
+                        # Runtime's logging config (1.7.0+) which falls
+                        # through to `Hyperion.log_requests?` (env +
+                        # default ON).
+                        Hyperion.log_requests?
+                      else
+                        log_requests
+                      end
     end
 
     def serve(socket, app, max_request_read_seconds: 60)
