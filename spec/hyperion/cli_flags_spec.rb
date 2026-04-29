@@ -73,8 +73,8 @@ RSpec.describe 'Hyperion::CLI option parsing' do
     expect(config.max_header_bytes).to eq(16_384)
     expect(config.max_pending).to eq(128)
     expect(config.max_request_read_seconds).to eq(45.0)
-    expect(config.admin_token).to eq('tok')
-    expect(config.worker_max_rss_mb).to eq(768)
+    expect(config.admin.token).to eq('tok')
+    expect(config.worker_health.max_rss_mb).to eq(768)
     expect(config.idle_keepalive).to eq(7.5)
     expect(config.graceful_timeout).to eq(90)
   end
@@ -82,14 +82,14 @@ RSpec.describe 'Hyperion::CLI option parsing' do
   it 'preserves CLI > config-file precedence (CLI wins)' do
     config = Hyperion::Config.new
     config.max_body_bytes  = 100 # simulate value from config file
-    config.admin_token     = 'from-file'
+    config.admin.token     = 'from-file'
     config.idle_keepalive  = 99.0
 
     cli_opts, = parse(['--max-body-bytes', '200', '--admin-token', 'from-cli'])
     config.merge_cli!(cli_opts)
 
     expect(config.max_body_bytes).to eq(200)        # overridden
-    expect(config.admin_token).to eq('from-cli')    # overridden
+    expect(config.admin.token).to eq('from-cli')    # overridden
     expect(config.idle_keepalive).to eq(99.0)       # untouched (no CLI flag)
   end
 

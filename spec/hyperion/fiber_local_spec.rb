@@ -100,11 +100,11 @@ RSpec.describe Hyperion::FiberLocal do
         fake.define_singleton_method(:warn) { |&blk| captured << blk.call }
         # Logger#info is also called by the CLI on success — stub it harmlessly.
         fake.define_singleton_method(:info) { |&_blk| nil }
-        Hyperion.logger = fake
+        Hyperion::Runtime.default.logger = fake
         begin
           described_class.install!(async_io: false)
         ensure
-          Hyperion.logger = original
+          Hyperion::Runtime.default.logger = original
         end
         expect(captured).not_to be_empty
         expect(captured.first[:message]).to match(/ignored/i)

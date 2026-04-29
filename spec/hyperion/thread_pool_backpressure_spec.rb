@@ -11,10 +11,10 @@ RSpec.describe Hyperion::ThreadPool do
     # connection lifecycle), so silence the error logger for the duration.
     before do
       @prev_logger = Hyperion.logger
-      Hyperion.logger = Hyperion::Logger.new(level: :fatal)
+      Hyperion::Runtime.default.logger = Hyperion::Logger.new(level: :fatal)
     end
 
-    after { Hyperion.logger = @prev_logger }
+    after { Hyperion::Runtime.default.logger = @prev_logger }
 
     # Helper: build a real socket pair so submit_connection can hand a
     # genuine IO to the worker without contriving a stub. We close the

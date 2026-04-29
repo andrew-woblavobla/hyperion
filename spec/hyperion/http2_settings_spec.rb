@@ -106,8 +106,8 @@ RSpec.describe Hyperion::Http2Handler do
 
     it 'omits keys whose config value is nil so operators can disable individual overrides' do
       cfg = Hyperion::Config.new
-      cfg.h2_max_concurrent_streams = nil
-      cfg.h2_initial_window_size = nil
+      cfg.h2.max_concurrent_streams = nil
+      cfg.h2.initial_window_size = nil
 
       h = Hyperion::Master.build_h2_settings(cfg)
 

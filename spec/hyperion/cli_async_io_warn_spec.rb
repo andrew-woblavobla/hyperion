@@ -12,12 +12,12 @@ RSpec.describe Hyperion::CLI, '.warn_orphan_async_io' do
   let(:logger) { Hyperion::Logger.new(io: io, level: :info, format: :text) }
 
   before do
-    @prev_logger = Hyperion.logger
-    Hyperion.logger = logger
+    @prev_logger = Hyperion::Runtime.default.logger
+    Hyperion::Runtime.default.logger = logger
   end
 
   after do
-    Hyperion.logger = @prev_logger
+    Hyperion::Runtime.default.logger = @prev_logger
   end
 
   def with_config(async_io:)

@@ -9,13 +9,13 @@ module Hyperion
   # so that running Hyperion without a config file works identically to the
   # pre-rc14 behaviour.
   #
-  # 1.7.0 (RFC A4): grouped settings move into nested subconfigs —
+  # 1.7.0 (RFC A4): grouped settings live in nested subconfigs —
   # `config.h2.*`, `config.admin.*`, `config.worker_health.*`,
-  # `config.logging.*`. The flat top-level setters keep working without
-  # any deprecation warn (warns land in 1.8.0; removal in 2.0). Flat
-  # writes proxy into the nested object, and the legacy `attr_accessor`
-  # generated `Config#h2_max_concurrent_streams` etc. read back from
-  # the same place — there's only one source of truth per setting.
+  # `config.logging.*`. 1.7 added the nested DSL alongside the legacy
+  # flat keys; 1.8 deprecation-warned the flat keys; 2.0 removed them.
+  # The nested DSL is the only configuration surface — flat aliases
+  # like `h2_max_concurrent_streams` no longer exist on the DSL or on
+  # `Config` itself.
   class Config
     # Top-level (un-nested) defaults. Flat fields that don't group
     # naturally are deliberately kept here per the RFC's "only 8 fields
@@ -139,10 +139,14 @@ module Hyperion
       end
     end
 
-    # Map flat setter name → [subconfig accessor, nested attribute].
-    # Used by both the flat-named DSL methods and the `Config#xxx=`
-    # forwarders below so there's one source of truth.
-    FLAT_TO_NESTED = {
+    # CLI-only flat→nested setter map. The DSL surface no longer
+    # honours these names (2.0 removed the flat DSL forwarders), but
+    # `Config#merge_cli!` still receives flat-keyed cli_opts hashes
+    # built by the OptionParser branches in `Hyperion::CLI`. Routing
+    # them via this table keeps CLI flag spellings stable
+    # (`--admin-token`, `--log-level`, …) without re-introducing the
+    # deprecated DSL surface.
+    CLI_FLAT_TO_NESTED = {
       h2_max_concurrent_streams: %i[h2 max_concurrent_streams],
       h2_initial_window_size: %i[h2 initial_window_size],
       h2_max_frame_size: %i[h2 max_frame_size],
@@ -158,14 +162,6 @@ module Hyperion
       log_requests: %i[logging requests]
     }.freeze
 
-    # Pre-rendered "use the nested DSL instead" snippet per flat key.
-    # Computed once at load time so the deprecation warn doesn't pay a
-    # string-build cost on every flat-DSL invocation.
-    FLAT_TO_NESTED_DEPRECATION = FLAT_TO_NESTED.each_with_object({}) do |(flat, (group, nested)), h|
-      h[flat] = "use `#{group} do |#{group[0]}|; #{group[0]}.#{nested} = ...; end` instead — " \
-                "flat `#{flat}` removed in 2.0"
-    end.freeze
-
     def initialize
       DEFAULTS.each { |k, v| public_send(:"#{k}=", v) }
       HOOKS.each { |h| instance_variable_set(:"@#{h}", []) }
@@ -174,20 +170,6 @@ module Hyperion
       @worker_health = WorkerHealthConfig.new
       @logging       = LoggingConfig.new
       @tls           = TlsConfig.new
-    end
-
-    # Generate flat-name forwarders so callers reading
-    # `config.h2_max_concurrent_streams` (Master#build_h2_settings used
-    # to do this) get the value back from the nested object. Same for
-    # writes — they proxy into the nested config.
-    FLAT_TO_NESTED.each do |flat, (group, nested)|
-      define_method(flat) do
-        public_send(group).public_send(nested)
-      end
-
-      define_method(:"#{flat}=") do |value|
-        public_send(group).public_send(:"#{nested}=", value)
-      end
     end
 
     HOOKS.each do |hook|
@@ -209,11 +191,22 @@ module Hyperion
     # Apply CLI overrides on top of an existing config. Only non-nil values
     # in `overrides` are applied — preserves the precedence ordering
     # (CLI > env > config file > default).
+    #
+    # 2.0.0: flat keys that map to a nested subconfig
+    # (`admin_token` → `admin.token`, `log_level` → `logging.level`, …)
+    # are dispatched through `CLI_FLAT_TO_NESTED`. The DSL no longer
+    # accepts these names, but the CLI flag surface keeps its 1.x
+    # spellings — operators don't have to learn a new flag set.
     def merge_cli!(overrides)
       overrides.each do |key, value|
         next if value.nil?
 
-        public_send(:"#{key}=", value) if respond_to?(:"#{key}=")
+        if (route = CLI_FLAT_TO_NESTED[key])
+          group, nested = route
+          public_send(group).public_send(:"#{nested}=", value)
+        elsif respond_to?(:"#{key}=")
+          public_send(:"#{key}=", value)
+        end
       end
       self
     end
@@ -244,26 +237,10 @@ module Hyperion
         end
       end
 
-      # Flat-name forwarders for the soon-to-be-nested settings (RFC A4).
-      # Pre-1.7 these were generated off `attr_accessor`; now they go
-      # through `Config#flat_setter=` which proxies into the nested
-      # subconfig. The DSL surface is unchanged for operators on the
-      # 1.6.x flat shape.
-      #
-      # 1.8.0 (RFC §3): each flat-DSL key now emits a one-shot
-      # deprecation warn through `Hyperion::Deprecations`. Behaviour is
-      # unchanged — the value still lands in the same nested slot. The
-      # warn dedup key is the flat name itself, so each key warns once
-      # per process regardless of how many config files / hot-reloads
-      # call into it.
-      Config::FLAT_TO_NESTED.each_key do |flat|
-        message = Config::FLAT_TO_NESTED_DEPRECATION[flat]
-        define_method(flat) do |value|
-          ::Hyperion::Deprecations.warn_once(:"flat_dsl_#{flat}", message)
-          @config.public_send(:"#{flat}=", value)
-        end
-      end
-
+      # 2.0.0: the flat DSL keys (`h2_max_concurrent_streams`, `admin_token`,
+      # `log_format`, …) are removed. Operators must use the nested DSL
+      # blocks defined below. Unknown DSL methods bubble up as
+      # `NoMethodError` from the DSL evaluator — typos surface at boot.
       Config::HOOKS.each do |hook|
         define_method(hook) do |&block|
           @config.public_send(:"add_#{hook}", &block)

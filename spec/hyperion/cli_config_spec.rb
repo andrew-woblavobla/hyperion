@@ -16,8 +16,10 @@ RSpec.describe 'Hyperion::CLI with --config' do
     config.write(<<~RUBY)
       bind '127.0.0.1'
       port #{port}
-      log_format :json
-      log_requests false
+      logging do
+        format :json
+        requests false
+      end
     RUBY
     config.close
 

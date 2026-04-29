@@ -27,54 +27,24 @@ module Hyperion
   }.freeze
 
   class << self
-    # 1.7.0: legacy module-level accessors are now thin delegators to
-    # `Runtime.default`. Pre-1.7 they each owned their own ivar; the
-    # delegate keeps the existing surface (`Hyperion.metrics`, the `=`
-    # writers) working untouched while the new constructor-injection
-    # path (`Hyperion::Runtime.new(...)` + `Server.new(runtime: …)`) is
-    # the recommended shape going forward. Deprecation warns land in
-    # 1.8.0; removal in 2.0.
+    # 2.0.0: legacy module-level `Hyperion.metrics =` / `Hyperion.logger =`
+    # SETTERS are removed. The getters stay as Runtime.default delegators —
+    # they're the canonical REPL convenience — and assignment now happens
+    # via the Runtime API:
     #
-    # The default Runtime's getters honour any module-level `@metrics`
-    # / `@logger` ivar override (see Runtime#metrics / Runtime#logger),
-    # so 1.6.x specs that swap via `Hyperion.instance_variable_set(:@metrics, …)`
-    # — reaching into private internals — keep working unchanged. The
-    # `=` setters write the ivar AND propagate; that way an explicit
-    # `Hyperion.metrics = nil` clears the override cleanly.
+    #   Hyperion::Runtime.default.metrics = MyAdapter.new   # mutate default
+    #   server = Hyperion::Server.new(app:, runtime: Hyperion::Runtime.new(metrics: …))
+    #
+    # The 1.8.0 deprecation warns called this out for one full release;
+    # in-tree spec rewrites flipped to `Runtime.default.metrics =` already.
     def logger
       Runtime.default.logger
-    end
-
-    def logger=(value)
-      Hyperion::Deprecations.warn_once(
-        :hyperion_logger_setter,
-        '`Hyperion.logger = ...` writes into `Runtime.default` and will be removed in 2.0. ' \
-        'New code should construct a Runtime explicitly: ' \
-        '`Hyperion::Runtime.new(logger: my_logger)` and pass it to `Hyperion::Server.new(runtime:)`. ' \
-        'In-tree code wanting to mutate the default Runtime should call ' \
-        '`Hyperion::Runtime.default.logger = ...` directly.'
-      )
-      @logger = value
-      Runtime.default.logger = value if value
     end
 
     attr_writer :log_requests
 
     def metrics
       Runtime.default.metrics
-    end
-
-    def metrics=(value)
-      Hyperion::Deprecations.warn_once(
-        :hyperion_metrics_setter,
-        '`Hyperion.metrics = ...` writes into `Runtime.default` and will be removed in 2.0. ' \
-        'New code should construct a Runtime explicitly: ' \
-        '`Hyperion::Runtime.new(metrics: my_metrics)` and pass it to `Hyperion::Server.new(runtime:)`. ' \
-        'In-tree code wanting to mutate the default Runtime should call ' \
-        '`Hyperion::Runtime.default.metrics = ...` directly.'
-      )
-      @metrics = value
-      Runtime.default.metrics = value if value
     end
 
     def stats

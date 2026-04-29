@@ -25,9 +25,9 @@ module Hyperion
       # 1.8.0: write directly to the default Runtime — `Hyperion.logger=` now
       # emits a deprecation warn aimed at out-of-tree callers, and CLI bootstrap
       # is the canonical in-tree caller, so we sidestep the warn here.
-      if config.log_level || config.log_format
+      if config.logging.level || config.logging.format
         Hyperion::Runtime.default.logger =
-          Hyperion::Logger.new(level: config.log_level, format: config.log_format)
+          Hyperion::Logger.new(level: config.logging.level, format: config.logging.format)
       end
 
       # Advisory: operators frequently flip --async-io expecting "fast mode"
@@ -46,7 +46,7 @@ module Hyperion
       # `Hyperion.log_requests?` without needing to thread it through
       # Server/ThreadPool/Master plumbing. Default is ON; nil means "don't
       # touch — fall through to the env/default chain in Hyperion.log_requests?".
-      Hyperion.log_requests = config.log_requests unless config.log_requests.nil?
+      Hyperion.log_requests = config.logging.requests unless config.logging.requests.nil?
 
       # Enable YJIT before workers fork / connections start. Auto-on in
       # production/staging gives operators the perf bump for free; explicit
@@ -336,13 +336,13 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
     # Skipped when the token is unset — those paths fall through to the app,
     # so apps may still own /-/anything if Hyperion's admin is off.
     def self.wrap_admin_middleware(app, config)
-      return app if config.admin_token.nil? || config.admin_token.to_s.empty?
+      return app if config.admin.token.nil? || config.admin.token.to_s.empty?
 
       Hyperion.logger.info do
         { message: 'admin endpoint enabled',
           paths: [AdminMiddleware::PATH_QUIT, AdminMiddleware::PATH_METRICS] }
       end
-      AdminMiddleware.new(app, token: config.admin_token)
+      AdminMiddleware.new(app, token: config.admin.token)
     end
     private_class_method :wrap_admin_middleware
 

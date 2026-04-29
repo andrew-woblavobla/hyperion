@@ -31,8 +31,10 @@ RSpec.describe Hyperion::Config do
         port 19200
         workers 4
         thread_count 16
-        log_level :debug
-        log_format :json
+        logging do
+          level :debug
+          format :json
+        end
         yjit true
       RUBY
       file.close
@@ -42,8 +44,8 @@ RSpec.describe Hyperion::Config do
       expect(cfg.port).to eq(19_200)
       expect(cfg.workers).to eq(4)
       expect(cfg.thread_count).to eq(16)
-      expect(cfg.log_level).to eq(:debug)
-      expect(cfg.log_format).to eq(:json)
+      expect(cfg.logging.level).to eq(:debug)
+      expect(cfg.logging.format).to eq(:json)
       expect(cfg.yjit).to be(true)
     ensure
       file.unlink

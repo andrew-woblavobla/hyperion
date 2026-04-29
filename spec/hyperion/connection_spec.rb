@@ -305,7 +305,7 @@ RSpec.describe Hyperion::Connection do
 
     it 'is ON by default — emits an access log line on a successful request' do
       Hyperion.log_requests = nil # reset to default
-      Hyperion.logger = Hyperion::Logger.new(io: log_io, format: :text, level: :info)
+      Hyperion::Runtime.default.logger = Hyperion::Logger.new(io: log_io, format: :text, level: :info)
       a, b = ::Socket.pair(:UNIX, :STREAM)
       a.write("GET /noisy HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
       a.close_write
@@ -318,12 +318,12 @@ RSpec.describe Hyperion::Connection do
       a&.close
       b&.close
       Hyperion.log_requests = nil
-      Hyperion.logger = Hyperion::Logger.new
+      Hyperion::Runtime.default.logger = Hyperion::Logger.new
     end
 
     it 'can be disabled via Hyperion.log_requests = false' do
       Hyperion.log_requests = false
-      Hyperion.logger = Hyperion::Logger.new(io: log_io, format: :text, level: :info)
+      Hyperion::Runtime.default.logger = Hyperion::Logger.new(io: log_io, format: :text, level: :info)
       a, b = ::Socket.pair(:UNIX, :STREAM)
       a.write("GET /silent HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
       a.close_write
@@ -335,11 +335,11 @@ RSpec.describe Hyperion::Connection do
       a&.close
       b&.close
       Hyperion.log_requests = nil
-      Hyperion.logger = Hyperion::Logger.new
+      Hyperion::Runtime.default.logger = Hyperion::Logger.new
     end
 
     it 'can be disabled per-Connection via log_requests: false' do
-      Hyperion.logger = Hyperion::Logger.new(io: log_io, format: :text, level: :info)
+      Hyperion::Runtime.default.logger = Hyperion::Logger.new(io: log_io, format: :text, level: :info)
       a, b = ::Socket.pair(:UNIX, :STREAM)
       a.write("GET /silent HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
       a.close_write
@@ -350,11 +350,11 @@ RSpec.describe Hyperion::Connection do
     ensure
       a&.close
       b&.close
-      Hyperion.logger = Hyperion::Logger.new
+      Hyperion::Runtime.default.logger = Hyperion::Logger.new
     end
 
     it 'emits one structured info line per response when log_requests: true' do
-      Hyperion.logger = Hyperion::Logger.new(io: log_io, format: :text, level: :info)
+      Hyperion::Runtime.default.logger = Hyperion::Logger.new(io: log_io, format: :text, level: :info)
       a, b = ::Socket.pair(:UNIX, :STREAM)
       a.write("GET /widgets?id=42 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
       a.close_write
@@ -374,11 +374,11 @@ RSpec.describe Hyperion::Connection do
     ensure
       a&.close
       b&.close
-      Hyperion.logger = Hyperion::Logger.new
+      Hyperion::Runtime.default.logger = Hyperion::Logger.new
     end
 
     it 'emits json access log when format is json' do
-      Hyperion.logger = Hyperion::Logger.new(io: log_io, format: :json, level: :info)
+      Hyperion::Runtime.default.logger = Hyperion::Logger.new(io: log_io, format: :json, level: :info)
       a, b = ::Socket.pair(:UNIX, :STREAM)
       a.write("POST /api/items HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
       a.close_write
@@ -399,7 +399,7 @@ RSpec.describe Hyperion::Connection do
     ensure
       a&.close
       b&.close
-      Hyperion.logger = Hyperion::Logger.new
+      Hyperion::Runtime.default.logger = Hyperion::Logger.new
     end
   end
 end

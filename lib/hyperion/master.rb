@@ -83,8 +83,8 @@ module Hyperion
       @stopping     = false
       @worker_model = self.class.detect_worker_model
       @listener     = nil # populated only in :share mode
-      @worker_max_rss_mb     = @config.worker_max_rss_mb
-      @worker_check_interval = @config.worker_check_interval || 30
+      @worker_max_rss_mb     = @config.worker_health.max_rss_mb
+      @worker_check_interval = @config.worker_health.check_interval || 30
       @last_health_check     = 0  # monotonic seconds
       @cycling               = {} # pid => true while we wait for it to exit
     end

@@ -80,49 +80,22 @@ RSpec.describe 'Config nested DSL (RFC A4)' do
     end
   end
 
-  describe 'flat-form DSL keeps working in 1.7 (no warns)' do
-    it 'h2_max_concurrent_streams = 256 produces equivalent Config' do
+  describe 'flat-form DSL is removed in 2.0' do
+    it 'flat keys raise NoMethodError from the DSL evaluator' do
       write_config(<<~RUBY) do |path|
         h2_max_concurrent_streams 256
-        h2_initial_window_size 2_097_152
-        admin_token 'sekrit'
-        worker_max_rss_mb 1024
-        log_level :debug
-        log_format :json
-        log_requests false
       RUBY
-        cfg = Hyperion::Config.load(path)
-        expect(cfg.h2.max_concurrent_streams).to eq(256)
-        expect(cfg.h2.initial_window_size).to eq(2_097_152)
-        expect(cfg.admin.token).to eq('sekrit')
-        expect(cfg.worker_health.max_rss_mb).to eq(1024)
-        expect(cfg.logging.level).to eq(:debug)
-        expect(cfg.logging.format).to eq(:json)
-        expect(cfg.logging.requests).to be(false)
+        expect { Hyperion::Config.load(path) }
+          .to raise_error(NoMethodError, /h2_max_concurrent_streams/)
       end
     end
 
-    it 'flat reads after nested writes return the same value' do
+    it 'flat-keyed Config setters no longer exist on the instance' do
       cfg = Hyperion::Config.new
-      cfg.h2.max_concurrent_streams = 256
-      expect(cfg.h2_max_concurrent_streams).to eq(256)
-    end
-
-    it 'nested reads after flat writes return the same value' do
-      cfg = Hyperion::Config.new
-      cfg.h2_max_concurrent_streams = 256
-      expect(cfg.h2.max_concurrent_streams).to eq(256)
-    end
-
-    it 'still produces an equivalent Config when flat keys are used (1.8 warns but does not change behaviour)' do
-      write_config(<<~RUBY) do |path|
-        h2_max_concurrent_streams 64
-        admin_token 'x'
-      RUBY
-        cfg = Hyperion::Config.load(path)
-        expect(cfg.h2.max_concurrent_streams).to eq(64)
-        expect(cfg.admin.token).to eq('x')
-      end
+      expect(cfg).not_to respond_to(:h2_max_concurrent_streams)
+      expect(cfg).not_to respond_to(:h2_max_concurrent_streams=)
+      expect(cfg).not_to respond_to(:admin_token)
+      expect(cfg).not_to respond_to(:log_format=)
     end
   end
 
