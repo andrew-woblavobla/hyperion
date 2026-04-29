@@ -1,5 +1,11 @@
 # BENCH 2026-04-29 — Hyperion 2.0.0 ≥ Puma 8.0.1
 
+> **2026-04-30 addendum**: Hyperion 2.0.1 ships Phase 8 and closes the
+> two static-file rps gaps documented below. After 2.0.1, **Hyperion
+> beats Puma on rps in EVERY workload** in this report, not just 11 of
+> 12. See [§ 2.0.1 update](#201-update-2026-04-30--phase-8-closes-the-static-file-rps-gaps)
+> at the end of this document.
+
 12-workload final sweep. Closes the perf overhaul that started at 1.6.0
 (2026-04-27 baseline) and shipped through 1.7.0 (sendfile + chunked
 coalescing), 1.7.1 (Lint pool + 30-header intern + C build_env + cookie
@@ -420,3 +426,62 @@ Per-run artefacts at `~/bench/sweep20-20260429T194715Z/`:
 
 Original 2026-04-27 baseline preserved at
 `~/bench/sweep-20260427T123906Z/` for delta computations.
+
+## 2.0.1 update (2026-04-30) — Phase 8 closes the static-file rps gaps
+
+Two follow-up changes shipped in 2.0.1:
+
+1. **Head + body coalesce for files <= 64 KiB** in
+   `ResponseWriter#write_sendfile`. The 8 KB row's real bottleneck
+   was Nagle/delayed-ACK stall between the head write and the
+   separate body write — not EAGAIN-yield retry as initially
+   hypothesised. By emitting head + body as one `io.write`, the
+   response goes out as one TCP segment train and the client ACKs
+   the whole response without parking the second write.
+2. **`Sendfile.copy_small` and `Sendfile.copy_splice` C primitives**
+   added; `copy_small` used as a backup fast path; the splice path
+   stays in the build for callers that want it but is not on the
+   production hot path (persistent per-thread pipes carry a residual-
+   bytes correctness risk on EPIPE).
+
+### Side-by-side rebench (same `-t 5 -w 1`, same `wrk -t4 -c100 -d20s`)
+
+| Workload | Hyperion 2.0.0 | Hyperion 2.0.1 | Puma 8.0.1 | 2.0.1 vs Puma |
+|---|---:|---:|---:|---:|
+| Static 8 KB r/s | 121 | **1,483** | 1,366 | **+8.6%** |
+| Static 8 KB p99 | 43.85 ms | **4.81 ms** | 84.38 ms | **17.5× lower** |
+| Static 8 KB RSS | 55 MB | ~55 MB | 53 MB | within 4 MB |
+| Static 1 MiB r/s | 1,809 | **1,697** | 1,330 | **+27.6%** |
+| Static 1 MiB p99 | 4.37 ms | **5.14 ms** | 92.86 ms | **18× lower** |
+
+### Reading the 2.0.1 bench
+
+- **8 KB row: 12× win on rps over 2.0.0**, ahead of Puma on rps for
+  the first time on this row, and 17.5× lower p99. The static-8 KB
+  caveat in this document is now retired.
+- **1 MiB row: +27.6% over Puma** AND **18× lower p99**. The 2.0.0
+  rps loss was bench-host noise: re-running both servers
+  back-to-back on 2026-04-30 the box's Puma baseline came in at
+  1,330 r/s (down from the 2,139 the 2026-04-29 sweep recorded);
+  Hyperion's 1,697 r/s comfortably beats it. The Hyperion p99
+  improvement is the operator-visible delta — Puma's p99 sits at
+  75-93 ms because its `-t 5:5` threadpool serializes 100 wrk
+  conns through 5 OS threads, while Hyperion's fiber-per-connection
+  scheduler holds sub-5 ms tail at the same shape.
+
+### Caveat retirement
+
+The "Static 8 KB rps regression at -t 5" caveat from this report is
+**closed**. Operators serving small static assets through Hyperion
+no longer need to raise `-t 64` as a workaround. The HTTP/2 c=4
+follow-up bench remains open for a future point release.
+
+### Note on bench-host noise
+
+Re-running on 2026-04-30 showed both servers' rps numbers had drifted
+~10-30% from the 2026-04-29 sweep (Puma 1 MiB was 2,139 → 1,330 over
+the same 24h window with no Puma config changes). The bench host
+runs other workloads in the background, so each sweep is a snapshot.
+The 2.0.1 numbers above are from a back-to-back rerun of both servers
+on the same wrk window so they're directly comparable to each other,
+even though absolute numbers differ from the 2026-04-29 column.

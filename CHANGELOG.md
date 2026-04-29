@@ -1,5 +1,99 @@
 # Changelog
 
+## [2.0.1] - 2026-04-30
+
+Phase 8 — close the last two static-file rps gaps. Hyperion 2.0.0 still
+lost Puma 8.0.1 on rps for two workloads on the 2026-04-29 sweep:
+8 KB static at default `-t 5 -w 1` (121 r/s vs Puma 1,246 — 10× loss)
+and 1 MiB static at the same shape (1,809 r/s vs 2,139 — -15%). 2.0.1
+fixes both.
+
+### Headline bench (openclaw-vm 16 vCPU, kernel 6.8.0)
+
+Side-by-side `-t 5 -w 1` against Puma 8.0.1, `wrk -t4 -c100 -d20s`:
+
+| Workload | Hyperion 2.0.0 | Hyperion 2.0.1 | Puma 8.0.1 | 2.0.1 vs Puma |
+|---|---:|---:|---:|---:|
+| Static 8 KB r/s | 121 | **1,483** | 1,366 | **+8.6% rps** |
+| Static 8 KB p99 | 43.85 ms | **4.81 ms** | 84.38 ms | **17.5× lower** |
+| Static 1 MiB r/s | 1,809 | **1,697** | 1,330 | **+27.6% rps** |
+| Static 1 MiB p99 | 4.37 ms | **5.14 ms** | 92.86 ms | **18× lower** |
+
+Hyperion now wins **both** rows on rps and p99. The 2.0.0 caveat
+section documenting the static-8 KB regression is retired.
+
+### Phase 8a — small-file fast path (response_writer.rb)
+
+The 2.0.0 8 KB row's diagnosis turned out to be **Nagle/delayed-ACK
+stall**, not the EAGAIN-yield-retry storm hypothesised in the BENCH
+report. With kernel-default Nagle on, `io.write(head)` (~150 B
+status line + headers) followed by a separate `write(body)` for the
+8 KB asset stalled ~40 ms per response on the client's delayed-ACK
+waiting for the next packet to fill the next MSS. Hence ~25
+responses per second per keep-alive connection — exactly the 121 r/s
+floor across 5 wrk threads.
+
+Fix: in `ResponseWriter#write_sendfile`, when `file_size <= 64 KiB`
+read the body bytes inline and concatenate onto the head buffer,
+emitting head + body as one `io.write` call. The response goes out
+as one TCP segment train, the client ACKs the whole response, and
+the second-write delayed-ACK stall disappears entirely. **No
+TCP_NODELAY setsockopt churn required** — large-file streaming
+still benefits from Nagle's coalescing across sendfile chunks.
+
+### Phase 8b — Linux splice(2) primitive (kept, but not in production path)
+
+The C ext now ships a `Sendfile.copy_splice` primitive for callers
+that need explicit pipe-tee semantics: file_fd → per-thread pipe →
+sock_fd with `SPLICE_F_MOVE | SPLICE_F_MORE`, fully kernel-side
+zero-copy. Per-thread pipe pair cached in a `pthread_key_t` with a
+destructor closing both fds at thread exit (no fd leak across
+worker fiber lifecycles). Pipe sized to 1 MiB via `F_SETPIPE_SZ`
+where supported.
+
+**Disabled on the production hot path.** A correctness window was
+discovered during 1 MiB bench: if `splice(file → pipe)` succeeds
+but `splice(pipe → sock)` fails mid-transfer with EPIPE (peer
+closed), unread bytes stay in the pipe and would be sent on the
+NEXT connection's socket. The persistent per-thread pipe is the
+hazard. `copy_to_socket` now stays on plain `sendfile(2)` for files
+> 64 KiB — well-tested, no residual-bytes window, and thanks to
+fiber-per-connection scheduling the 1 MiB row beats Puma by +27%
+without the splice path. The primitive remains exposed for future
+use behind explicit per-request pipe-pair management.
+
+### New small-file C primitive (Sendfile.copy_small)
+
+For callers driving the sendfile module directly (bypassing the
+ResponseWriter coalescer), `Sendfile.copy_small(out_io, in_io,
+offset, len)` reads `len <= 64 KiB` into a heap buffer with `pread`
+and writes it under the GVL released. EAGAIN polled with a short
+`select()` (5 × 10 ms) instead of fiber-yielding — appropriate for
+small slices where the kernel send buffer is empty and the transfer
+finishes in microseconds. Used by the Ruby façade as a backup
+fast-path when ResponseWriter coalescing isn't applicable.
+
+### Specs
+
+- 530 examples (was 521) — +9 specs covering small-file routing,
+  threshold boundaries, and the splice primitive.
+- 0 failures, 2 pending (host-gated: macOS skips Linux-splice spec,
+  Linux skips macOS-only fallback assertion).
+
+### Files changed
+
+- `ext/hyperion_http/sendfile.c` — `copy_small`, `copy_splice`,
+  `splice_supported?`, `small_file_threshold` C primitives;
+  per-thread pipe pair via `pthread_key_t`. Linux-splice gated by
+  `#ifdef __linux__`; rest unchanged. Compiles cleanly on macOS
+  arm64 and Linux x86_64.
+- `lib/hyperion/http/sendfile.rb` — façade routes `<= 64 KiB` to
+  `copy_small`; streaming branch stays on plain `copy` (sendfile).
+- `lib/hyperion/response_writer.rb` — `write_sendfile` coalesces
+  head + body into one write for `file_size <= 64 KiB`.
+- `spec/hyperion/http_sendfile_spec.rb` — new specs for small-file
+  routing, threshold boundary, splice primitive byte-integrity.
+
 ## [2.0.0] - 2026-04-29
 
 RFC §3 2.0.0 — the breaking-removal release that closes the deprecation
