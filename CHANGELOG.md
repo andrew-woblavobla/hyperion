@@ -1,5 +1,96 @@
 # Changelog
 
+## [1.8.0] - 2026-04-29
+
+RFC §3 1.8.0 deprecation wave + Phase 4 TLS session resumption. Two
+work streams in one minor: every API the RFC marks for removal in 2.0
+now emits a one-shot deprecation warn through the runtime logger, and
+the TLS context turns on server-side session caching + RFC 5077 ticket
+resumption with operator-driven SIGUSR2 key rotation. Behaviour of the
+deprecated APIs is unchanged — the warn is purely advisory.
+
+### Deprecations (1.8.0 emits, 2.0.0 removes)
+
+- **Flat-name DSL keys.** All 13 flat config keys
+  (`h2_max_concurrent_streams`, `h2_initial_window_size`,
+  `h2_max_frame_size`, `h2_max_header_list_size`, `h2_max_total_streams`,
+  `admin_token`, `admin_listener_port`, `admin_listener_host`,
+  `worker_max_rss_mb`, `worker_check_interval`, `log_level`,
+  `log_format`, `log_requests`) now emit a deprecation warn at boot
+  identifying the nested-DSL replacement. The CLI flag surface
+  (`--admin-token`, `--worker-max-rss-mb`, etc.) is unchanged — only the
+  Ruby DSL form warns. `merge_cli!` does NOT trigger the warn so
+  `--log-level info` from a launcher script stays quiet.
+- **`Hyperion.metrics =` / `Hyperion.logger =` setters.** Both
+  module-level setters now emit a deprecation warn pointing at the
+  Runtime injection path (`Hyperion::Runtime.new(metrics: …)` +
+  `Hyperion::Server.new(runtime:)`). In-tree CLI bootstrap was
+  rerouted to write `Hyperion::Runtime.default.logger = …` directly so
+  the canonical CLI path doesn't deprecation-warn itself.
+- **`Hyperion::AsyncPg.install!(activerecord: true)`** — N/A in this
+  repo. Lives in the `hyperion-async-pg` companion gem; deprecation
+  ships there.
+
+Each warn fires once per process via `Hyperion::Deprecations.warn_once`
+with a per-key dedup table. Tests can suppress via
+`Hyperion::Deprecations.silence!` (the spec-suite default) and assert
+on warn output via `unsilence!` + a sink-logger swap on
+`Hyperion::Runtime.default`.
+
+### Phase 4 — TLS session resumption ticket cache + SIGUSR2 rotation
+
+- **`Hyperion::TLS.context` enables `SESSION_CACHE_SERVER`** with a
+  20_480-entry LRU cap (≈16 MiB at 800 B/session) and a stable
+  per-process `session_id_context` so cache lookups cross worker
+  boundaries when the master inherits a single listener fd
+  (`:share` model).
+- **RFC 5077 session tickets are explicitly enabled** by clearing
+  `OP_NO_TICKET` on the SSLContext; OpenSSL's auto-rolled ticket key
+  handles short-circuited handshakes for returning clients with no
+  server-side state.
+- **`Hyperion::TLS.rotate!`** flushes the in-process session cache;
+  used by the SIGUSR2 handler.
+- **SIGUSR2-driven key rotation.** The master traps the configured
+  rotation signal (default `:USR2`) and re-broadcasts to every live
+  child; each worker calls `Hyperion::TLS.rotate!` on its per-context
+  SSLContext. Operators set `tls.ticket_key_rotation_signal = :NONE`
+  to disable rotation entirely.
+- **New `tls` config subconfig** with `session_cache_size` (default
+  20_480) and `ticket_key_rotation_signal` (default `:USR2`). Wired
+  through both the nested DSL and Worker / Server constructors.
+- **Cross-worker ticket-key sharing trade-off.** Ruby's stdlib OpenSSL
+  bindings (3.3.x) do not expose `SSL_CTX_set_tlsext_ticket_keys`, so
+  each worker still owns its own auto-generated ticket key. On Linux
+  `:reuseport` workers the kernel pins client → worker by tuple hash
+  so a returning client lands on the same worker's cache; on `:share`
+  model the cache is shared via the inherited fd. We'll thread a
+  master-generated key through to children when a Ruby binding lands
+  (probably 3.4+).
+
+### New specs (+24 examples)
+
+- `spec/hyperion/deprecation_warns_spec.rb` (12) — flat DSL warns,
+  per-key dedup, `Hyperion.metrics =` / `Hyperion.logger =` warns,
+  Runtime-direct write does NOT warn, suite-default silence path.
+- `spec/hyperion/tls_session_resumption_spec.rb` (12) — context
+  defaults (`SESSION_CACHE_SERVER`, stable `session_id_context`,
+  ticket-enabled), live resumption via OpenSSL session reuse,
+  `Hyperion::TLS.rotate!` flush, `session_cache_size = 1` eviction,
+  Config TLS subconfig defaults + nested-DSL wiring.
+
+### Test-suite changes
+
+- `spec_helper.rb` flips `Hyperion::Deprecations.silence!` in
+  `before(:suite)` so the legacy 475 specs (which intentionally
+  exercise deprecated APIs as their canonical 1.x test seams) stay
+  quiet without per-spec ceremony.
+- `spec/hyperion/nested_dsl_spec.rb` — the "does NOT emit a deprecation
+  warn on flat keys (warns land in 1.8)" example was the canary for
+  this release; replaced with a behaviour-parity assertion. Per-file
+  `before/after` silences the warns so the parity assertions still hold.
+- `spec/hyperion/tls_spec.rb` baseline ALPN tests untouched — the new
+  resumption knobs are additive on the same constructor.
+
 ## [1.7.1] - 2026-04-29
 
 Perf-only point release approaching Falcon parity on CPU-bound JSON.
