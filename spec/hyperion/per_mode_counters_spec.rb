@@ -3,7 +3,12 @@
 require 'net/http'
 require 'socket'
 
-RSpec.describe 'per-mode dispatch counters with dual-emit (RFC A2 / §3 1.7.0)' do
+# 2.0.0: the legacy `:requests_async_dispatched` /
+# `:requests_threadpool_dispatched` keys are retired. Only the
+# per-mode `:requests_dispatch_<mode>` key is emitted by
+# `Server#record_dispatch`. 1.7→1.8 dual-emitted both for one full
+# release cycle to give Grafana boards a migration window.
+RSpec.describe 'per-mode dispatch counters (RFC A2 / §3 2.0.0)' do
   let(:app) { ->(_env) { [200, { 'content-type' => 'text/plain' }, ['ok']] } }
 
   before do
@@ -13,12 +18,11 @@ RSpec.describe 'per-mode dispatch counters with dual-emit (RFC A2 / §3 1.7.0)' 
 
   after { Hyperion.instance_variable_set(:@metrics, @prev_metrics) }
 
-  it 'increments BOTH the new :requests_dispatch_threadpool_h1 and legacy :requests_threadpool_dispatched on plain HTTP' do
+  it 'increments :requests_dispatch_threadpool_h1 on plain HTTP and does NOT emit the retired legacy key' do
     server = Hyperion::Server.new(host: '127.0.0.1', port: 0, app: app)
     server.listen
     serve_thread = Thread.new { server.start }
 
-    # Wait for accept
     deadline = Time.now + 2
     loop do
       s = TCPSocket.new('127.0.0.1', server.port)
@@ -32,13 +36,13 @@ RSpec.describe 'per-mode dispatch counters with dual-emit (RFC A2 / §3 1.7.0)' 
 
     Net::HTTP.get(URI("http://127.0.0.1:#{server.port}/"))
     Net::HTTP.get(URI("http://127.0.0.1:#{server.port}/"))
-    sleep 0.05 # let metrics settle
+    sleep 0.05
 
     stats = Hyperion.stats
     expect(stats[:requests_dispatch_threadpool_h1]).to be >= 1
-    expect(stats[:requests_threadpool_dispatched]).to be >= 1
-    # Both keys reflect the same dispatches.
-    expect(stats[:requests_dispatch_threadpool_h1]).to eq(stats[:requests_threadpool_dispatched])
+    # Retired legacy keys: must NOT appear at all in 2.0.
+    expect(stats).not_to have_key(:requests_threadpool_dispatched)
+    expect(stats).not_to have_key(:requests_async_dispatched)
   ensure
     server&.stop
     serve_thread&.join(2)
@@ -47,40 +51,40 @@ RSpec.describe 'per-mode dispatch counters with dual-emit (RFC A2 / §3 1.7.0)' 
   describe 'Server#record_dispatch (unit)' do
     let(:server) { Hyperion::Server.new(host: '127.0.0.1', port: 0, app: app) }
 
-    it 'dual-emits threadpool_h1 → both keys' do
+    it 'emits ONLY :requests_dispatch_threadpool_h1 for threadpool_h1' do
       server.send(:record_dispatch, Hyperion::DispatchMode.new(:threadpool_h1))
       stats = Hyperion.stats
       expect(stats[:requests_dispatch_threadpool_h1]).to eq(1)
-      expect(stats[:requests_threadpool_dispatched]).to eq(1)
+      expect(stats).not_to have_key(:requests_threadpool_dispatched)
     end
 
-    it 'dual-emits inline_h1_no_pool under the legacy threadpool key' do
+    it 'emits ONLY :requests_dispatch_inline_h1_no_pool for inline_h1_no_pool' do
       server.send(:record_dispatch, Hyperion::DispatchMode.new(:inline_h1_no_pool))
       stats = Hyperion.stats
       expect(stats[:requests_dispatch_inline_h1_no_pool]).to eq(1)
-      expect(stats[:requests_threadpool_dispatched]).to eq(1)
+      expect(stats).not_to have_key(:requests_threadpool_dispatched)
     end
 
-    it 'dual-emits tls_h1_inline → both keys' do
+    it 'emits ONLY :requests_dispatch_tls_h1_inline for tls_h1_inline' do
       server.send(:record_dispatch, Hyperion::DispatchMode.new(:tls_h1_inline))
       stats = Hyperion.stats
       expect(stats[:requests_dispatch_tls_h1_inline]).to eq(1)
-      expect(stats[:requests_async_dispatched]).to eq(1)
+      expect(stats).not_to have_key(:requests_async_dispatched)
     end
 
-    it 'dual-emits async_io_h1_inline under the legacy async key' do
+    it 'emits ONLY :requests_dispatch_async_io_h1_inline for async_io_h1_inline' do
       server.send(:record_dispatch, Hyperion::DispatchMode.new(:async_io_h1_inline))
       stats = Hyperion.stats
       expect(stats[:requests_dispatch_async_io_h1_inline]).to eq(1)
-      expect(stats[:requests_async_dispatched]).to eq(1)
+      expect(stats).not_to have_key(:requests_async_dispatched)
     end
 
-    it 'tls_h2 emits ONLY the new key (not the legacy buckets)' do
+    it 'emits ONLY :requests_dispatch_tls_h2 for tls_h2' do
       server.send(:record_dispatch, Hyperion::DispatchMode.new(:tls_h2))
       stats = Hyperion.stats
       expect(stats[:requests_dispatch_tls_h2]).to eq(1)
-      expect(stats[:requests_async_dispatched]).to be_nil
-      expect(stats[:requests_threadpool_dispatched]).to be_nil
+      expect(stats).not_to have_key(:requests_async_dispatched)
+      expect(stats).not_to have_key(:requests_threadpool_dispatched)
     end
   end
 end

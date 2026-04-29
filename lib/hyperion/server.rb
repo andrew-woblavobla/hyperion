@@ -356,23 +356,15 @@ module Hyperion
       @explicit_runtime ? @runtime.logger : Hyperion.logger
     end
 
-    # Bump per-mode dispatch counter + (transitionally, until 2.0) the
+    # Bump the per-mode dispatch counter. 1.7→1.8 dual-emitted under the
     # legacy `:requests_async_dispatched` / `:requests_threadpool_dispatched`
-    # keys. Operators on Grafana dashboards from the 1.x line keep getting
-    # data; new dashboards should switch to `:requests_dispatch_<mode>`.
-    # 2.0 drops the dual-emit.
+    # keys for one full release cycle so operators could migrate Grafana
+    # boards. 2.0 retires the legacy keys: only `:requests_dispatch_<mode>`
+    # is emitted (one of `:requests_dispatch_threadpool_h1`,
+    # `:requests_dispatch_inline_h1_no_pool`, `:requests_dispatch_tls_h1_inline`,
+    # `:requests_dispatch_async_io_h1_inline`, `:requests_dispatch_tls_h2`).
     def record_dispatch(mode)
-      m = runtime_metrics
-      m.increment(mode.metric_key)
-      # Legacy-key dual emit. The h2 path historically wasn't counted in
-      # either legacy bucket — keep that behaviour so dashboards that
-      # ignore h2 don't suddenly see a spike.
-      case mode.name
-      when :threadpool_h1, :inline_h1_no_pool
-        m.increment(:requests_threadpool_dispatched)
-      when :tls_h1_inline, :async_io_h1_inline
-        m.increment(:requests_async_dispatched)
-      end
+      runtime_metrics.increment(mode.metric_key)
     end
 
     # Spawn the optional sibling admin listener (RFC A8). When
