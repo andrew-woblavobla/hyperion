@@ -49,6 +49,13 @@ static VALUE rb_kSERVER_PROTOCOL;
 static VALUE rb_kCONTENT_TYPE;
 static VALUE rb_kCONTENT_LENGTH;
 
+/* 2.4-B (S2): pre-interned frozen Strings used by on_headers_complete
+ * for the smuggling-defense lookups. Pre-2.4-B these were freshly
+ * allocated via rb_str_new_cstr on every parse(); promoting them to
+ * static globals removes 2 String allocations per parse. */
+static VALUE rb_kHCONTENT_LENGTH_LC;
+static VALUE rb_kHTRANSFER_ENCODING_LC;
+
 /* Request ivar IDs, looked up once at extension load. Request is a frozen
  * struct-like value so reading via rb_ivar_get is safe — no dispatch cost,
  * no method-cache invalidation. */
@@ -135,15 +142,25 @@ typedef struct {
     const char *error_message;
 } parser_state_t;
 
+/* 2.4-B (S1): defer per-field String allocations until the relevant
+ * llhttp callback actually fires. A typical GET request never sends a
+ * body and may have no query_string; allocating empty placeholder
+ * Strings up-front cost 6 allocations per parse() before this change.
+ * After: allocate Qnil sentinels; the on_* callbacks lazy-allocate
+ * via the LAZY_ALLOC helper below; the Request build at the bottom
+ * coerces any remaining Qnil to the global empty-Strings table. */
+static VALUE rb_kEMPTY_STR;          /* frozen empty ASCII-8BIT String */
+static VALUE rb_kHTTP_1_1;           /* frozen "HTTP/1.1" String */
+
 static void state_init(parser_state_t *s) {
     s->method                    = Qnil;
-    s->path                      = rb_str_new_cstr("");
-    s->query_string              = rb_str_new_cstr("");
-    s->http_version              = rb_str_new_cstr("HTTP/1.1");
+    s->path                      = Qnil;  /* allocated in on_url first call */
+    s->query_string              = Qnil;  /* allocated in on_url_complete only if '?' present */
+    s->http_version              = Qnil;  /* allocated in on_version */
     s->headers                   = rb_hash_new();
-    s->body                      = rb_str_new_cstr("");
-    s->current_header_name       = rb_str_new_cstr("");
-    s->current_header_value      = rb_str_new_cstr("");
+    s->body                      = Qnil;  /* allocated in on_body first call */
+    s->current_header_name       = Qnil;  /* allocated in on_header_field */
+    s->current_header_value      = Qnil;  /* allocated in on_header_value */
     s->message_complete          = 0;
     s->has_content_length        = 0;
     s->has_transfer_encoding     = 0;
@@ -156,17 +173,33 @@ static void state_init(parser_state_t *s) {
 #define MAX_FIELD_BYTES (64 * 1024)
 #define MAX_BODY_BYTES  (16 * 1024 * 1024)
 
+/* 2.4-B (S1): lazy field allocation. The slot may still be Qnil on
+ * first append (state_init left it nil to skip the empty-String
+ * allocation). Materialise on first append, cap-check on subsequent. */
 #define APPEND_OR_FAIL(dst, at, length, cap, who) do {     \
-    if (RSTRING_LEN(dst) + (long)(length) > (long)(cap)) { \
-        s->parse_error = 1;                                \
-        s->error_message = (who " too large");             \
-        return -1;                                         \
+    if (NIL_P(dst)) {                                      \
+        if ((long)(length) > (long)(cap)) {                \
+            s->parse_error = 1;                            \
+            s->error_message = (who " too large");         \
+            return -1;                                     \
+        }                                                  \
+        (dst) = rb_str_new(at, length);                    \
+    } else {                                               \
+        if (RSTRING_LEN(dst) + (long)(length) > (long)(cap)) { \
+            s->parse_error = 1;                            \
+            s->error_message = (who " too large");         \
+            return -1;                                     \
+        }                                                  \
+        rb_str_cat(dst, at, length);                       \
     }                                                      \
-    rb_str_cat(dst, at, length);                           \
 } while (0)
 
 static void stash_pending_header(parser_state_t *s) {
-    if (RSTRING_LEN(s->current_header_name) > 0) {
+    /* 2.4-B (S1): the name/value slots are Qnil between headers; only
+     * an actually-populated header pair triggers the stash. Reset to
+     * Qnil after stash (not a fresh empty String) — the next
+     * on_header_field allocates lazily via APPEND_OR_FAIL. */
+    if (!NIL_P(s->current_header_name) && RSTRING_LEN(s->current_header_name) > 0) {
         /* Phase 2c (1.7.1): try the pre-interned table first. On a hit
          * we reuse the frozen lowercase VALUE — saves a String allocation
          * per common header. On a miss, fall back to the original
@@ -181,9 +214,10 @@ static void stash_pending_header(parser_state_t *s) {
         } else {
             key = rb_funcall(s->current_header_name, id_downcase, 0);
         }
-        rb_hash_aset(s->headers, key, s->current_header_value);
-        s->current_header_name  = rb_str_new_cstr("");
-        s->current_header_value = rb_str_new_cstr("");
+        VALUE val = NIL_P(s->current_header_value) ? rb_kEMPTY_STR : s->current_header_value;
+        rb_hash_aset(s->headers, key, val);
+        s->current_header_name  = Qnil;
+        s->current_header_value = Qnil;
     }
 }
 
@@ -195,6 +229,11 @@ static int on_url(llhttp_t *p, const char *at, size_t length) {
 
 static int on_url_complete(llhttp_t *p) {
     parser_state_t *s = (parser_state_t *)p->data;
+    /* 2.4-B (S1): path is Qnil for the (rare) zero-length-URL pathological
+     * case; nothing to split. */
+    if (NIL_P(s->path)) {
+        return 0;
+    }
     /* Split path?query. */
     char *full = RSTRING_PTR(s->path);
     long full_len = RSTRING_LEN(s->path);
@@ -222,6 +261,13 @@ static int on_method(llhttp_t *p, const char *at, size_t length) {
 static int on_version(llhttp_t *p, const char *at, size_t length) {
     /* llhttp gives us "1.1"; we prepend "HTTP/" ourselves. */
     parser_state_t *s = (parser_state_t *)p->data;
+    /* 2.4-B (S1): fast path the common "1.1" case to the frozen
+     * "HTTP/1.1" constant; saves an allocation on the overwhelming
+     * majority of HTTP/1.1 requests. */
+    if (length == 3 && at[0] == '1' && at[1] == '.' && at[2] == '1') {
+        s->http_version = rb_kHTTP_1_1;
+        return 0;
+    }
     s->http_version = rb_str_new_cstr("HTTP/");
     rb_str_cat(s->http_version, at, length);
     return 0;
@@ -229,25 +275,18 @@ static int on_version(llhttp_t *p, const char *at, size_t length) {
 
 static int on_header_field(llhttp_t *p, const char *at, size_t length) {
     parser_state_t *s = (parser_state_t *)p->data;
-    /* If current_header_value is non-empty, we just finished a header. */
-    if (RSTRING_LEN(s->current_header_value) > 0) {
+    /* 2.4-B (S1): name/value are Qnil between headers. A pending value
+     * is the signal that we just finished one and need to stash. */
+    if (!NIL_P(s->current_header_value) && RSTRING_LEN(s->current_header_value) > 0) {
         stash_pending_header(s);
     }
-    if (RSTRING_LEN(s->current_header_name) == 0) {
-        s->current_header_name = rb_str_new(at, length);
-    } else {
-        APPEND_OR_FAIL(s->current_header_name, at, length, MAX_FIELD_BYTES, "header name");
-    }
+    APPEND_OR_FAIL(s->current_header_name, at, length, MAX_FIELD_BYTES, "header name");
     return 0;
 }
 
 static int on_header_value(llhttp_t *p, const char *at, size_t length) {
     parser_state_t *s = (parser_state_t *)p->data;
-    if (RSTRING_LEN(s->current_header_value) == 0) {
-        s->current_header_value = rb_str_new(at, length);
-    } else {
-        APPEND_OR_FAIL(s->current_header_value, at, length, MAX_FIELD_BYTES, "header value");
-    }
+    APPEND_OR_FAIL(s->current_header_value, at, length, MAX_FIELD_BYTES, "header value");
     return 0;
 }
 
@@ -255,11 +294,14 @@ static int on_headers_complete(llhttp_t *p) {
     parser_state_t *s = (parser_state_t *)p->data;
     stash_pending_header(s);
 
-    /* Smuggling defense: both Content-Length and Transfer-Encoding present. */
-    VALUE cl_key = rb_str_new_cstr("content-length");
-    VALUE te_key = rb_str_new_cstr("transfer-encoding");
-    VALUE cl = rb_hash_aref(s->headers, cl_key);
-    VALUE te = rb_hash_aref(s->headers, te_key);
+    /* 2.4-B (S2): the lookup keys are pre-interned frozen Strings
+     * registered as globals in Init_hyperion_http. Pre-2.4-B these were
+     * freshly allocated via rb_str_new_cstr on every parse(); the new
+     * statics save 2 String allocations per parse() and (more
+     * importantly) make the Hash#[] lookup hit the internal frozen-key
+     * fast path because identity matches the keys we stored under. */
+    VALUE cl = rb_hash_aref(s->headers, rb_kHCONTENT_LENGTH_LC);
+    VALUE te = rb_hash_aref(s->headers, rb_kHTRANSFER_ENCODING_LC);
     s->has_content_length    = !NIL_P(cl);
     s->has_transfer_encoding = !NIL_P(te);
     if (s->has_content_length && s->has_transfer_encoding) {
@@ -375,14 +417,24 @@ static VALUE cparser_parse(VALUE self, VALUE buffer) {
         consumed = len;
     }
 
+    /* 2.4-B (S1): Qnil-to-empty-String coercion for fields that the
+     * llhttp callbacks never touched (e.g. zero-length URL, GET with
+     * no body, HTTP/1.0 with no version detail). The frozen empty
+     * String is shared across every nil-coerced field — no allocation. */
+    VALUE method        = NIL_P(s.method)        ? rb_kEMPTY_STR : s.method;
+    VALUE path          = NIL_P(s.path)          ? rb_kEMPTY_STR : s.path;
+    VALUE query_string  = NIL_P(s.query_string)  ? rb_kEMPTY_STR : s.query_string;
+    VALUE http_version  = NIL_P(s.http_version)  ? rb_kHTTP_1_1  : s.http_version;
+    VALUE body          = NIL_P(s.body)          ? rb_kEMPTY_STR : s.body;
+
     /* Build the Request. */
     VALUE kwargs = rb_hash_new();
-    rb_hash_aset(kwargs, ID2SYM(id_method_kw),       s.method);
-    rb_hash_aset(kwargs, ID2SYM(id_path_kw),         s.path);
-    rb_hash_aset(kwargs, ID2SYM(id_query_string_kw), s.query_string);
-    rb_hash_aset(kwargs, ID2SYM(id_http_version_kw), s.http_version);
+    rb_hash_aset(kwargs, ID2SYM(id_method_kw),       method);
+    rb_hash_aset(kwargs, ID2SYM(id_path_kw),         path);
+    rb_hash_aset(kwargs, ID2SYM(id_query_string_kw), query_string);
+    rb_hash_aset(kwargs, ID2SYM(id_http_version_kw), http_version);
     rb_hash_aset(kwargs, ID2SYM(id_headers_kw),      s.headers);
-    rb_hash_aset(kwargs, ID2SYM(id_body_kw),         s.body);
+    rb_hash_aset(kwargs, ID2SYM(id_body_kw),         body);
 
     VALUE args[1] = { kwargs };
     VALUE request = rb_funcallv_kw(rb_cRequest, id_new, 1, args, RB_PASS_KEYWORDS);
@@ -1199,6 +1251,18 @@ void Init_hyperion_http(void) {
     rb_global_variable(&rb_kSERVER_PROTOCOL);
     rb_global_variable(&rb_kCONTENT_TYPE);
     rb_global_variable(&rb_kCONTENT_LENGTH);
+
+    /* 2.4-B (S1, S2): the Qnil-coercion sentinel + the smuggling-defense
+     * lookup keys, all interned + frozen once at module init. They show
+     * up in every parse() call. */
+    rb_kEMPTY_STR             = rb_obj_freeze(rb_str_new("", 0));
+    rb_kHTTP_1_1              = rb_obj_freeze(rb_str_new_cstr("HTTP/1.1"));
+    rb_kHCONTENT_LENGTH_LC    = rb_obj_freeze(rb_str_new_cstr("content-length"));
+    rb_kHTRANSFER_ENCODING_LC = rb_obj_freeze(rb_str_new_cstr("transfer-encoding"));
+    rb_global_variable(&rb_kEMPTY_STR);
+    rb_global_variable(&rb_kHTTP_1_1);
+    rb_global_variable(&rb_kHCONTENT_LENGTH_LC);
+    rb_global_variable(&rb_kHTRANSFER_ENCODING_LC);
 
     /* Phase 2c (1.7.1): build the 30-entry pre-interned header table.
      * Each entry caches the frozen lowercase header name (used as the
