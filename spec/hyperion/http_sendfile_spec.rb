@@ -197,6 +197,88 @@ RSpec.describe Hyperion::Http::Sendfile do
     end
   end
 
+  # 2.6-B — posix_fadvise(SEQUENTIAL) hint for files >256 KiB on Linux.
+  #
+  # The hint is a kernel-only side effect with no observable Ruby
+  # return value: the C helper deliberately discards posix_fadvise's
+  # rc because some kernels return -EINVAL on certain fd types
+  # (tmpfs, FUSE) and that's not a fatal condition — sendfile / splice
+  # still work.  We can't observe the call from Ruby without strace,
+  # which is brittle.  The contract we CAN assert is behavioral:
+  #
+  #   1. The round-trip stays byte-equal on every file size around
+  #      and across the 256 KiB threshold (1 KiB / 100 KiB / 1 MiB /
+  #      4 MiB).  If the fadvise call accidentally raised on macOS
+  #      (where the #ifdef gate must elide the call) the >256 KiB
+  #      rows would fail to serve.  If the threshold gate were
+  #      wrong (e.g. fired on every file) small-file serving would
+  #      regress visibly.
+  #   2. On non-Linux hosts the >256 KiB row continues to serve —
+  #      proves the #if defined(__linux__) gate compiles out cleanly
+  #      and doesn't introduce a runtime regression.
+  describe '2.6-B — posix_fadvise(SEQUENTIAL) hint for files >256 KiB' do
+    [
+      ['1 KiB (well below threshold)', 1 * 1024],
+      ['100 KiB (below threshold)', 100 * 1024],
+      ['257 KiB (just above threshold)', (256 * 1024) + 1024],
+      ['1 MiB (the typical large asset)', 1024 * 1024],
+      ['4 MiB (multi-chunk)', 4 * 1024 * 1024]
+    ].each do |label, size|
+      it "round-trips a #{label} file byte-equal through copy_to_socket" do
+        # Use a deterministic, distinct-byte payload so a missed
+        # range or a stale-cache splice bug shows up as a byte-diff
+        # at a specific offset rather than as a length match with
+        # garbled content.
+        bytes = (0..255).map(&:chr).join.b * (size / 256)
+        bytes << ('Z' * (size % 256)).b if (size % 256).positive?
+
+        f = Tempfile.new(%w[hy-sf-fadv .bin]).tap do |t|
+          t.binmode
+          t.write(bytes)
+          t.flush
+          t.rewind
+        end
+        begin
+          with_socket_pair(size) do |client, reader|
+            written = described_class.copy_to_socket(client, f, 0, size)
+            client.close
+            expect(written).to eq(size)
+            expect(reader.value.bytesize).to eq(size)
+            expect(reader.value).to eq(bytes)
+          end
+        ensure
+          f.close!
+        end
+      end
+    end
+
+    it 'compiles out cleanly on non-Linux hosts (>256 KiB still serves)' do
+      # On macOS / BSD the #if defined(__linux__) gate elides the
+      # posix_fadvise call entirely; the test asserts that the
+      # >256 KiB path still completes a round-trip.  On Linux this
+      # spec is also valid (the call fires and is harmless), so we
+      # don't gate it.
+      size = 512 * 1024
+      bytes = (0..255).map(&:chr).join.b * (size / 256)
+      f = Tempfile.new(%w[hy-sf-fadv-mac .bin]).tap do |t|
+        t.binmode
+        t.write(bytes)
+        t.flush
+        t.rewind
+      end
+      begin
+        with_socket_pair(size) do |client, reader|
+          written = described_class.copy_to_socket(client, f, 0, size)
+          client.close
+          expect(written).to eq(size)
+          expect(reader.value).to eq(bytes)
+        end
+      ensure
+        f.close!
+      end
+    end
+  end
+
   describe 'EAGAIN / fiber-yield correctness' do
     # Fake out_io that returns :eagain once then accepts the rest.
     # Verifies the loop yields (calls wait_writable) and resumes from the

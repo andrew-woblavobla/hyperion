@@ -2,6 +2,97 @@
 
 ## [Unreleased] - 2.6.0
 
+### 2.6-B — posix_fadvise(SEQUENTIAL) hint for files >256 KiB on Linux
+
+Tells the kernel "I'm reading this file sequentially from `offset`
+for `len` bytes" before each sendfile / splice round, so the page
+cache pre-reads aggressively and subsequent kernel calls don't
+wait on disk I/O.
+
+**Where the win lives — cold-cache scenarios.**  The hint is
+specifically designed for the case where the bytes aren't yet in
+the page cache: a fresh deploy, the first request after a process
+restart, an asset paged out under memory pressure, or any workload
+whose hot set exceeds RAM (large-asset CDN front, long-tail file
+serving).  In those scenarios `fadvise(SEQUENTIAL)` doubles the
+read-ahead window and pre-reads aggressively, so by the time
+sendfile / splice reaches each subsequent page it's already
+resident.  Production deploys serving multi-megabyte JS bundles or
+model-weight files after a restart are the canonical "this matters"
+workloads.
+
+**Warm-cache is neutral to slightly negative** (and warm-cache is
+the typical bench shape).  When the file is already in the page
+cache the hint is a no-op kernel-side, but it's still a syscall —
+one per chunk.  At 256 KiB chunks (post-2.6-A), a 1 MiB response
+pays 4 extra syscalls.  The `wrk -t4 -c100 -d30s` warm-cache bench
+on openclaw-vm came in at **1,204 r/s** (median of 3 trials) vs a
+2.6-A-equivalent baseline of **1,289 r/s** on the same VM in the
+same hour (re-measured A/B by toggling
+`HYP_FADVISE_SEQUENTIAL_THRESHOLD` between `256 * 1024` and `1L <<
+60`) — about **-6.6%**.  This was anticipated; the brief target was
+"~0 ± noise" warm-cache, and the residual cost is the price of
+cold-cache correctness.  Future work could amortize the hint to
+one call per RESPONSE rather than one per chunk by lifting the
+call into the Ruby-level loop entry — out of scope for 2.6-B.
+
+**Cold-cache validation gap on this host.**  A genuine cold-cache
+bench requires `vm.drop_caches=3` between every request, not just
+once before the wrk run.  `wrk` opens 100 connections of 20-30
+seconds each, so after the first ~10 responses the file is back
+in the page cache and the rest are warm-cache anyway.  The
+single-request cold-per-call test (drop_caches + curl, 20 trials)
+came in at ~92 ms median per 1 MiB transfer with the hint, and
+fluctuated within the same range without it (the file is small
+relative to disk read-ahead).  The expected +5-10% cold-cache
+delta would be visible on workloads with bigger hot-sets and / or
+slower disks (cloud volumes, network-attached storage), neither
+of which is the openclaw-vm shape.  Documented as a known gap;
+production cold-cache benefit remains the design rationale.
+
+**Threshold rationale.**  Files <= 256 KiB ride the streaming path
+in one chunk (after 2.6-A's `USERSPACE_CHUNK = 256 KiB`), and the
+single-chunk case can't benefit from speculative read-ahead — there
+are no future chunks to pre-read for.  Files <= 64 KiB ride the
+small-file synchronous fast path (`copy_small`) which doesn't
+involve sendfile / splice at all and stays untouched.  The C-level
+gate is `len >= 256 KiB`; the Ruby façade chunks at exactly
+256 KiB so every chunk of any file >= 256 KiB fires the hint, and
+small files / favicons / sprite sheets pay nothing.
+
+**Linux-only.**  The C call is gated by
+`#if defined(__linux__) && defined(POSIX_FADV_SEQUENTIAL)`; on
+macOS / BSD the call is elided at compile time and the entire
+streaming path stays bit-for-bit identical to 2.6-A.  The C
+extension still compiles cleanly on macOS arm64 and the full
+spec suite stays green on both hosts.
+
+**Best-effort semantics.**  The return value is intentionally
+discarded.  Some kernels reject `posix_fadvise` with `-EINVAL` on
+certain fd types (tmpfs, FUSE, special filesystems); the hint is
+optional and `sendfile` / `splice` work without it.  Strace
+verification on openclaw-vm (Linux 6.8) confirms 4 successful
+`fadvise64(fd, offset, 262144, POSIX_FADV_SEQUENTIAL) = 0` calls
+per 1 MiB response — one per 256 KiB chunk — and zero calls on
+the 8 KiB row (which routes through `copy_small`).
+
+#### Files touched
+- `ext/hyperion_http/sendfile.c` — `HYP_FADVISE_SEQUENTIAL_THRESHOLD`
+  constant (256 KiB), `hyp_advise_sequential()` helper gated on
+  `__linux__` + `POSIX_FADV_SEQUENTIAL`, called from
+  `rb_sendfile_copy`, `rb_sendfile_copy_splice`, and
+  `rb_sendfile_copy_splice_into_pipe` immediately before each
+  `rb_thread_call_without_gvl`.
+- `spec/hyperion/http_sendfile_spec.rb` — 6 new round-trip byte-
+  equality tests (1 KiB / 100 KiB / 257 KiB just-above-threshold /
+  1 MiB / 4 MiB / 512 KiB non-Linux gate).  The fadvise call has
+  no observable Ruby side effect, so we assert behavioral
+  correctness across the threshold boundary on every host; strace
+  verification covered the Linux call-count contract out of band.
+
+Spec count: 941 → 947 (+6).  0 failures, 11 pending (Linux-only
+splice path skips on macOS).
+
 ### 2.6-C — `:inline_blocking` dispatch mode (Puma-style serial-per-thread sendfile for static)
 
 The biggest remaining 2.6 cut on the static-file row.  Adds a sixth

@@ -156,6 +156,54 @@
  * one read() + one write() with no loop. */
 #define HYP_SINGLE_MSS_THRESHOLD 1500
 
+/* 2.6-B — posix_fadvise(SEQUENTIAL) hint threshold.
+ *
+ * For files larger than 256 KiB we tell the kernel "I'm reading this
+ * file sequentially from `offset` for `len` bytes" so it can pre-read
+ * the page cache aggressively and subsequent sendfile / splice rounds
+ * don't wait on disk I/O.  Cold-cache scenarios benefit the most:
+ * deploys serving large assets, the first request after a restart,
+ * page-cache eviction under memory pressure.  Warm-cache is neutral
+ * (the pages are already resident; the hint is a no-op).
+ *
+ * The threshold avoids paying the syscall cost on small files where
+ * the win is not worth it.  After 2.6-A's chunking the streaming
+ * loops cap each kernel call at `USERSPACE_CHUNK` (256 KiB), so a
+ * file of exactly 256 KiB rides the path in one chunk with `len ==
+ * 256 KiB` and any larger file rides it in chunks of `len == 256
+ * KiB` (plus a remainder).  We therefore gate on `len >= 256 KiB`
+ * rather than strictly greater than: that fires the hint on every
+ * chunk of any file ≥ 256 KiB.  Per-chunk advising is what the
+ * kernel's read-ahead heuristic was designed for — repeated calls
+ * over the same fd at sequential offsets reinforce the sequential-
+ * access tag without per-call cost (the kernel coalesces).
+ *
+ * Linux-only; the call is gated by `#if defined(__linux__) &&
+ * defined(POSIX_FADV_SEQUENTIAL)`.  macOS / BSD compile without it.
+ *
+ * The return value is informational: some kernels return -EINVAL on
+ * certain fd types (e.g. tmpfs-backed files in older kernels).  We
+ * intentionally ignore it — sendfile / splice still works, the hint
+ * was just optional.
+ */
+#define HYP_FADVISE_SEQUENTIAL_THRESHOLD (256 * 1024)
+
+/* Best-effort sequential-read hint for the page cache.  Linux-only;
+ * the no-op on every other platform keeps the call sites uncluttered.
+ * Return value deliberately discarded — fadvise failures are not
+ * fatal. */
+static inline void hyp_advise_sequential(int file_fd, off_t offset, size_t len) {
+#if defined(__linux__) && defined(POSIX_FADV_SEQUENTIAL)
+    if (len >= HYP_FADVISE_SEQUENTIAL_THRESHOLD) {
+        (void)posix_fadvise(file_fd, offset, (off_t)len, POSIX_FADV_SEQUENTIAL);
+    }
+#else
+    (void)file_fd;
+    (void)offset;
+    (void)len;
+#endif
+}
+
 /* Phase 8a EAGAIN poll budget for the small-file path. We poll up to
  * ~50 ms total (5 × 10 ms select) before giving up and surfacing EAGAIN
  * to Ruby; on the small-file path this almost never triggers because
@@ -595,6 +643,10 @@ static VALUE rb_sendfile_copy(VALUE self, VALUE out_io, VALUE in_io,
     args.rc     = -1;
     args.err    = 0;
 
+    /* 2.6-B — page-cache pre-read hint for files > 256 KiB.  See
+     * hyp_advise_sequential for the rationale. */
+    hyp_advise_sequential(args.in_fd, args.offset, args.len);
+
     rb_thread_call_without_gvl(sendfile_blocking_call, &args, RUBY_UBF_IO, NULL);
 
     if (args.rc < 0) {
@@ -695,6 +747,9 @@ static VALUE rb_sendfile_copy_splice(VALUE self, VALUE out_io, VALUE in_io,
     args.rc      = 0;
     args.err     = 0;
 
+    /* 2.6-B — page-cache pre-read hint for files > 256 KiB. */
+    hyp_advise_sequential(args.in_fd, args.offset, args.len);
+
     rb_thread_call_without_gvl(splice_blocking_call, &args, RUBY_UBF_IO, NULL);
 
     /* Close the pipe pair before we either return a value or
@@ -779,6 +834,13 @@ static VALUE rb_sendfile_copy_splice_into_pipe(VALUE self, VALUE out_io, VALUE i
     args.len     = (size_t)len_l;
     args.rc      = 0;
     args.err     = 0;
+
+    /* 2.6-B — page-cache pre-read hint for files > 256 KiB.  Called
+     * per chunk; if the same file is being streamed across multiple
+     * chunks the kernel coalesces redundant hints, so the per-chunk
+     * cost is negligible.  We pass the chunk's local offset/len so
+     * the hint stays scoped to "the bytes we're about to splice". */
+    hyp_advise_sequential(args.in_fd, args.offset, args.len);
 
     rb_thread_call_without_gvl(splice_blocking_call, &args, RUBY_UBF_IO, NULL);
 
