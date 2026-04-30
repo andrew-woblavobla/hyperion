@@ -60,6 +60,20 @@ module Hyperion
     NATIVE_AVAILABLE = defined?(::Hyperion::WebSocket::CFrame) &&
                        ::Hyperion::WebSocket::CFrame.respond_to?(:parse)
 
+    # 2.4-B (S5): the empty-payload Frame body. Pre-2.4-B every empty
+    # text/binary/control frame allocated `(+'').b` — two String
+    # allocations (the unfrozen `+''` and its `.b` re-encoding clone).
+    # Frames carry frozen empty payloads idempotently — a downstream
+    # caller that mutates would have been silently broken pre-2.4-B
+    # because the allocation was already non-shared. Sharing one frozen
+    # binary empty String per process is a strict win.
+    EMPTY_BIN_PAYLOAD = String.new('', encoding: Encoding::ASCII_8BIT).freeze
+
+    # 2.4-B (S4): pre-allocated Encoding identity check. `payload.b`
+    # always allocates a new String, even when payload is already
+    # ASCII-8BIT. Skipping the no-op clone saves one String per send().
+    BINARY_ENCODING = Encoding::ASCII_8BIT
+
     module Parser
       # Parse one frame out of `buf` starting at `offset`. Does NOT mutate
       # or consume `buf` — the caller is responsible for advancing its
@@ -86,10 +100,24 @@ module Hyperion
 
         payload =
           if payload_len.zero?
-            (+'').b
+            # 2.4-B (S5): share one frozen empty binary String across
+            # every empty-payload frame instead of allocating
+            # `(+'').b` (= 2 strings) per parse.
+            EMPTY_BIN_PAYLOAD
           else
             slice = buf.byteslice(payload_offset, payload_len)
-            masked ? ::Hyperion::WebSocket::CFrame.unmask(slice, mask_key) : slice.b
+            # 2.4-B (S5): when the input @inbuf is ASCII-8BIT (which
+            # WS::Connection guarantees: see `@inbuf = String.new(
+            # capacity:, encoding: ASCII_8BIT)`), `slice.b` is a no-op
+            # that allocates a redundant String clone. Skip when the
+            # source slice already has the right encoding.
+            if masked
+              ::Hyperion::WebSocket::CFrame.unmask(slice, mask_key)
+            elsif slice.encoding == BINARY_ENCODING
+              slice
+            else
+              slice.b
+            end
           end
 
         Frame.new(fin: fin, opcode: opcode_sym, payload: payload, rsv1: rsv1 ? true : false)
@@ -116,10 +144,18 @@ module Hyperion
 
         payload =
           if payload_len.zero?
-            (+'').b
+            # 2.4-B (S5): share one frozen empty binary String. See
+            # parse() above for the rationale.
+            EMPTY_BIN_PAYLOAD
           else
             slice = buf.byteslice(payload_offset, payload_len)
-            masked ? ::Hyperion::WebSocket::CFrame.unmask(slice, mask_key) : slice.b
+            if masked
+              ::Hyperion::WebSocket::CFrame.unmask(slice, mask_key)
+            elsif slice.encoding == BINARY_ENCODING
+              slice
+            else
+              slice.b
+            end
           end
 
         [
@@ -146,7 +182,18 @@ module Hyperion
       # those invariants are violated, which we re-raise as-is.
       def self.build(opcode:, payload: '', fin: true, mask: false, mask_key: nil, rsv1: false)
         opcode_int = opcode.is_a?(Symbol) ? OPCODES.fetch(opcode) : Integer(opcode)
-        bin_payload = payload.is_a?(String) ? payload.b : payload.to_s.b
+        # 2.4-B (S4): skip the redundant `.b` re-encoding when the
+        # caller already passes ASCII-8BIT. Servers echoing inbound
+        # WebSocket frames (chat, ActionCable, /echo benchmarks) all
+        # have binary-encoded payloads at this point — the previous
+        # unconditional `.b` allocated a String per send() that just
+        # equalled the input.
+        bin_payload =
+          if payload.is_a?(String)
+            payload.encoding == BINARY_ENCODING ? payload : payload.b
+          else
+            payload.to_s.b
+          end
 
         if mask && mask_key.nil?
           # Caller didn't supply a key — generate one with SecureRandom
