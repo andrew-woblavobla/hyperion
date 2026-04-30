@@ -26,6 +26,8 @@ Gem::Specification.new do |spec|
     'ext/**/*.{rb,c,h,rs}',
     'ext/hyperion_h2_codec/Cargo.toml',
     'ext/hyperion_h2_codec/Cargo.lock',
+    'ext/hyperion_io_uring/Cargo.toml',
+    'ext/hyperion_io_uring/Cargo.lock',
     'CHANGELOG.md',
     'README.md',
     'LICENSE'
@@ -42,7 +44,8 @@ Gem::Specification.new do |spec|
   #     `protocol-http2`'s Ruby HPACK at runtime.
   spec.extensions = [
     'ext/hyperion_http/extconf.rb',
-    'ext/hyperion_h2_codec/extconf.rb'
+    'ext/hyperion_h2_codec/extconf.rb',
+    'ext/hyperion_io_uring/extconf.rb'
   ]
 
   spec.add_dependency 'rack', '>= 3.0', '< 4.0'

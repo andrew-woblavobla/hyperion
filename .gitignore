@@ -15,9 +15,11 @@ ext/**/Makefile
 ext/**/mkmf.log
 lib/hyperion_http/
 lib/hyperion_h2_codec/
+lib/hyperion_io_uring/
 
 # Rust extension build artifacts
 ext/hyperion_h2_codec/target/
+ext/hyperion_io_uring/target/
 
 # bench output
 bench/keepalive_memory_results/

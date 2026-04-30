@@ -26,7 +26,8 @@ module Hyperion
                    admin_token: nil,
                    tls_session_cache_size: TLS::DEFAULT_SESSION_CACHE_SIZE,
                    tls_ticket_key_rotation_signal: :USR2,
-                   tls_ktls: :auto)
+                   tls_ktls: :auto,
+                   io_uring: :off)
       @host                     = host
       @port                     = port
       @app                      = app
@@ -49,6 +50,7 @@ module Hyperion
       @tls_session_cache_size            = tls_session_cache_size
       @tls_ticket_key_rotation_signal    = tls_ticket_key_rotation_signal
       @tls_ktls                          = tls_ktls
+      @io_uring                          = io_uring
     end
 
     def run
@@ -76,7 +78,8 @@ module Hyperion
                           admin_listener_host: @admin_listener_host,
                           admin_token: @admin_token,
                           tls_session_cache_size: @tls_session_cache_size,
-                          tls_ktls: @tls_ktls)
+                          tls_ktls: @tls_ktls,
+                          io_uring: @io_uring)
 
       # `on_worker_boot` runs in the child after fork, BEFORE the worker
       # adopts/binds its listener and before any accept. App code reconnects

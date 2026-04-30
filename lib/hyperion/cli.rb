@@ -37,6 +37,14 @@ module Hyperion
       # (per-invocation), and the config file is innermost.
       apply_h2_max_total_streams_env_override!(config)
 
+      # 2.3-A: env-var override for the io_uring accept policy. Same
+      # grammar as `HYPERION_TLS_KTLS` (off/on/auto). Operators flip
+      # on for an A/B run without rewriting their config file.
+      # 2.3.0 default is :off because io_uring under fork+threads has
+      # known sharp edges (SQ inheritance, SQPOLL non-survival across
+      # fork). The env var is the sanctioned way to opt in.
+      apply_io_uring_env_override!(config)
+
       # Install logger early so every subsequent log call honours the operator's
       # chosen format/level (config file or CLI) before anything else logs.
       # 1.8.0: write directly to the default Runtime — `Hyperion.logger=` now
@@ -241,7 +249,8 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
                           admin_listener_host: config.admin.listener_host,
                           admin_token: config.admin.token,
                           tls_session_cache_size: config.tls.session_cache_size,
-                          tls_ktls: config.tls.ktls)
+                          tls_ktls: config.tls.ktls,
+                          io_uring: config.io_uring)
       warn_c_parser_unavailable
 
       # Pre-allocate Rack env-pool entries and eager-touch lazy constants.
@@ -409,6 +418,27 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
       end
     end
     private_class_method :apply_h2_max_total_streams_env_override!
+
+    # 2.3-A: env-var bridge for the io_uring accept policy. Mirrors
+    # `apply_ktls_env_override!`. Unknown values warn and leave the
+    # config untouched — env vars are convenience knobs for benches /
+    # operator overrides, not security boundaries, so a typo
+    # shouldn't crash boot.
+    def self.apply_io_uring_env_override!(config)
+      raw = ENV['HYPERION_IO_URING']
+      return if raw.nil? || raw.empty?
+
+      case raw
+      when 'off'  then config.io_uring = :off
+      when 'on'   then config.io_uring = :on
+      when 'auto' then config.io_uring = :auto
+      else
+        Hyperion.logger.warn do
+          { message: 'HYPERION_IO_URING ignored (must be off|on|auto)', value: raw }
+        end
+      end
+    end
+    private_class_method :apply_io_uring_env_override!
 
     # Probe table for fiber-cooperative I/O libraries. If `async_io: true` is
     # set but none of these are loaded, the operator has likely flipped the

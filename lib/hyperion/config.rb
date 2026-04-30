@@ -39,7 +39,14 @@ module Hyperion
       max_pending: nil,
       max_request_read_seconds: 60,
       async_io: nil, # nil/true/false (validated strictly in 1.7.0+ via Server constructor).
-      accept_fibers_per_worker: 1 # RFC A6 — opt-in multi-fiber accept under :reuseport.
+      accept_fibers_per_worker: 1, # RFC A6 — opt-in multi-fiber accept under :reuseport.
+      # 2.3-A: io_uring accept policy (Linux 5.6+ only). Tri-state, mirrors `tls.ktls`:
+      #   :off  — never use io_uring; epoll path always (2.3.0 default).
+      #   :auto — use io_uring when supported; quietly fall back otherwise.
+      #   :on   — demand it; raise at boot if unsupported.
+      # Default flips to :auto in 2.4 only after soak. Operators flip on
+      # via `HYPERION_IO_URING={on,auto}` env var to A/B test.
+      io_uring: :off
     }.freeze
 
     HOOKS = %i[before_fork on_worker_boot on_worker_shutdown].freeze

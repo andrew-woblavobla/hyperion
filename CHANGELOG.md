@@ -1,5 +1,66 @@
 # Changelog
 
+## [Unreleased] - 2.3.0
+
+In-progress release. First of five 2.3.0 streams (2.3-A through 2.3-E)
+plus the version-bump release task (2.3-fix-F). The user's deployment
+shape is plaintext h1 behind nginx + LB (TLS terminated upstream), so
+the headline target is the unmovable kernel-accept boundary on the
+plaintext h1 path.
+
+### 2.3-A — io_uring accept on Linux 5.6+, opt-in via `HYPERION_IO_URING=on`
+
+**Why this matters most:** the 2026-04-30 sweep showed Hyperion at
+96,813 r/s on hello `-w 16 -t 5` (vs Puma 75,776 — already +27.8%).
+With the GVL bypassed by 16 workers, the next bottleneck is the
+kernel accept loop: every accept costs `accept_nonblock` + `IO.select`
+on the EAGAIN edge — two syscalls per accepted connection under
+burst. io_uring submits accept SQEs and reaps CQEs in one syscall,
+and the kernel batches multiple accepts in a single CQE drain when
+connections arrive faster than the fiber consumes them.
+
+**Target:** hello `-w 16 -t 5` from 96,813 → ≥ 130,000 r/s with p99
+unchanged (~2-3 ms).
+
+**What ships:**
+
+| Deliverable | Where | Why |
+|---|---|---|
+| `ext/hyperion_io_uring/` Rust crate | NEW | Wraps the `io-uring` crate (https://docs.rs/io-uring) — well-maintained safe Rust around liburing. Linux-gated via `target.'cfg(target_os = "linux")'` so the macOS dev build still cargo-checks cleanly; Darwin compiles to stubs that return -ENOSYS. |
+| `lib/hyperion/io_uring.rb` | NEW | Ruby surface: `Hyperion::IOUring.supported?`, `Hyperion::IOUring::Ring.new(queue_depth: 256)` with `#accept(fd)` / `#read(fd, max:)` / `#close`. Loaded over Fiddle, identical pattern to `Hyperion::H2Codec`. |
+| `Hyperion::Server#run_accept_fiber` | UPDATED | Splits into `run_accept_fiber_io_uring` and `run_accept_fiber_epoll`. The io_uring branch lazily opens a per-fiber ring on first use (`Fiber.current[:hyperion_io_uring] ||= Ring.new(...)`), drains accept CQEs, and hands each accepted fd to `dispatch` via `::Socket.for_fd`. Closed at fiber exit. The TLS path keeps epoll — io_uring accept is wired only for plain TCP (the SSL handshake still wants the userspace `accept` + `SSL_accept` dance). |
+| `Hyperion::Config#io_uring` | NEW | Tri-state `:off` / `:auto` / `:on`. Mirrors `tls.ktls`. |
+| `HYPERION_IO_URING={on,auto,off}` env var | NEW | Operator flips on for an A/B run without rewriting the config file, identical pattern to fix-B `HYPERION_H2_NATIVE_HPACK` and fix-C `HYPERION_TLS_KTLS`. |
+| `spec/hyperion/io_uring_spec.rb` | NEW (16 examples) | Cross-platform: `supported?` returns false on Darwin, `:auto` doesn't raise on Mac, `:on` raises with clear "io_uring not supported" / "io_uring required" message on Mac. Linux-only context (gated via `if: described_class.supported?`): ring lifecycle (open + close + no fd leak across 1000 accepts), feature parity (bytes through io_uring path match bytes through epoll). |
+
+**Per-fiber rings, NEVER per-process or per-thread.** io_uring under
+fork+threads has known sharp edges:
+
+- Submission queue is process-shared by default — under fork, the
+  parent's outstanding SQEs leak into the child's CQ.
+- `IORING_SETUP_SQPOLL` kernel thread does not survive fork.
+- Threads sharing a ring need `IORING_SETUP_SINGLE_ISSUER` + careful
+  submission discipline.
+
+The safe pattern matching Hyperion's fiber-per-conn architecture: one
+ring per fiber that needs it (the accept fiber, optionally per-conn
+read fibers in a future 2.3-x round). Rings are opened lazily on
+first use and closed at fiber exit. Workers never share rings across
+fork — each child opens its own.
+
+**Default off in 2.3.0.** Mirrors the 2.2.0 fix-B
+`HYPERION_H2_NATIVE_HPACK` pattern: ship the plumbing, give operators
+the env var to A/B, flip the default to `:auto` only after 6 months
+of soak. io_uring code in production has too many sharp edges to
+default-on without field validation.
+
+**Bench delta on openclaw-vm:** to be re-measured by the maintainer
+on the bench host. Auto-mode bench attempt from the dev sandbox is
+documented in the 2.3-A commit body; the gem ships with the code +
+specs + CHANGELOG even where the bench harness was unreachable.
+
+Spec count: 698 (2.2.0) → 714 (+ 16 io_uring specs).
+
 ## [2.2.0] - 2026-05-01
 
 ### Headline

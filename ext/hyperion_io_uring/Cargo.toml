@@ -1,0 +1,34 @@
+[package]
+name = "hyperion_io_uring"
+version = "2.3.0"
+edition = "2021"
+publish = false
+description = "io_uring accept/read primitives for Hyperion (2.3-A, Linux 5.6+ only)"
+
+[lib]
+crate-type = ["cdylib"]
+name = "hyperion_io_uring"
+
+# Linux-only dep. io-uring (https://docs.rs/io-uring) is the
+# well-maintained safe Rust wrapper around liburing — owns the ring
+# lifecycle, SQE/CQE submission, kernel-feature probing, and the dance
+# of io_uring's evolving feature set across kernel versions. We pull
+# it in only on Linux so the macOS dev build still cargo-checks
+# cleanly; on Darwin the cdylib compiles down to stubbed
+# `extern "C"` entry points that always return -ENOSYS, mirroring the
+# kernel surface we'd see on Linux < 5.6.
+#
+# 2.3-A keeps the surface intentionally small: ring lifecycle (new /
+# close), one accept submission API, and a feature-gate hook used by
+# `Hyperion::IOUring.supported?`. fix-A read_into hooks are wired but
+# not exercised on the wire path yet; future 2.3-x rounds will plumb
+# them once the accept-only path is field-validated.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.6"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -70,7 +70,8 @@ module Hyperion
                    h2_max_total_streams: nil, admin_listener_port: nil,
                    admin_listener_host: '127.0.0.1', admin_token: nil,
                    tls_session_cache_size: TLS::DEFAULT_SESSION_CACHE_SIZE,
-                   tls_ktls: :auto)
+                   tls_ktls: :auto,
+                   io_uring: :off)
       validate_async_io!(async_io)
       @host                     = host
       @port                     = port
@@ -107,6 +108,14 @@ module Hyperion
       @tls_session_cache_size   = tls_session_cache_size
       @tls_ktls                 = tls_ktls
       @ktls_logged              = false
+      # 2.3-A: resolve the io_uring accept policy. `:off` (the 2.3.0
+      # default) skips the resolve step entirely so hosts without the
+      # cdylib don't trigger any Fiddle.dlopen probe at boot.
+      # Workers don't share rings across fork — each child opens its
+      # own ring lazily on first use inside `run_accept_fiber`.
+      @io_uring_policy          = io_uring
+      @io_uring_active          = io_uring != :off && Hyperion::IOUring.resolve_policy!(io_uring)
+      log_io_uring_state_once
     end
 
     # Read-only handle to the per-worker SSL context (nil when the
@@ -281,7 +290,23 @@ module Hyperion
     # `start_async_loop`. All accept fibers share `@server` / `@tcp_server`
     # via closure; the kernel arbitrates which fiber wins each
     # IO.select / accept_nonblock race.
+    #
+    # 2.3-A: when `io_uring: :auto/:on` resolves to active, each accept
+    # fiber lazily opens its OWN ring (per-fiber lifecycle — see
+    # `Hyperion::IOUring` docs for the fork+threads sharp edges this
+    # avoids). The ring is closed at fiber exit. The TLS path keeps the
+    # epoll branch — io_uring accept is wired only for the plain TCP
+    # listener; the SSL handshake still wants the userspace
+    # `accept` + `SSL_accept` dance.
     def run_accept_fiber(task)
+      if @io_uring_active && !@tls
+        run_accept_fiber_io_uring(task)
+      else
+        run_accept_fiber_epoll(task)
+      end
+    end
+
+    def run_accept_fiber_epoll(task)
       until @stopped
         socket = accept_or_nil
         next unless socket
@@ -289,6 +314,61 @@ module Hyperion
         apply_timeout(socket)
         task.async { dispatch(socket) }
       end
+    end
+
+    # 2.3-A: io_uring accept loop. Opens a per-fiber ring on first
+    # use, drains accept CQEs, and hands the resulting fd to the
+    # existing `dispatch` path via a Ruby `Socket.for_fd` wrapper so
+    # the rest of the server (Connection, ResponseWriter, …) keeps
+    # working off a `::Socket` object identical to what
+    # `accept_nonblock` would have returned.
+    def run_accept_fiber_io_uring(task)
+      ring = Fiber.current[:hyperion_io_uring] ||= Hyperion::IOUring::Ring.new(queue_depth: 256)
+      listener_fd = listening_io.fileno
+      until @stopped
+        client_fd = ring.accept(listener_fd)
+        next if client_fd == :wouldblock
+
+        socket = ::Socket.for_fd(client_fd)
+        socket.autoclose = true
+        apply_timeout(socket)
+        task.async { dispatch(socket) }
+      end
+    rescue IOError, Errno::EBADF
+      @stopped = true
+    rescue StandardError => e
+      runtime_logger.warn do
+        { message: 'io_uring accept fiber error; falling back to epoll for this fiber',
+          error: e.message, error_class: e.class.name }
+      end
+      run_accept_fiber_epoll(task)
+    ensure
+      ring = Fiber.current[:hyperion_io_uring]
+      if ring && !ring.closed?
+        ring.close
+        Fiber.current[:hyperion_io_uring] = nil
+      end
+    end
+
+    # Boot-time log line per worker capturing the resolved io_uring
+    # state. Mirrors the `log_ktls_state_once` pattern from 2.2.0.
+    # Single-shot via the class-level ivar so multi-worker boots
+    # don't fan into N identical lines.
+    def log_io_uring_state_once
+      return if Hyperion::Server.instance_variable_get(:@io_uring_state_logged)
+      return if @io_uring_policy == :off
+
+      Hyperion::Server.instance_variable_set(:@io_uring_state_logged, true)
+      runtime_logger.info do
+        {
+          message: 'io_uring accept policy resolved',
+          policy: @io_uring_policy,
+          active: @io_uring_active,
+          supported: Hyperion::IOUring.supported?
+        }
+      end
+    rescue StandardError
+      nil
     end
 
     def dispatch(socket)

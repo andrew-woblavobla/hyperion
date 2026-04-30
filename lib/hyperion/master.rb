@@ -244,7 +244,9 @@ module Hyperion
           tls_session_cache_size: @config.tls.session_cache_size,
           tls_ticket_key_rotation_signal: @config.tls.ticket_key_rotation_signal,
           # 2.2.0 Phase 9 — kernel TLS_TX policy.
-          tls_ktls: @config.tls.ktls
+          tls_ktls: @config.tls.ktls,
+          # 2.3-A — io_uring accept policy.
+          io_uring: @config.io_uring
         }
         # Hand the inherited socket to the worker in :share mode. In
         # :reuseport mode the worker binds its own with SO_REUSEPORT.
