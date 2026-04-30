@@ -83,6 +83,7 @@ RSpec.describe Hyperion::Http2Handler do
     it 'logs a warning and skips unknown setting keys' do
       logger = instance_double(Hyperion::Logger)
       allow(logger).to receive(:warn)
+      allow(logger).to receive(:info) # Phase 6b: Http2Handler#initialize logs codec boot state
       allow(Hyperion).to receive(:logger).and_return(logger)
 
       handler = handler_with(bogus_setting: 42, max_concurrent_streams: 128)
