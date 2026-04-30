@@ -162,3 +162,183 @@ end
 
 The legacy unlabeled counters (`hyperion_requests_total`, status family,
 …) keep emitting — that surface predates 2.4-C and is operator-immutable.
+
+## Custom request lifecycle hooks (2.5-C)
+
+Most production Rails apps wire their own APM agent — NewRelic,
+AppSignal, DataDog, OpenTelemetry — and need a callback at the
+request boundary to start/finish a transaction or span. Pre-2.5-C the
+only seam was a monkey-patch on `Hyperion::Adapter::Rack#call`. 2.5-C
+exposes the lifecycle as a first-class API on `Hyperion::Runtime`:
+
+```ruby
+runtime = Hyperion::Runtime.default        # or Server.new(runtime: …)
+
+runtime.on_request_start do |request, env|
+  # fires AFTER env is built, BEFORE app.call
+  # `env` is the live Rack env Hash — middleware can stash anything
+  # the app or the after-hook needs to read.
+end
+
+runtime.on_request_end do |request, env, response, error|
+  # fires AFTER app.call returns or raises
+  #   * `response`  — [status, headers, body] tuple, or nil if app raised
+  #   * `error`     — the StandardError the app raised, or nil on success
+end
+```
+
+Hooks fire in registration order (FIFO). Hook errors are caught and
+logged with the block's `source_location` — they do **not** break the
+dispatch chain or the response. When **no hooks are registered** the
+adapter skips dispatch entirely (one `Array#empty?` check); per-request
+allocation count stays at the 2.5-B baseline.
+
+### NewRelic
+
+```ruby
+require 'newrelic_rpm'
+
+runtime.on_request_start do |request, env|
+  env['nr.tx'] = NewRelic::Agent::Tracer
+                   .start_transaction(name: "Controller/#{request.path}",
+                                      category: :web)
+end
+
+runtime.on_request_end do |_request, env, response, error|
+  tx = env['nr.tx']
+  next unless tx
+
+  if error
+    NewRelic::Agent.notice_error(error)
+  elsif response
+    NewRelic::Agent.add_custom_attributes(http_status: response[0])
+  end
+  tx.finish
+end
+```
+
+### AppSignal
+
+```ruby
+runtime.on_request_start do |request, env|
+  env['appsignal.tx'] = Appsignal::Transaction.create(
+    SecureRandom.uuid, Appsignal::Transaction::HTTP_REQUEST, request
+  )
+end
+
+runtime.on_request_end do |_request, env, response, error|
+  tx = env['appsignal.tx']
+  next unless tx
+
+  tx.set_error(error) if error
+  tx.set_metadata('status', response[0].to_s) if response
+  Appsignal::Transaction.complete_current!
+end
+```
+
+### OpenTelemetry
+
+```ruby
+tracer = OpenTelemetry.tracer_provider.tracer('hyperion')
+
+runtime.on_request_start do |request, env|
+  env['otel.span'] = tracer.start_span(
+    "HTTP #{request.method} #{request.path}",
+    attributes: {
+      'http.method' => request.method,
+      'http.target' => request.path,
+      'http.host'   => request.header('host')
+    },
+    kind: :server
+  )
+end
+
+runtime.on_request_end do |_request, env, response, error|
+  span = env['otel.span']
+  next unless span
+
+  if error
+    span.record_exception(error)
+    span.status = OpenTelemetry::Trace::Status.error(error.message)
+  elsif response
+    span.set_attribute('http.status_code', response[0])
+  end
+  span.finish
+end
+```
+
+### DataDog
+
+```ruby
+runtime.on_request_start do |request, env|
+  env['dd.span'] = Datadog::Tracing.trace(
+    'rack.request',
+    service: 'web',
+    resource: "#{request.method} #{request.path}",
+    span_type: 'web'
+  )
+end
+
+runtime.on_request_end do |_request, env, response, error|
+  span = env['dd.span']
+  next unless span
+
+  if error
+    span.set_error(error)
+  elsif response
+    span.set_tag('http.status_code', response[0])
+  end
+  span.finish
+end
+```
+
+### Plain Prometheus — per-route counters
+
+The built-in `hyperion_request_duration_seconds` histogram covers
+status × method × route templates registered via the path templater. To
+add **custom** labels (tenant, plan, feature flag) not covered by the
+built-in surface, hook in:
+
+```ruby
+require 'prometheus/client'
+
+ROUTE_HITS = Prometheus::Client.registry.counter(
+  :app_route_hits_total,
+  docstring: 'Per-route hits with custom labels',
+  labels: %i[route tenant plan]
+)
+
+runtime.on_request_end do |request, env, response, _error|
+  next unless response
+
+  ROUTE_HITS.increment(labels: {
+    route:  env['hyperion.route_template'] || request.path,
+    tenant: env['HTTP_X_TENANT_ID'] || 'unknown',
+    plan:   env['app.current_plan']  || 'free'
+  })
+end
+```
+
+Keep label cardinality bounded — Prometheus flat-files one time series
+per `(metric, label-tuple)`; an unbounded user-id label here is a fast
+path to OOM in your scrape target.
+
+### Multi-tenant isolation
+
+Each `Hyperion::Server` can carry its own Runtime — the hook registry
+is per-Runtime, not process-global:
+
+```ruby
+tenant_a_runtime = Hyperion::Runtime.new
+tenant_b_runtime = Hyperion::Runtime.new
+tenant_a_runtime.on_request_start { |req, env| TenantA::Tracer.start(req, env) }
+tenant_b_runtime.on_request_start { |req, env| TenantB::Tracer.start(req, env) }
+
+Hyperion::Server.new(app: tenant_a_app, runtime: tenant_a_runtime, ...)
+Hyperion::Server.new(app: tenant_b_app, runtime: tenant_b_runtime, ...)
+```
+
+`Runtime.default` is the back-compat path — calls to `Hyperion.metrics`,
+`Hyperion.logger`, and (now) on-request hooks registered against
+`Runtime.default` apply to every Server that does **not** pass an
+explicit `runtime:` kwarg.
