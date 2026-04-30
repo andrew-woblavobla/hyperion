@@ -187,6 +187,55 @@ gets its own observer list — no cross-contamination, no global mutex.
 
 Spec count: 894 → 907 (+13). 0 failures, 11 pending.
 
+### 2.5-D — permessage-deflate compression-bomb fuzz harness
+
+**The user-relevant bit.** 2.3-C shipped the RFC 7692 §8.1 defense:
+`max_message_bytes` is applied AFTER decompression, so a tiny
+compressed payload that explodes on inflate trips close 1009 (Message
+Too Big) BEFORE the inflated buffer is materialized. ONE regression
+spec covered the happy-path "4 MB of zeroes vs 64 KB cap" case in
+`spec/hyperion/websocket_permessage_deflate_spec.rb`. **2.5-D verifies
+the defense holds across six adversarial input vectors.**
+
+Each vector boots a `Hyperion::WebSocket::Connection` on one half of a
+`UNIXSocket.pair`, throws crafted compressed bytes at it from the
+other half, and asserts: (a) the server doesn't crash, (b) the server
+doesn't blow process RSS past a generous bomb-detection ceiling
+(4 MiB for protocol-error vectors, 64 MiB for the streaming ratio
+bomb — both >> the 64 KiB `max_message_bytes` cap so a real bomb
+trips), (c) the server closes with the expected RFC 6455 close code.
+
+**Vectors and the close codes they trip:**
+
+| # | Vector | Close code | Notes |
+|---|---|---|---|
+| 1 | Classic ratio bomb (4 GB inflated, streamed) | **1009** Message Too Big | Stream-deflated chunked input never holds 4 GB at rest; cap trips well before the full stream lands |
+| 2 | Malformed sync trailer (`00 00 ff fe`) | **1007** Invalid Frame Payload Data | Inflate hits `Zlib::DataError`, mapped to 1007 by `Connection#inflate_message` |
+| 3 | Mid-message dictionary corruption (3-fragment, frame 2 byte-flipped) | **1007** Invalid Frame Payload Data | Backreference points outside the legal sliding window → `Zlib::DataError` |
+| 4 | Zero-length compressed message (empty stored deflate block, RSV1=1) | **1000** Normal Closure | Decompresses to empty string OK, follow-up close 1000 returned cleanly |
+| 5 | Min-window-bits negotiation (`client_max_window_bits=9`) | **1000** Normal Closure | Hyperion clamps the floor to 9 (zlib raw-deflate refuses 8 in some builds); 9 round-trips OK |
+| 6 | Compressed control frame (ping with RSV1=1) | **1002** Protocol Error | RFC 7692 §6.1 — control frames MUST NOT carry RSV1; parser rejects |
+
+**Result on macOS arm64-darwin23 + Ruby 3.3.3 with YJIT:**
+**6/6 vectors PASS.** No bugs found. Total runtime under 2 minutes
+(ratio bomb ~80 s, all five protocol-error vectors complete in
+under a second each). The 2.3-C defense holds across every
+adversarial dimension we throw at it.
+
+**Files added.**
+- `bench/ws_compression_bomb_fuzz.rb` — the harness. Self-contained,
+  uses Ruby stdlib `zlib` + the existing `Hyperion::WebSocket::Builder`
+  for client-side framing, no new gem deps. Runs standalone via
+  `ruby bench/ws_compression_bomb_fuzz.rb` or via the wrapper spec.
+- `spec/hyperion/websocket_compression_bomb_fuzz_spec.rb` — single
+  example tagged `:perf` (skipped by default; operators run with
+  `--tag perf` after permessage-deflate code changes).
+
+Spec count: default-run unchanged at 907 (the new wrapper is `:perf`
+tagged so it skips by default). With `--tag perf` enabled the count
+moves 908 → 909 (the perf-included pool also picks up the existing
+`long_run_stability_spec`). 0 failures, 11 pending.
+
 ## [2.4.0] - 2026-04-29
 
 ### Headline
