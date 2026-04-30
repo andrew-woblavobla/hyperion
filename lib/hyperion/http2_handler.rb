@@ -705,6 +705,15 @@ module Hyperion
 
       @metrics.increment(:requests_total)
       @metrics.increment(:requests_in_flight)
+      # 2.1.0 (WS-1): HTTP/2 hijack is intentionally NOT plumbed here.
+      # Rack 3 hijack over HTTP/2 requires Extended CONNECT (RFC 8441 +
+      # RFC 9220) — a separate feature with its own SETTINGS handshake,
+      # :protocol pseudo-header, and stream lifetime semantics. The
+      # 2.1.0 scope is HTTP/1.1 hijack only (env['rack.hijack?'] returns
+      # false on h2 streams because we don't pass `connection:` here).
+      # If a Rack app keys on rack.hijack? to choose a transport, the h2
+      # branch will fall through to its non-hijack path. See WS-2..WS-5
+      # for the full WebSocket roadmap.
       status, response_headers, body_chunks = begin
         if @thread_pool
           @thread_pool.call(@app, request)

@@ -73,7 +73,23 @@ module Hyperion
     # `spawn_worker`.
     def call(app, request)
       reply = @reply_pool.pop
-      @inbox << [:call, app, request, reply]
+      @inbox << [:call, app, request, reply, nil]
+      result = reply.pop
+      @reply_pool << reply
+      result
+    end
+
+    # 2.1.0 (WS-1) — same as #call, but threads a `Hyperion::Connection`
+    # through to `Adapter::Rack.call(app, request, connection:)` so the
+    # Rack env hash advertises full-hijack support. The worker pushes the
+    # standard [status, headers, body] tuple back; if the app called
+    # `env['rack.hijack'].call`, the connection's `@hijacked` ivar was
+    # flipped from inside the worker thread and the calling fiber will
+    # observe it on return (Ruby ivars are visible across the GVL boundary
+    # for plain assignments — no Mutex/atomic needed).
+    def call_with_connection(app, request, connection)
+      reply = @reply_pool.pop
+      @inbox << [:call, app, request, reply, connection]
       result = reply.pop
       @reply_pool << reply
       result
@@ -110,10 +126,14 @@ module Hyperion
               end
             end
           when :call
-            _, app, request, reply = job
+            _, app, request, reply, connection = job
             reply <<
               begin
-                Hyperion::Adapter::Rack.call(app, request)
+                if connection
+                  Hyperion::Adapter::Rack.call(app, request, connection: connection)
+                else
+                  Hyperion::Adapter::Rack.call(app, request)
+                end
               rescue StandardError => e
                 Hyperion.logger.error do
                   { message: 'thread pool worker raised', error: e.message, error_class: e.class.name }

@@ -135,8 +135,16 @@ module Hyperion
           nil
         end
 
-        def call(app, request)
-          env, input = build_env(request)
+        # 2.1.0 (WS-1): `connection:` is the Hyperion::Connection that owns
+        # the underlying socket for this request. When non-nil, the env hash
+        # advertises Rack 3 full-hijack support — the app can call
+        # `env['rack.hijack'].call` to take ownership of the raw socket and
+        # speak any post-HTTP protocol (WebSocket, raw TCP tunnel, etc.).
+        # When nil (HTTP/2 path, ad-hoc adapter callers in specs), hijack
+        # stays disabled — `env['rack.hijack?']` returns false and the env
+        # has no `rack.hijack` key, matching pre-2.1 behaviour.
+        def call(app, request, connection: nil)
+          env, input = build_env(request, connection: connection)
           status, headers, body = app.call(env)
           [status, headers, body]
         rescue StandardError => e
@@ -156,13 +164,26 @@ module Hyperion
           # is iterated lazily — release happens after the writer.
           # For Phase 5 simplicity we release synchronously since the writer
           # buffers fully. Phase 7 (HTTP/2 streaming) will revisit.
-          ENV_POOL.release(env) if env
-          INPUT_POOL.release(input) if input
+          #
+          # 2.1.0 hijack: when the app full-hijacked the socket, the env
+          # references (notably the rack.hijack proc + buffered carry) are
+          # *the* live reference to the connection. Returning the env to the
+          # pool here would let a subsequent request reuse the same hash and
+          # silently null out the hijacker's state. Skip the pool release on
+          # hijacked connections and let the hash be GC'd normally.
+          if env && connection && connection.respond_to?(:hijacked?) && connection.hijacked?
+            # Drop the input back into the pool (it's a fresh StringIO and
+            # the hijacker doesn't reference it). Skip env recycling.
+            INPUT_POOL.release(input) if input
+          else
+            ENV_POOL.release(env) if env
+            INPUT_POOL.release(input) if input
+          end
         end
 
         private
 
-        def build_env(request)
+        def build_env(request, connection: nil)
           host_header = request.header('host') || ''
           server_name, server_port = split_host(host_header)
 
@@ -186,7 +207,28 @@ module Hyperion
           env['rack.url_scheme']   = 'http'
           env['rack.input']        = input
           env['rack.errors']       = $stderr
-          env['rack.hijack?']      = false
+          if connection
+            # 2.1.0 (WS-1) — Rack 3 full-hijack. The proc captures the
+            # connection (NOT the socket directly) so the connection can
+            # flip its @hijacked flag synchronously inside hijack!; that
+            # way the writer / cleanup paths see the flag the moment the
+            # app takes over the wire. The proc returns the raw socket
+            # IO, per Rack 3 spec.
+            env['rack.hijack?'] = true
+            env['rack.hijack']  = lambda do
+              connection.hijack!
+            end
+            # Hyperion-specific extension: any bytes the connection had
+            # buffered past the parsed request (pipelined/keep-alive
+            # carry, or — for an Upgrade — bytes the client sent
+            # immediately after the headers). Empty string when none.
+            # The app reads these BEFORE reading from the hijacked
+            # socket. Documented in CHANGELOG; not a Rack 3 spec key.
+            env['hyperion.hijack_buffered'] =
+              connection.respond_to?(:hijack_buffered) ? connection.hijack_buffered : +''
+          else
+            env['rack.hijack?'] = false
+          end
           env['rack.version']      = [3, 0]
           env['rack.multithread']  = false
           env['rack.multiprocess'] = false

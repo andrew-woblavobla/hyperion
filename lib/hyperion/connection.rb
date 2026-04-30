@@ -96,8 +96,50 @@ module Hyperion
                       end
     end
 
+    # 2.1.0 (WS-1): the connection itself caches the live socket so that
+    # `hijack!` (called from inside the app, possibly on a thread-pool
+    # worker thread) can reach back and yield it. `@hijacked` is the flag
+    # that gates writer + cleanup behaviour after the app returns. Reset
+    # at the top of each request iteration: a keep-alive client that does
+    # NOT hijack on request N must still get the normal response path,
+    # and a hijack on request N+1 should not be observed during request N.
+    attr_reader :socket
+
+    def hijacked?
+      @hijacked == true
+    end
+
+    # Called by the Rack app (via `env['rack.hijack'].call`). Flips the
+    # `@hijacked` flag — Connection#serve checks this after `call_app`
+    # returns and skips the writer + the ensure-block close. Returns the
+    # raw socket IO so the app can speak any post-HTTP protocol on it.
+    #
+    # Idempotent: a subsequent call returns the same socket without
+    # re-flipping (the flag is monotonic). Defensive — apps occasionally
+    # do `io = env['rack.hijack'].call; io2 = env['rack.hijack'].call`
+    # when chaining middleware.
+    def hijack!
+      @hijacked = true
+      Hyperion.metrics.increment(:rack_hijacks) if defined?(Hyperion) && Hyperion.respond_to?(:metrics)
+      @socket
+    end
+
+    # Bytes the connection had buffered past the parsed request boundary
+    # at the moment we entered the dispatch step (pipelined keep-alive
+    # carry, or — for an Upgrade — early bytes the client sent right
+    # after the headers, before they could see our 101 response).
+    # Returns a binary-encoded String (possibly empty). Captured fresh
+    # per request inside `serve` *before* `call_app` so reads from the
+    # socket past this point still go to the OS buffer; the carry is
+    # the application's responsibility to drain.
+    def hijack_buffered
+      @hijack_buffered ||= +''
+    end
+
     def serve(socket, app, max_request_read_seconds: 60)
       request_count = 0
+      @socket = socket
+      @hijacked = false
       # Phase 2b (1.7.1): pre-size the read accumulator once per connection
       # and reuse it across keep-alive requests. `String#clear` between
       # requests preserves the underlying capacity, so subsequent appends
@@ -143,6 +185,19 @@ module Hyperion
         # Carry over any pipelined trailing bytes for the next iteration. We
         # rewrite @inbuf in place — `replace` keeps the underlying capacity
         # allocation, so the next request starts with a warm 8 KiB buffer.
+        #
+        # 2.1.0 (WS-1): snapshot the carry BEFORE we collapse it back into
+        # the read buffer. If the app full-hijacks this request, those
+        # bytes are the application's responsibility (sent right after the
+        # Upgrade headers, etc.) — exposed via `env['hyperion.hijack_buffered']`.
+        # On the non-hijack hot path the snapshot is empty (no allocation
+        # past the constant `EMPTY_BIN`) for keep-alive without pipelining.
+        @hijack_buffered = if buffer.bytesize > body_end
+                             buffer.byteslice(body_end,
+                                              buffer.bytesize - body_end).b
+                           else
+                             EMPTY_BIN
+                           end
         carry_into_inbuf!(buffer, body_end)
         request = enrich_with_peer(request, peer_addr) if peer_addr && request.peer_address.nil?
 
@@ -154,6 +209,26 @@ module Hyperion
           status, headers, body = call_app(app, request)
         ensure
           @metrics.decrement(:requests_in_flight)
+        end
+
+        # 2.1.0 (WS-1): if the app called `env['rack.hijack'].call` during
+        # `call_app`, the connection has handed the socket over. We MUST
+        # NOT write a response (the app is now driving the wire) and we
+        # MUST NOT close the socket (the app owns it). The status/headers/body
+        # tuple from the app is ignored on this path — Rack 3 spec calls this
+        # out explicitly. Drop out of the per-request loop; the ensure block
+        # will skip socket close because of @hijacked.
+        if @hijacked
+          @logger.debug do
+            { message: 'rack hijack', method: request.method, path: request.path, peer_addr: peer_addr }
+          end
+          # Drop body if the app still returned one — apps occasionally
+          # return [-1, {}, []] but some return real arrays out of habit.
+          # We don't iterate or close the body; iterating would let it
+          # write to the (now app-owned) socket via env['rack.input'] etc.
+          # body.close is the one safe call (frees temp files), best-effort.
+          body.close if body.respond_to?(:close)
+          return
         end
 
         keep_alive = should_keep_alive?(request, status, headers)
@@ -187,10 +262,17 @@ module Hyperion
       # the connection go idle. Otherwise a low-traffic worker would hold
       # logs in its per-thread buffer indefinitely.
       @logger.flush_access_buffer if @log_requests && @logger.respond_to?(:flush_access_buffer)
-      begin
-        socket.close unless socket.closed?
-      rescue StandardError
-        # Already failing; swallow close errors so we don't mask the real cause.
+      # 2.1.0 (WS-1): when the app full-hijacked the socket, ownership has
+      # transferred. Hyperion MUST NOT close — the app may still be reading
+      # from / writing to the wire (e.g. an open WebSocket) long after this
+      # fiber exits. Skip the close branch entirely; the app is the sole
+      # closer from this point on.
+      unless @hijacked
+        begin
+          socket.close unless socket.closed?
+        rescue StandardError
+          # Already failing; swallow close errors so we don't mask the real cause.
+        end
       end
     end
 
@@ -219,11 +301,23 @@ module Hyperion
     # otherwise run inline on the current fiber. Inline keeps the test path
     # simple (no extra threads spun up for unit specs) and provides a
     # debugging escape hatch via `Server#thread_count: 0`.
+    #
+    # 2.1.0 (WS-1) passes `self` as the hijack target so the env hash gets
+    # a working `rack.hijack?` + `rack.hijack` proc. Both modes (inline and
+    # thread-pool) plumb the connection through — the app can hijack on
+    # either path; the connection's `@hijacked` ivar is the source of
+    # truth that's read back here in `serve` after `call_app` returns,
+    # regardless of which thread evaluated the proc.
     def call_app(app, request)
-      if @thread_pool
+      if @thread_pool && @thread_pool.respond_to?(:call_with_connection)
+        @thread_pool.call_with_connection(app, request, self)
+      elsif @thread_pool
+        # Older ThreadPool (or stubs) without the WS-1 helper — fall
+        # back to the no-hijack path. Keeps third-party pool plug-ins
+        # working at the cost of disabling hijack on those paths.
         @thread_pool.call(app, request)
       else
-        Adapter::Rack.call(app, request)
+        Adapter::Rack.call(app, request, connection: self)
       end
     end
 

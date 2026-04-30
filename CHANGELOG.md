@@ -1,5 +1,47 @@
 # Changelog
 
+## [Unreleased] — 2.1.0
+
+### Rack 3 hijack support (WS-1)
+
+`env['rack.hijack?']` now returns `true`; `env['rack.hijack']` returns a
+callable that detaches the underlying socket from Hyperion's request
+lifecycle. After the app calls `env['rack.hijack'].call`:
+
+* Hyperion does NOT write a response on the wire — the Rack tuple
+  returned from `app.call(env)` is ignored, per the Rack 3 spec.
+* The socket is removed from Hyperion's read/write rotation. The accept
+  loop / writer fiber will not touch it again.
+* Hyperion does NOT close the socket on connection cleanup or worker
+  shutdown — the application owns it. `Connection#close` becomes a
+  no-op for the close branch on the hijack path.
+* The connection is removed from keep-alive accounting; the next
+  request from this client is a fresh connection.
+
+Both dispatch modes are covered: the inline (per-fiber) path and the
+thread-pool path. The hijack proc captures the `Hyperion::Connection`
+(not the socket directly) so the `@hijacked` flag is observed by the
+connection fiber the moment the app evaluates the proc, regardless of
+which thread the proc runs on.
+
+Hyperion-specific extension: `env['hyperion.hijack_buffered']` exposes
+any bytes the connection had buffered past the parsed request boundary
+(pipelined keep-alive carry, or — for an Upgrade — bytes the client
+sent immediately after the request headers). The application is
+responsible for consuming these before reading from the hijacked socket.
+
+Foundation for native WebSocket support (WS-2 through WS-5).
+
+#### Scope notes
+
+* HTTP/1.1 only. Rack 3 hijack over HTTP/2 requires Extended CONNECT
+  (RFC 8441 / RFC 9220) and is intentionally NOT plumbed in this
+  release. h2 streams continue to see `env['rack.hijack?'] == false`.
+* Partial hijack (response-headers `'rack.hijack'` callback that
+  receives the writer-side IO) is not yet implemented. Apps that need
+  streaming should keep using the existing chunked transfer-encoding
+  path; a follow-up will add partial hijack once full hijack lands.
+
 ## [2.0.1] - 2026-04-30
 
 Phase 8 — close the last two static-file rps gaps. Hyperion 2.0.0 still
