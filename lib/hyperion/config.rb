@@ -136,15 +136,21 @@ module Hyperion
     # Set to `:NONE` to disable rotation entirely (workloads that don't
     # care about ticket-key rotation security guarantees).
     class TlsConfig
-      ATTRS = %i[session_cache_size ticket_key_rotation_signal].freeze
+      ATTRS = %i[session_cache_size ticket_key_rotation_signal ktls].freeze
       attr_accessor(*ATTRS)
 
       DEFAULT_SESSION_CACHE_SIZE = 20_480
       DEFAULT_ROTATION_SIGNAL    = :USR2
+      # 2.2.0 (Phase 9): kernel TLS_TX policy.
+      #   :auto — enable on Linux when supported, off elsewhere
+      #   :on   — force enable; raise at boot if unsupported
+      #   :off  — never enable, always use userspace SSL_write
+      DEFAULT_KTLS               = :auto
 
       def initialize
         @session_cache_size         = DEFAULT_SESSION_CACHE_SIZE
         @ticket_key_rotation_signal = DEFAULT_ROTATION_SIGNAL
+        @ktls                       = DEFAULT_KTLS
       end
     end
 

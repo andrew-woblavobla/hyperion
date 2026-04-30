@@ -207,7 +207,8 @@ module Hyperion
 
       if @tls
         ctx = TLS.context(cert: @tls[:cert], key: @tls[:key],
-                          session_cache_size: @config.tls.session_cache_size)
+                          session_cache_size: @config.tls.session_cache_size,
+                          ktls: @config.tls.ktls)
         ssl_server = ::OpenSSL::SSL::SSLServer.new(tcp, ctx)
         ssl_server.start_immediately = false
         @listener = ssl_server
@@ -241,7 +242,9 @@ module Hyperion
           admin_token: @config.admin.token,
           # 1.8.0 Phase 4 — TLS session resumption knobs.
           tls_session_cache_size: @config.tls.session_cache_size,
-          tls_ticket_key_rotation_signal: @config.tls.ticket_key_rotation_signal
+          tls_ticket_key_rotation_signal: @config.tls.ticket_key_rotation_signal,
+          # 2.2.0 Phase 9 — kernel TLS_TX policy.
+          tls_ktls: @config.tls.ktls
         }
         # Hand the inherited socket to the worker in :share mode. In
         # :reuseport mode the worker binds its own with SO_REUSEPORT.

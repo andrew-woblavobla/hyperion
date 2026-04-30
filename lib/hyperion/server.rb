@@ -69,7 +69,8 @@ module Hyperion
                    runtime: nil, accept_fibers_per_worker: 1,
                    h2_max_total_streams: nil, admin_listener_port: nil,
                    admin_listener_host: '127.0.0.1', admin_token: nil,
-                   tls_session_cache_size: TLS::DEFAULT_SESSION_CACHE_SIZE)
+                   tls_session_cache_size: TLS::DEFAULT_SESSION_CACHE_SIZE,
+                   tls_ktls: :auto)
       validate_async_io!(async_io)
       @host                     = host
       @port                     = port
@@ -104,6 +105,8 @@ module Hyperion
       @thread_pool              = nil
       @stopped                  = false
       @tls_session_cache_size   = tls_session_cache_size
+      @tls_ktls                 = tls_ktls
+      @ktls_logged              = false
     end
 
     # Read-only handle to the per-worker SSL context (nil when the
@@ -130,7 +133,8 @@ module Hyperion
 
       if @tls
         @ssl_ctx = TLS.context(cert: @tls[:cert], key: @tls[:key], chain: @tls[:chain],
-                               session_cache_size: @tls_session_cache_size)
+                               session_cache_size: @tls_session_cache_size,
+                               ktls: @tls_ktls)
         ssl_server = ::OpenSSL::SSL::SSLServer.new(tcp, @ssl_ctx)
         ssl_server.start_immediately = false
         @server = ssl_server
@@ -160,7 +164,8 @@ module Hyperion
               end
       if @tls
         @ssl_ctx = TLS.context(cert: @tls[:cert], key: @tls[:key], chain: @tls[:chain],
-                               session_cache_size: @tls_session_cache_size)
+                               session_cache_size: @tls_session_cache_size,
+                               ktls: @tls_ktls)
       end
       self
     end
@@ -421,6 +426,7 @@ module Hyperion
         ssl = ::OpenSSL::SSL::SSLSocket.new(raw, @ssl_ctx)
         ssl.sync_close = true
         ssl.accept # blocks; under Async this yields cooperatively via the scheduler
+        log_ktls_state_once(ssl)
         ssl
       else
         socket, = listening_io.accept_nonblock
@@ -442,6 +448,7 @@ module Hyperion
         ssl = ::OpenSSL::SSL::SSLSocket.new(raw, @ssl_ctx)
         ssl.sync_close = true
         ssl.accept
+        log_ktls_state_once(ssl)
         ssl
       else
         socket, = @server.accept
@@ -449,6 +456,34 @@ module Hyperion
       end
     rescue OpenSSL::SSL::SSLError => e
       runtime_logger.warn { { message: 'tls handshake failed', error: e.message } }
+      nil
+    end
+
+    # 2.2.0 (Phase 9): emit a single info-level log line per worker boot
+    # capturing whether kTLS_TX engaged for this listener and which cipher
+    # the first connection landed on. The cipher is per-connection (not
+    # per-context), so we wait for the first successful handshake — at
+    # that point either the kernel module is in use or the listener fell
+    # back to userspace SSL_write. Subsequent connections skip the log
+    # via `@ktls_logged`.
+    def log_ktls_state_once(ssl)
+      return if @ktls_logged
+
+      @ktls_logged = true
+      cipher_name = ssl.cipher && ssl.cipher.first rescue nil # rubocop:disable Style/RescueModifier
+      ktls_active = Hyperion::TLS.ktls_active?(ssl)
+      runtime_logger.info do
+        {
+          message: 'tls listener ready',
+          ktls_policy: @tls_ktls,
+          ktls_supported: Hyperion::TLS.ktls_supported?,
+          ktls_active: ktls_active,
+          cipher: cipher_name
+        }
+      end
+    rescue StandardError
+      # Logging is best-effort — never let a log line take down the
+      # accept loop.
       nil
     end
 

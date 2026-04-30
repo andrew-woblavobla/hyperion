@@ -25,7 +25,8 @@ module Hyperion
                    admin_listener_port: nil, admin_listener_host: '127.0.0.1',
                    admin_token: nil,
                    tls_session_cache_size: TLS::DEFAULT_SESSION_CACHE_SIZE,
-                   tls_ticket_key_rotation_signal: :USR2)
+                   tls_ticket_key_rotation_signal: :USR2,
+                   tls_ktls: :auto)
       @host                     = host
       @port                     = port
       @app                      = app
@@ -47,6 +48,7 @@ module Hyperion
       @admin_token              = admin_token
       @tls_session_cache_size            = tls_session_cache_size
       @tls_ticket_key_rotation_signal    = tls_ticket_key_rotation_signal
+      @tls_ktls                          = tls_ktls
     end
 
     def run
@@ -73,7 +75,8 @@ module Hyperion
                           admin_listener_port: @admin_listener_port,
                           admin_listener_host: @admin_listener_host,
                           admin_token: @admin_token,
-                          tls_session_cache_size: @tls_session_cache_size)
+                          tls_session_cache_size: @tls_session_cache_size,
+                          tls_ktls: @tls_ktls)
 
       # `on_worker_boot` runs in the child after fork, BEFORE the worker
       # adopts/binds its listener and before any accept. App code reconnects
@@ -119,7 +122,8 @@ module Hyperion
 
       if @tls
         ctx = Hyperion::TLS.context(cert: @tls[:cert], key: @tls[:key], chain: @tls[:chain],
-                                    session_cache_size: @tls_session_cache_size)
+                                    session_cache_size: @tls_session_cache_size,
+                                    ktls: @tls_ktls)
         ssl = ::OpenSSL::SSL::SSLServer.new(sock, ctx)
         ssl.start_immediately = false
         ssl

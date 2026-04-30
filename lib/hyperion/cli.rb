@@ -209,7 +209,9 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
                           h2_max_total_streams: config.h2.max_total_streams,
                           admin_listener_port: config.admin.listener_port,
                           admin_listener_host: config.admin.listener_host,
-                          admin_token: config.admin.token)
+                          admin_token: config.admin.token,
+                          tls_session_cache_size: config.tls.session_cache_size,
+                          tls_ktls: config.tls.ktls)
       warn_c_parser_unavailable
 
       # Pre-allocate Rack env-pool entries and eager-touch lazy constants.

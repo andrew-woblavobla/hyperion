@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased] - 2.2.0
+
+### Phase 9 — kernel TLS (KTLS_TX) on Linux
+
+`OP_ENABLE_KTLS` is now flipped on the SSL context after a Linux-kernel
++ OpenSSL probe at boot, so the kernel takes over the symmetric-cipher
+write path post-handshake. Pairs with — does not replace — Phase 4
+session resumption.
+
+* **Probe** — `Hyperion::TLS.ktls_supported?` returns `true` only on
+  Linux ≥ 4.13 + OpenSSL ≥ 3.0. macOS / BSD always return `false` and
+  the boot path falls back transparently to userspace `SSL_write`.
+* **Config** — `tls.ktls` (`:auto` / `:on` / `:off`, default `:auto`).
+  `:on` raises `Hyperion::UnsupportedError` at boot on hosts where the
+  probe returns false; `:auto` enables when supported, off elsewhere;
+  `:off` always uses the userspace cipher loop.
+* **Boot log** — one info-level line per worker on the first connection
+  recording `ktls_policy`, `ktls_supported`, `ktls_active`, and the
+  negotiated cipher. Subsequent connections skip via `@ktls_logged`.
+* **Plumbing** — `tls_ktls` flows through Server → Worker → Master and
+  through CLI single-mode `Server.new`. The `tls.ktls` DSL key is
+  available in nested form (`tls do; ktls :on; end`).
+* **Bench (openclaw-vm, 1 worker, wrk -t4 -c64 -d20s)** — TLS h1 hello:
+  kTLS off ≈ **3,068 r/s** (p99 38–73 ms), kTLS on ≈ **3,508 r/s** (p99
+  41–101 ms with high variance from kernel TLS_TX queueing). 8 KB
+  static: kTLS off ≈ **1,470 r/s**, kTLS on ≈ **1,519 r/s**. The gain
+  is small at hello-payload size because the userspace cipher cost is
+  a tiny fraction of per-request overhead — the win compounds with
+  larger response bodies (kernel-side write-coalescing) and longer
+  keep-alive sessions. Full measured rows in `BENCH_HYPERION_2_0.md`.
+
+Out of scope for Phase 9: kTLS RX (receive-side) — OpenSSL 3.0 ships
+TX only. RFC 8446 0-RTT continues to be served by Phase 4.
+
 ## [2.1.0] - 2026-04-30
 
 **Headline:** WebSocket support — RFC 6455 over Rack 3 full hijack, with a
