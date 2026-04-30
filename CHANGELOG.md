@@ -55,13 +55,26 @@ routes that match.
 asset, `wrk -t4 -c100 -d20s`, target validated against 2.6-A's
 1,320 r/s baseline and Puma's 1,571 r/s):
 
-  * Bench validation pending — this 2.6-C lands from a session
-    without working SSH to openclaw-vm.  Maintainer to verify
-    post-merge: expected ≥+25% over 2.6-A (≥1,650 r/s) which
-    would also clear Puma's 1,571 baseline by 5–10%.  When the
-    bench runs the rackup boot log should mention
-    `dispatch: inline_blocking auto-detected for to_path bodies`
-    on the static.ru request path.
+  * **Bench validation 2026-05-01 (maintainer rerun):**
+    - Default threadpool mode (no `--async-io`): static 1 MiB
+      median **1,270 r/s, p99 6 ms** across 3 trials. Within noise
+      of 2.6-A's 1,320 r/s — meaning the new `:inline_blocking`
+      dispatch is essentially equivalent to the existing threadpool
+      path on the user's typical (nginx-fronted, no async-io)
+      deployment shape. Threadpool already serves static via OS
+      threads with no fiber yield, so there's nothing for
+      `:inline_blocking` to skip.
+    - `--async-io` mode: static 1 MiB median **1,232 r/s, p99
+      433-710 ms**. The fiber-yield-on-EAGAIN penalty IS visible in
+      this mode's p99. **2.6-C's auto-detect should kick in here
+      and drop p99 to ~6 ms — but the bench shows it doesn't, so
+      the auto-detect engagement has a runtime gap that the unit
+      specs miss.** Filed as 2.6-C-followup: investigate why the
+      `Adapter::Rack#resolve_dispatch_mode!` call doesn't propagate
+      to the actual write path under `--async-io`.
+    - Headline: 2.6-C ships the dispatch mode and unit-test
+      coverage; the end-to-end perf win on `--async-io` is
+      unverified pending the engagement-fix follow-up.
 
 **Tail-latency expectation.**  p99 may bump slightly under the
 blocking variant (the OS thread parks on the kernel write while a
