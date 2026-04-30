@@ -259,6 +259,86 @@ emission path; no `prometheus-client` (or any other) gem was added.
 Spec count: 796 → 823 default-run.
 No version bump (release task is 2.4-fix-F).
 
+### 2.4-D — Linux multi-process WS bench rerun + autobahn RFC 6455 conformance
+
+Two items deferred from 2.3-D landed in this stream — the openclaw-vm
+multi-process WebSocket bench and the autobahn-testsuite fuzzer run
+against the WS echo rackup. Bench + docs only; no production code
+changed.
+
+**Headlines.**
+
+* **Linux multi-process WS bench captures the published numbers.**
+  4 procs × 200 conns × 1000 msgs hits **6,880 msg/s** with
+  p50 28.60 ms / p99 33.86 ms; 4 procs × 40 conns hits **7,561 msg/s**
+  with p50 5.26 ms / p99 6.22 ms. vs the fix-E single-process
+  Linux baseline this is **+285–289% msg/s and a 75% drop in
+  p99 on the throughput row** (134 ms → 33.86 ms). Confirms that
+  the long fix-E Linux tail at 200 conns was client-side GVL
+  serialisation, not server-side latency — the same shape we
+  saw on macOS in 2.3-D.
+
+* **autobahn RFC 6455 conformance: 453/463 pass (97.8%).** Run on
+  openclaw-vm with `bench/ws_echo_autobahn.ru` (1 MiB cap +
+  permessage-deflate negotiated) against `crossbario/autobahn-testsuite`
+  Docker image. Per-section breakdown:
+
+  | Section | Cases | Pass | Note |
+  |---|---:|---:|---|
+  | 1 — Framing                          |  16 | 16 / 16  | 100% OK |
+  | 2 — Pings / pongs                    |  11 | 11 / 11  | 100% OK |
+  | 3 — Reserved bits / opcodes          |   7 |  7 /  7  | 100% OK |
+  | 4 — Frame contents                   |  10 | 10 / 10  | 100% OK |
+  | 5 — Fragmentation                    |  20 | 20 / 20  | 100% OK |
+  | 6 — UTF-8 validation                 | 145 |145 /145  | 4 NON-STRICT (fail-fast position; passes per RFC §8.1 SHOULD) |
+  | 7 — Close handling                   |  37 | 27 / 37  | **10 FAILED — 2.5 follow-up** |
+  | 9 — Limits / very large              |   — |    —     | excluded by config |
+  | 10 — Auto-fragmentation              |   1 |  1 /  1  | 100% OK |
+  | 12 — permessage-deflate (RFC 7692)   |  90 | 90 / 90  | 100% OK — 2.3-C validated |
+  | 13 — permessage-deflate fragmentation| 126 |126 /126  | 100% OK — 2.3-C validated |
+
+  **Sections 12 + 13 (216 cases, RFC 7692 permessage-deflate)**
+  are 100% OK on this run — the first autobahn validation since
+  2.3-C shipped the extension. Confirms the encode + decode + per-
+  message reset paths are RFC-compliant end-to-end.
+
+  **Section 7 close handling has 10 FAILED cases, all in 7.5.1
+  + 7.9.x.** RFC 6455 §7.4 requires the server to close 1002
+  (Protocol Error) when the peer sends a close frame with an
+  invalid close code (0, 1004, 1005, 1006, reserved range, etc.).
+  Hyperion's `Connection#recv` close path currently echoes the
+  invalid code back instead of rejecting it. **Filed as a 2.5
+  follow-up** — out of scope for 2.4-D (bench + docs only) per the
+  sprint scope.
+
+**What ships:**
+
+| Where | What |
+|---|---|
+| `bench/ws_echo_autobahn.ru` | NEW — autobahn-friendly variant of `ws_echo.ru`. 1 MiB `max_message_bytes` (vs 16 KiB) and propagates the negotiated `permessage-deflate` extension into the 101 response so sections 12/13 fire. Plain `ws_echo.ru` runs through autobahn fine for sections 1-10 but marks 12/13 UNIMPLEMENTED because the server never advertises deflate. |
+| `bench/parse_autobahn_index.rb` | NEW — reads `autobahn-reports/index.json` and prints the per-section breakdown the table above came from. Identifies FAILED cases for triage. Also lists OK / NON-STRICT / INFORMATIONAL / UNIMPLEMENTED counts per section. |
+| `autobahn-config/fuzzingclient.json` | UPDATED — agent string bumped to `Hyperion-2.4.0`, points at `ws://127.0.0.1:9888` (no path; `bench/ws_echo_autobahn.ru` accepts upgrade on any URL), header comment now references `parse_autobahn_index.rb` and the 17-minute wall-clock estimate. |
+| `docs/WEBSOCKETS.md` "RFC 6455 conformance" subsection | UPDATED — replaces the deferred-to-2.4 note with the actual 2.4-D results table, the 7.x close-handshake gap as a known 2.5 follow-up, and a "Configuring permessage-deflate echo" snippet for operators rolling their own ws app. |
+| `docs/BENCH_HYPERION_2_0.md` "WebSocket multi-process bench" subsection | UPDATED — replaces the deferred-recipe block with the openclaw-vm 2.4-D table + cross-platform shape comparison (within-host scaling vs Apple Silicon dev) + raw 3-run-median data. |
+
+**Bench environment.** All 2.4-D numbers from `openclaw-vm`,
+Ubuntu 24.04, kernel 6.8, 16 vCPU x86_64, Ruby 3.3.3, hyperion
+master @ commit `ffcbdfb` (2.4-C tip pre-2.4-D commit). Three runs
+each, median reported, run-to-run variance ~3-5%.
+
+**Known limit (logged for 2.5).** Section 7.5.1 + 7.9.x autobahn
+FAILED cases — the close-handshake invalid-payload validation gap
+described above. The fuzzer tests close codes 0 / 1004 / 1005 /
+1006 / 1012-1015 / 1016+ / 2000+ / 2999 / etc.; Hyperion echoes the
+peer's invalid code instead of rejecting it with 1002. Fix is a
+small `validate_close_payload!` helper on `WebSocket::Connection`
+plus the matching close-handshake response — punted out of 2.4-D
+because the sprint stream was bench + docs only.
+
+Spec count: 823 → 823 (no spec changes — bench scripts and parser
+script are runnable Ruby but not exercised by the rspec suite).
+No version bump (release task is 2.4-fix-F).
+
 ## [2.3.0] - 2026-05-01
 
 ### Headline
