@@ -168,13 +168,18 @@ dispatches** — for an nginx-fronted deployment the saving lands
 straight on the egress bill (Cloudfront / ALB egress @ ~$0.085/GiB at
 the unhappy AWS price band).
 
-**Bench delta on a chat-style JSON workload (1 KB messages, local
-UNIXSocket harness — `bench/ws_deflate_bench.rb`):**
+**Bench delta on a chat-style JSON workload (1 KB messages,
+`bench/ws_deflate_bench.rb`):**
 
-| Mode | Bytes per message | Wire reduction | msg/s |
-|---:|---:|---:|---:|
-| Plain (no deflate) | 400.8 B | — | 57,498 |
-| permessage-deflate | 19.7 B | **20.4× smaller** | 34,999 (61% of baseline) |
+| Mode | Bytes per message | Wire reduction | msg/s (macOS arm64) | msg/s (openclaw Linux 16-vCPU) |
+|---:|---:|---:|---:|---:|
+| Plain (no deflate) | 400.8 B | — | 57,498 | 11,782 |
+| permessage-deflate | 19.7-20.0 B | **20.0-20.4× smaller** | 34,999 (61%) | 8,101 (69%) |
+
+Both hosts confirm the wire reduction is workload-shape-bound, not
+host-bound (zlib is identical on both). The msg/s gap is the deflate
+CPU cost on the encode side. The openclaw measurement was run after
+the 2.3-C ship (commit `8044610`) on `bench/ws_deflate_bench.rb`.
 
 The 20× number is upper-bound — chat-style JSON has very repetitive
 field names which the shared deflate dictionary picks up immediately.
