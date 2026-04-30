@@ -35,8 +35,13 @@ land for 4 MiB (multi-chunk), 256 KiB (exactly one chunk), and
 asset, `wrk -t4 -c100 -d20s`, 3 trials, median):
 
   * 2.5.0 baseline:  1,094 r/s
-  * 2.6-A:           pending bench-rerun on openclaw-vm
-  * Delta:           pending
+  * 2.6-A:           1,320 r/s (trials: 1,370 / 1,320 / 1,305 r/s)
+  * Delta:           **+20.7%** (above the +10% target)
+  * p50 latency:     3.49 → 3.64 ms (within noise; transfer/sec
+                     climbs from ~1.07 GB/s → 1.34 GB/s on the
+                     fastest trial, indicating the syscall-count
+                     reduction is the bottleneck mover, not the
+                     wire).
 
 **Config knob — deliberately not exposed.**  The 256 KiB value is
 the most-likely-good across the field; nginx/Apache/Caddy operators
