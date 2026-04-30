@@ -40,6 +40,112 @@ TLS bench harness for Phase 9) are queued for the 2.2.x follow-up
 sprint. **No version tag.** Code is on master (commits b4ca6a0,
 4d8af74, 5c00b15, e105bc6); operators should continue running 2.1.0.
 
+### fix-B — Rust HPACK FFI marshalling rewrite (per-encoder scratch buffer + flat-blob ABI)
+
+**The 2026-04-30 native-HPACK regression diagnosed and fixed.** Phase 10
+shipped a Rust HPACK adapter that won 3.26× on the encode microbench (a
+tight loop over many headers in one call) but ran -8% to -28% **slower**
+than the Ruby fallback on h2load c=1 m=100 traffic. The bench sweep
+identified per-HEADERS-frame Fiddle FFI marshalling as the root cause:
+on real h2 traffic each call encodes 3-8 small headers, so the per-call
+allocation overhead dominates whatever the encode kernel saves.
+
+The v1 ABI's per-call allocation profile (3 headers, response-side):
+* `Fiddle::Pointer[]` per header name **and** value = 6 Pointer wrappers
+* 4 separate `pack('Q*' / 'L*')` calls (names buf, name lens, vals buf, val lens)
+* 1 capacity-byte output buffer pre-fill: `out << ("\x00".b * capacity)`
+* 1 `byteslice(0, written)` to extract the encoded prefix
+
+≈ **12 transient String allocations per `encode_headers` call** on a
+3-header response, multiplied across thousands of streams per second
+on h2 traffic.
+
+**fix-B: per-encoder scratch buffer + flat-blob v2 ABI.** The wrapper
+now allocates the scratch buffers ONCE in `Encoder#initialize`:
+
+* `@scratch_blob`  — concatenated header bytes (name_1, value_1, …)
+* `@scratch_argv`  — packed `(name_off, name_len, val_off, val_len)` u64 quads
+* `@scratch_out`   — output buffer, grows on demand (start 16 KiB)
+* `@scratch_argv_ints` — Ruby Array reused for `pack('Q*', buffer:)`
+* Cached `Fiddle::Pointer` for each scratch — refreshed only on
+  reallocation.
+
+`#encode(headers)` clears the three buffers, appends raw bytes + offset
+quads, and dispatches a SINGLE FFI call to the new entry point:
+
+```rust
+pub unsafe extern "C" fn hyperion_h2_codec_encoder_encode_v2(
+    handle: EncoderHandle,
+    headers_blob_ptr: *const u8,
+    headers_blob_len: usize,
+    argv_ptr: *const u64,
+    argv_count: usize,
+    out_ptr: *mut u8,
+    out_capacity: usize,
+) -> i64 // bytes_written, -1 overflow, -2 bad args
+```
+
+The Rust side reads each `(name_off, name_len, val_off, val_len)` quad
+out of `argv_ptr` and indexes into `headers_blob_ptr` — no per-header
+allocation on the Ruby side, no per-header `Fiddle::Pointer.new`, no
+per-header pack(). The Rust `Encoder` also stashes a reusable scratch
+`Vec<u8>` (cleared via `Vec::clear` between calls — capacity preserved)
+so the Rust side avoids `Vec::with_capacity(64 * count)` per call too.
+
+**Per-call allocation count: BEFORE → AFTER (3-header response, 50 calls):**
+
+| Path | T_STRING per call | 50 calls total |
+|---|---:|---:|
+| v1 (shipped Phase 10) | ~12 | ~600 (lower bound) |
+| v2 fix-B | ~7.5 | ~377 (measured on darwin-arm64 ruby 3.3.3) |
+
+The remaining ~7.5 strings/call are: 6 × `.b` for non-binary header
+sources (zero-cost branch when sources are already ASCII-8BIT, which
+is the protocol-http2 norm) + 1 returned `Fiddle::Pointer#to_str(written)`
++ small GC noise. The v2 `pack('Q*', buffer:)` reuses the scratch
+buffer in-place — zero alloc on steady state.
+
+**Old `hyperion_h2_codec_encoder_encode` ABI symbol preserved.** The
+v1 entry stays exported from the cdylib (just unused by the in-tree
+adapter) so any third-party loaders still binding to it continue to
+work. ABI version stays at `1`; the new symbol is additive.
+
+**Specs.** `spec/hyperion/http2_native_hpack_spec.rb` gains 5 new
+examples under `fix-B (2.2.x) — per-encoder scratch buffer + flat-blob
+ABI`:
+
+* `'reuses scratch buffers across encode calls (no extra String.new in
+  encode hot path)'` — counts T_STRING delta across 50 encode calls,
+  asserts < 500 (v1 baseline ~600, v2 observed ~377).
+* `'rejects encode when output buffer overflow occurs'` — drives the
+  v2 entry with a 4-byte out_capacity against 1024-byte input, asserts
+  rc == -1.
+* `'rejects encode v2 with bad arguments (out-of-bounds offsets)'` —
+  asserts rc == -2 when an argv quad references past the blob end.
+* `'maintains dynamic-table state across encode calls under the v2
+  ABI'` — re-encodes the same `cookie: session=novel` header twice and
+  asserts the second block compresses to fewer bytes via the dyn-table
+  reuse path.
+* `'auto-grows the output scratch when a frame exceeds the running
+  capacity'` — encodes a 1000-header frame (>16 KiB encoded), then a
+  small frame, asserts both round-trip.
+
+Existing 13 native HPACK specs (parity, stateful-dyn-table,
+Http2Handler integration) stay green. Spec count **668 → 673**.
+
+**Bench validation on openclaw-vm.** Bench host had no `cargo` at the
+time of the 2026-04-30 sweep (Phase 10's bench reported
+`Hyperion::H2Codec.available? == false`). fix-B installed `rustup`
+toolchain stable on the host (`/home/ubuntu/.cargo`) and re-benched.
+See "Bench sweep notes (post fix-B)" below for the actual result.
+
+**Default-on flip.** [DEFERRED — see bench notes below.] If the bench
+flips native HPACK ahead of the Ruby fallback, the env-var gate
+(`HYPERION_H2_NATIVE_HPACK=1`) drops to default-on. If parity is the
+best we get on the bench host, the gate stays default-OFF (no
+regression vs 2.1.0) and the maintainer can re-bench from a session
+with a different host profile to decide.
+
 ### fix-A — splice pipe-hoist (per-chunk → per-response)
 
 **The 2026-04-30 splice regression diagnosed and fixed.** The 2.2.0

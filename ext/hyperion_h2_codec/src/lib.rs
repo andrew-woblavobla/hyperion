@@ -18,6 +18,7 @@ mod hpack;
 mod frames;
 
 use std::os::raw::{c_int, c_uchar};
+use std::os::raw::c_longlong;
 
 /// Opaque handle exported to Ruby.
 type EncoderHandle = *mut hpack::Encoder;
@@ -83,6 +84,114 @@ pub unsafe extern "C" fn hyperion_h2_codec_encoder_encode(
     }
     std::ptr::copy_nonoverlapping(buf.as_ptr(), out_ptr, buf.len());
     buf.len() as c_int
+}
+
+/// fix-B (2.2.x) — flat-blob encode ABI. Eliminates the per-header
+/// allocation profile of the v1 entry point: callers pack the
+/// concatenated names/values into ONE byte blob and a parallel array
+/// of `(name_off, name_len, value_off, value_len)` u64 quads in
+/// `argv_ptr`. The Rust side indexes into the blob via offsets — no
+/// per-header `Fiddle::Pointer.new` on the Ruby side, no per-header
+/// `pack('Q*')`.
+///
+/// Inputs:
+/// * `handle`            — encoder handle (preserved across calls; dyn table state)
+/// * `headers_blob_ptr`  — concatenated bytes (name_1, value_1, name_2, value_2, …)
+/// * `headers_blob_len`  — length of the blob in bytes
+/// * `argv_ptr`          — pointer to `argv_count * 4` little-endian u64s
+/// * `argv_count`        — number of header pairs
+/// * `out_ptr`           — caller-provided output buffer
+/// * `out_capacity`      — bytes available at `out_ptr`
+///
+/// Returns the number of bytes written, or:
+///   -1 = output buffer overflow
+///   -2 = bad arguments (null pointer, offset/length out of blob bounds)
+///
+/// Old `hyperion_h2_codec_encoder_encode` ABI symbol is **preserved
+/// unchanged** above for backwards compatibility — older Ruby loaders
+/// that still call it continue to work; the in-tree Ruby wrapper
+/// switches to v2 at the FFI boundary.
+#[no_mangle]
+pub unsafe extern "C" fn hyperion_h2_codec_encoder_encode_v2(
+    handle: EncoderHandle,
+    headers_blob_ptr: *const c_uchar,
+    headers_blob_len: usize,
+    argv_ptr: *const u64,
+    argv_count: usize,
+    out_ptr: *mut c_uchar,
+    out_capacity: usize,
+) -> c_longlong {
+    if handle.is_null() || out_ptr.is_null() {
+        return -2;
+    }
+    if argv_count > 0 && argv_ptr.is_null() {
+        return -2;
+    }
+    if headers_blob_len > 0 && headers_blob_ptr.is_null() {
+        return -2;
+    }
+
+    let encoder = &mut *handle;
+    // Reuse the per-encoder scratch buffer instead of allocating a
+    // fresh `Vec::with_capacity(64 * count)` per call. `clear()`
+    // length-zeros without dropping the backing allocation.
+    encoder.scratch.clear();
+
+    let blob: &[u8] = if headers_blob_len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(headers_blob_ptr, headers_blob_len)
+    };
+    let argv: &[u64] = if argv_count == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(argv_ptr, argv_count.saturating_mul(4))
+    };
+
+    // Move the scratch out of the encoder while we encode (so the
+    // borrow checker lets us call &mut self methods that touch the
+    // dyn table). This is a value swap — no allocation. We swap it
+    // back at the end so the next call reuses the same allocation.
+    let mut scratch = std::mem::take(&mut encoder.scratch);
+
+    for i in 0..argv_count {
+        let base = i.saturating_mul(4);
+        let name_off = argv[base] as usize;
+        let name_len = argv[base + 1] as usize;
+        let val_off = argv[base + 2] as usize;
+        let val_len = argv[base + 3] as usize;
+        if name_off
+            .checked_add(name_len)
+            .map(|end| end > blob.len())
+            .unwrap_or(true)
+        {
+            encoder.scratch = scratch;
+            return -2;
+        }
+        if val_off
+            .checked_add(val_len)
+            .map(|end| end > blob.len())
+            .unwrap_or(true)
+        {
+            encoder.scratch = scratch;
+            return -2;
+        }
+        let name = &blob[name_off..name_off + name_len];
+        let value = &blob[val_off..val_off + val_len];
+        encoder.encode_header(name, value, &mut scratch);
+    }
+
+    let written = scratch.len();
+    let result: c_longlong = if written > out_capacity {
+        -1
+    } else {
+        std::ptr::copy_nonoverlapping(scratch.as_ptr(), out_ptr, written);
+        written as c_longlong
+    };
+
+    // Restore the scratch (cleared on next call) so the allocation persists.
+    encoder.scratch = scratch;
+    result
 }
 
 // ---------- Decoder ----------

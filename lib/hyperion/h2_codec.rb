@@ -22,6 +22,11 @@ module Hyperion
   module H2Codec
     EXPECTED_ABI = 1
 
+    # Raised when the per-encoder scratch output buffer can't hold a
+    # single frame's encoded bytes. fix-B (2.2.x) — the v2 ABI returns
+    # -1 on overflow, which the wrapper translates to this.
+    class OutputOverflow < StandardError; end
+
     # Try to load the native cdylib. Sets `@available = true/false`.
     # Idempotent — second call is a no-op.
     def self.available?
@@ -39,12 +44,58 @@ module Hyperion
     # Ruby-friendly wrapper around the native encoder. Single instance
     # holds an opaque pointer; `#encode([['name','value'], ...])`
     # returns the wire bytes. The dynamic table state is per-instance.
+    #
+    # fix-B (2.2.x) — per-encoder scratch buffers eliminate per-call
+    # FFI marshalling allocations. Each `Encoder` owns:
+    #
+    #   * `@scratch_out`  — output buffer reused across encode calls,
+    #                       grown lazily if a single frame exceeds the
+    #                       starting 16 KiB capacity.
+    #   * `@scratch_argv` — packed `(name_off, name_len, val_off, val_len)`
+    #                       u64-quad buffer (each header is 32 bytes).
+    #   * `@scratch_blob` — concatenated header bytes
+    #                       (name_1, value_1, name_2, value_2, …).
+    #   * `@scratch_*_ptr` — `Fiddle::Pointer`s pre-cached for the three
+    #                        scratch strings; recreated only when the
+    #                        underlying string is reallocated by `<<`
+    #                        crossing the existing capacity.
+    #
+    # `#encode` clears the three buffers (length 0, capacity preserved),
+    # appends offset/length quads + raw bytes, and dispatches one FFI
+    # call to `hyperion_h2_codec_encoder_encode_v2`. The only unavoidable
+    # allocation per call is `byteslice` to extract the written bytes
+    # — that's the contract `protocol-http2`'s `encode_headers` returns
+    # under, so it can't move further.
     class Encoder
+      SCRATCH_OUT_DEFAULT = 16_384
+      SCRATCH_ARGV_DEFAULT = 4_096
+      SCRATCH_BLOB_DEFAULT = 4_096
+      private_constant :SCRATCH_OUT_DEFAULT, :SCRATCH_ARGV_DEFAULT, :SCRATCH_BLOB_DEFAULT
+
       def initialize
         raise 'H2Codec native library unavailable' unless H2Codec.available?
 
         @ptr = H2Codec.encoder_new
         ObjectSpace.define_finalizer(self, self.class.finalizer(@ptr))
+
+        @scratch_out  = String.new(capacity: SCRATCH_OUT_DEFAULT,  encoding: Encoding::ASCII_8BIT)
+        @scratch_argv = String.new(capacity: SCRATCH_ARGV_DEFAULT, encoding: Encoding::ASCII_8BIT)
+        @scratch_blob = String.new(capacity: SCRATCH_BLOB_DEFAULT, encoding: Encoding::ASCII_8BIT)
+        # Pre-cache the Fiddle::Pointer so the per-call hot path
+        # doesn't pay a Pointer.new allocation. The pointer's address
+        # tracks the underlying String's buffer; if `<<` later reallocates
+        # the buffer we refresh the pointer and bump the recorded
+        # capacity.
+        @scratch_out_ptr  = Fiddle::Pointer[@scratch_out]
+        @scratch_argv_ptr = Fiddle::Pointer[@scratch_argv]
+        @scratch_blob_ptr = Fiddle::Pointer[@scratch_blob]
+        @scratch_out_capacity  = SCRATCH_OUT_DEFAULT
+        @scratch_argv_capacity = SCRATCH_ARGV_DEFAULT
+        @scratch_blob_capacity = SCRATCH_BLOB_DEFAULT
+        # Per-encoder Int array reused for `pack('Q*', buffer:)` calls.
+        # `clear` keeps the array but length-zeros it; the underlying
+        # storage capacity is retained by MRI for steady-state reuse.
+        @scratch_argv_ints = []
       end
 
       def self.finalizer(ptr)
@@ -54,41 +105,84 @@ module Hyperion
       def encode(headers)
         return ''.b if headers.empty?
 
-        names_ptrs = []
-        name_lens = []
-        val_ptrs = []
-        val_lens = []
-        # Hold onto the source strings for the duration of the call so
-        # the byte pointers we extract stay valid across the FFI hop.
-        keepalive = []
+        # 1) Reset scratch buffers (length 0, capacity retained).
+        @scratch_blob.clear
+        argv_ints = @scratch_argv_ints
+        argv_ints.clear
+
+        # 2) Concatenate name+value bytes into one blob, recording
+        # (name_off, name_len, value_off, value_len) quads as 4 ints.
+        # Append to argv_ints in one go via a `pack('Q*')` at the end —
+        # one transient String per call instead of per header.
+        offset = 0
         headers.each do |name, value|
-          ns = name.to_s.b
-          vs = value.to_s.b
-          keepalive << ns << vs
-          names_ptrs << Fiddle::Pointer[ns].to_i
-          name_lens << ns.bytesize
-          val_ptrs << Fiddle::Pointer[vs].to_i
-          val_lens << vs.bytesize
+          # Avoid `.b` if the source is already binary-encoded — saves
+          # one transient String per non-binary header. For frozen
+          # binary literals (the common case in protocol-http2), this
+          # is a near-zero-cost branch.
+          ns = name.encoding == Encoding::ASCII_8BIT ? name : name.b
+          vs = value.encoding == Encoding::ASCII_8BIT ? value : value.b
+          name_len = ns.bytesize
+          val_len = vs.bytesize
+
+          argv_ints << offset << name_len << (offset + name_len) << val_len
+          offset += name_len + val_len
+          @scratch_blob << ns << vs
         end
 
-        names_buf = names_ptrs.pack('Q*')
-        name_lens_buf = name_lens.pack('L*')
-        val_buf = val_ptrs.pack('Q*')
-        val_lens_buf = val_lens.pack('L*')
+        # 3) Pack all argv ints into the per-encoder scratch via the
+        # `pack(buffer:)` keyword — Ruby reuses the existing String's
+        # buffer (length-truncating to 0 first), so this is a zero-alloc
+        # path on the steady state. The argv ints array itself reuses
+        # the same Array allocation across calls (we `clear`ed it
+        # above; capacity is retained by RArray internals).
+        @scratch_argv.clear
+        argv_ints.pack('Q*', buffer: @scratch_argv)
 
-        capacity = headers.sum { |n, v| 8 + n.to_s.bytesize + v.to_s.bytesize } + 64
-        out = (+'').b
-        out.force_encoding(Encoding::ASCII_8BIT)
-        out << ("\x00".b * capacity)
+        argv_bytes = @scratch_argv.bytesize
+        blob_bytes = @scratch_blob.bytesize
 
-        written = H2Codec.encoder_encode(@ptr,
-                                         names_buf, name_lens_buf,
-                                         val_buf, val_lens_buf,
-                                         headers.length,
-                                         out, capacity)
+        # 3) Make sure the output scratch can hold the worst-case
+        # encoded size. Reuse the existing buffer when it already fits;
+        # only grow when a single frame exceeds the running capacity.
+        worst_case = blob_bytes + (headers.length * 8) + 64
+        if worst_case > @scratch_out_capacity
+          new_cap = @scratch_out_capacity
+          new_cap *= 2 while new_cap < worst_case
+          @scratch_out = String.new(capacity: new_cap, encoding: Encoding::ASCII_8BIT)
+          @scratch_out_capacity = new_cap
+        end
+
+        # 4) Refresh Fiddle pointers. `<<` and `clear` may have caused
+        # MRI to reallocate the underlying String buffer (different
+        # RSTRING_PTR), so the cached pointers can be stale. Refresh
+        # them once per encode call — three Pointer wrapper objects vs
+        # the v1 path's `2 * headers.length` Pointer wrappers.
+        @scratch_blob_ptr = Fiddle::Pointer[@scratch_blob] if blob_bytes.positive?
+        @scratch_argv_ptr = Fiddle::Pointer[@scratch_argv] if argv_bytes.positive?
+        @scratch_out_ptr  = Fiddle::Pointer[@scratch_out]
+
+        # 5) One FFI call. Returns bytes_written, -1 on overflow, -2 on bad args.
+        written = H2Codec.encoder_encode_v2(@ptr,
+                                            @scratch_blob_ptr, blob_bytes,
+                                            @scratch_argv_ptr, headers.length,
+                                            @scratch_out_ptr, @scratch_out_capacity)
+        if written == -1
+          raise H2Codec::OutputOverflow,
+                "H2Codec encoder output buffer overflow (#{worst_case} bytes needed, " \
+                "#{@scratch_out_capacity} available)"
+        end
         raise "H2Codec encoder failed (rc=#{written})" if written.negative?
 
-        out.byteslice(0, written)
+        # 6) Read `written` bytes from the C-written scratch into a
+        # fresh ASCII-8BIT String. `Fiddle::Pointer#to_str(len)` copies
+        # exactly `len` bytes once — this is the ONE unavoidable
+        # allocation per encode call (Ruby strings can't alias
+        # arbitrary memory, and the caller's contract is to receive an
+        # owned String). Cheaper than v1 because we copy exactly
+        # `len` bytes here instead of `capacity` bytes during
+        # pre-fill + a `byteslice` of the encoded prefix.
+        @scratch_out_ptr.to_str(written)
       end
     end
 
@@ -181,6 +275,15 @@ module Hyperion
                                                Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT,
                                                Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
                                               Fiddle::TYPE_INT)
+      # fix-B (2.2.x) — v2 flat-blob encode entry.
+      # Signature: (handle, blob_ptr, blob_len, argv_ptr, argv_count, out_ptr, out_cap) -> i64
+      # Sizes are passed as size_t so Fiddle::TYPE_SIZE_T matches the
+      # Rust `usize` exactly on both 64-bit Linux and macOS arm64.
+      @encoder_enc_v2_fn = Fiddle::Function.new(@lib['hyperion_h2_codec_encoder_encode_v2'],
+                                                [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_SIZE_T,
+                                                 Fiddle::TYPE_VOIDP, Fiddle::TYPE_SIZE_T,
+                                                 Fiddle::TYPE_VOIDP, Fiddle::TYPE_SIZE_T],
+                                                Fiddle::TYPE_LONG_LONG)
       @decoder_new_fn  = Fiddle::Function.new(@lib['hyperion_h2_codec_decoder_new'],
                                               [], Fiddle::TYPE_VOIDP)
       @decoder_free_fn = Fiddle::Function.new(@lib['hyperion_h2_codec_decoder_free'],
@@ -219,6 +322,11 @@ module Hyperion
 
     def self.encoder_encode(ptr, names, name_lens, vals, val_lens, count, out, cap)
       @encoder_enc_fn.call(ptr, names, name_lens, vals, val_lens, count, out, cap)
+    end
+
+    # fix-B (2.2.x) — v2 flat-blob encode. See lib.rs:hyperion_h2_codec_encoder_encode_v2.
+    def self.encoder_encode_v2(ptr, blob, blob_len, argv, argv_count, out, out_cap)
+      @encoder_enc_v2_fn.call(ptr, blob, blob_len, argv, argv_count, out, out_cap)
     end
 
     def self.decoder_new

@@ -245,12 +245,19 @@ fn decode_string(input: &[u8]) -> Result<(Vec<u8>, usize), HpackError> {
 
 pub struct Encoder {
     dyn_table: DynTable,
+    /// Per-encoder scratch buffer reused across `encode_v2` calls.
+    /// fix-B (2.2.x): avoids one `Vec::with_capacity` allocation per
+    /// HEADERS frame on the Rust side, mirroring the Ruby-side scratch
+    /// buffer reuse. Cleared (length-zeroed, capacity preserved) at
+    /// the start of each encode call.
+    pub scratch: Vec<u8>,
 }
 
 impl Encoder {
     pub fn new() -> Self {
         Self {
             dyn_table: DynTable::new(4096),
+            scratch: Vec::with_capacity(4096),
         }
     }
 
