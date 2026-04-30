@@ -221,7 +221,7 @@ Per-app config via the full `Hyperion::Config` DSL is on the 2.2.x roadmap.
 
 ---
 
-## Performance note
+## Performance
 
 The 2.1.0 e2e smoke test (`spec/hyperion/websocket_e2e_spec.rb`) runs a
 real Hyperion server and a raw-TCP WS client through 100 echo round-trips.
@@ -230,20 +230,49 @@ at **~0.18 ms** end-to-end (handshake → mask → server unmask → reassemble 
 Rack app echo → server frame build → client unmask → parse). That's a
 sanity benchmark, not a published number.
 
-A throughput + p99 bench (target shape: 50,000+ msg/s on 1 worker, p99
-< 5 ms for 1 KB messages) ships separately as **WS-bench-followup** on
-the openclaw-vm 16 vCPU box. The benchmark rackup itself lives at
-`bench/ws_echo.rb` already so the bench host can run it without further
-changes:
+**Published bench numbers — 2.2.x fix-E (2026-04-30):**
+
+| Workload | msg/s | p50 | p99 |
+|---|---:|---:|---:|
+| 10 conns × 1000 msgs × 1 KiB (`-t 5 -w 1`) | 6,463 | 0.76 ms | 1.03 ms |
+| 200 conns × 1000 msgs × 1 KiB (`-t 256 -w 1`) | 5,346 | 37.19 ms | 43.12 ms |
+
+Median of 3 runs each. **Dev-hardware floor — Apple Silicon dev box, NOT
+openclaw-vm.** The 16-vCPU openclaw-vm bench host was unreachable this
+session (SSH refused); the 50,000+ msg/s target shape from the 2.1.0
+brief is the Linux + 16-vCPU number to publish, queued behind the next
+openclaw window. See [`docs/BENCH_HYPERION_2_0.md`](BENCH_HYPERION_2_0.md#websocket-echo-210--22x-fix-e-bench-numbers)
+for the full table + reproduction recipe.
+
+Two operator notes from the bench:
+
+- **`-t` is a hard cap on concurrent connections per worker.** Each
+  WebSocket connection permanently hijacks a worker thread for its
+  lifetime — once `-t` workers are holding sockets, additional
+  upgrade attempts queue behind them. Size `-t` to expected
+  concurrent-connection count + headroom.
+- **Don't over-provision threads** for low-concurrency latency
+  paths. The 10-conn / `-t 5` row above runs 2× faster on per-
+  message latency than the same workload on `-t 256` — extra
+  threads cost GVL contention without adding parallelism on a
+  scheduler-bound shape.
+
+The benchmark rackup itself lives at `bench/ws_echo.ru` (note the
+`.ru` extension — the original `bench/ws_echo.rb` from 2.1.0 was
+broken under `Rack::Builder.parse_file` because of the file
+extension, fix-E added the `.ru` variant alongside it):
 
 ```sh
-hyperion --async-io -t 5 -w 1 -p 9888 bench/ws_echo.rb
+bundle exec hyperion -t 5 -w 1 -p 9888 bench/ws_echo.ru
+ruby bench/ws_bench_client.rb --port 9888 --conns 10 --msgs 1000 \
+                              --bytes 1024 --json
 ```
 
 The wrapper's hot path is intentionally short — the `recv` loop spends most
 of its time in the C `parse` + `unmask` primitives with the GVL released,
-so YJIT and additional fiber concurrency both compound. We expect the
-published numbers to land in the 2.1.x bench follow-up doc.
+so YJIT and additional fiber concurrency both compound. The 2.3 follow-up
+will add the openclaw-vm rerun + autobahn-testsuite RFC 6455 conformance
+pass.
 
 ---
 

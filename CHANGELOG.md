@@ -42,14 +42,85 @@ The fixes that would unlock the perf wins (FFI-marshalling rewrite for
 Phase 10, pipe-hoist out of the chunk loop for splice, larger-payload
 TLS bench harness for Phase 9) are queued for the 2.2.x follow-up
 sprint. fix-A (splice pipe-hoist), fix-B (HPACK FFI rewrite), fix-C
-(large-payload TLS bench harness), and fix-D (h2 max_total_streams
-CLI flag + env-var) have landed on master in that order; the rps
+(large-payload TLS bench harness), fix-D (h2 max_total_streams
+CLI flag + env-var), and fix-E (WebSocket echo bench numbers + Ruby
+bench client) have landed on master in that order; the rps
 deltas the held-status table below carries reflect fix-A + fix-B
 measurements; the kTLS large-payload row is still PENDING the
 maintainer running the new bench rackups (see fix-C section), and the
 h2 row needs a rerun against the new flag (see fix-D section).
 **No version tag.** Code is on master (commits b4ca6a0, 4d8af74,
 5c00b15, e105bc6); operators should continue running 2.1.0.
+
+### fix-E — WebSocket echo bench numbers + Ruby bench client
+
+**2.1.0 shipped WebSocket support but never published bench numbers.**
+The 2.1.0 release commit (b097b78) included `bench/ws_echo.rb` as a
+rackup ready for the openclaw-vm bench host, plus a perf-note in
+`docs/WEBSOCKETS.md` claiming a 50,000+ msg/s target shape on 16
+vCPU, but no actual measurements. fix-E ships the bench numbers,
+the bench client tooling, and uncovers a small file-extension bug
+in the rackup itself.
+
+**Three deliverables:**
+
+| Deliverable | Where | Why |
+|---|---|---|
+| `bench/ws_bench_client.rb` | NEW (~250 LOC) | Ruby WS client built on `Hyperion::WebSocket::Frame` primitives. Zero external deps — shares the gem's masking/parsing code with the server side. Cleaner than installing `websocat` per bench host, and the tooling drops into a Linux CI box without cargo/pip toolchains. |
+| `bench/ws_echo.ru` | NEW | Renamed copy of `bench/ws_echo.rb`. The 2.1.0 commit shipped the rackup with a `.rb` extension — `Rack::Builder.parse_file` treats `.rb` as plain Ruby and tries to `Object.const_get` the camelized basename, which fails because the file uses the rackup `run lambda { ... }` DSL. fix-E adds the `.ru` variant; the original `.rb` stays in place for archaeology. |
+| `spec/hyperion/bench_ws_client_spec.rb` | NEW (5 examples) | Smoke for the bench client: 5-msg single-conn run + 2-conn × 3-msg concurrent run + percentile helper unit tests. No perf assertion — bench-host concerns belong on the bench host. |
+
+**Bench numbers — 2026-04-30:**
+
+| Workload | msg/s | p50 | p99 | max |
+|---|---:|---:|---:|---:|
+| WS echo, 10 conns × 1000 msgs × 1 KiB, `-t 5 -w 1` | **6,463** | **0.76 ms** | **1.03 ms** | 1.81 ms |
+| WS echo, 10 conns × 1000 msgs × 1 KiB, `-t 256 -w 1` | 6,205 | 1.58 ms | 2.02 ms | 2.99 ms |
+| WS echo, 200 conns × 1000 msgs × 1 KiB, `-t 256 -w 1` | **5,346** | 37.19 ms | **43.12 ms** | 93.68 ms |
+
+Median of 3 runs per row. **Bench-host caveat: these are dev-
+hardware (Apple Silicon) numbers, NOT openclaw-vm.** The 16-vCPU
+openclaw-vm bench host that carries every other row in
+`docs/BENCH_HYPERION_2_0.md` was unreachable this session — SSH on
+192.168.31.14 returned `Connection refused` on 2026-04-29. The
+50,000+ msg/s target shape from the 2.1.0 perf-note is the
+openclaw-vm Linux number to publish; the table above establishes
+the dev-hardware floor and exercises the full hijack + handshake +
+frame + unmask + echo pipeline end-to-end. Re-running the same
+client + server commands on openclaw-vm is queued for the 2.3
+follow-up, alongside the autobahn-testsuite RFC 6455 conformance
+pass (deferred — Docker daemon not running this session, and `pip
+install autobahntestsuite` exceeded the brief's "trivially
+installable" threshold).
+
+**Comparison vs the 2.1.0 spec p50 of ~0.18 ms** (single-conn,
+dev hardware, e2e smoke `spec/hyperion/websocket_e2e_spec.rb`): the
+0.76 ms p50 from the 10-conn `-t 5` row is 4.2× the smoke-spec
+single-conn number, which lines up cleanly with the queue-wait
+inside a 5-thread worker pool serving 10 client connections (each
+client thread parks behind a server thread for the round-trip).
+The `recv → echo → send` pipeline isn't slower per-message — it's
+serialized.
+
+**Operator notes surfaced by the bench:**
+
+- **`-t` is a hard cap on concurrent WS connections per worker.**
+  Each WebSocket permanently hijacks a worker thread for its
+  lifetime, so the (N+1)th client behind `-t N` queues at the
+  handshake stage until an existing connection drains. The
+  brief-recommended `-t 5` config rejects 200 concurrent client
+  threads — fix-E's 200-conn row used `-t 256` out of necessity.
+  This guidance is added to `docs/WEBSOCKETS.md` alongside the
+  published numbers.
+- **Don't over-provision `-t`** for low-concurrency latency
+  paths. The 10-conn / `-t 5` row runs 2× faster per-message than
+  the same workload on `-t 256` — extra threads cost GVL contention
+  without adding parallelism. Match `-t` to expected concurrent-
+  connection count, not "as high as it goes".
+
+**Spec count delta**: 693 → 698 (+5). All 693 prior examples still
+green. 11 pending (10 Linux-only splice tests + 1 macOS-kTLS gate),
+unchanged.
 
 ### fix-D — `h2.max_total_streams` CLI flag + env-var (h2load comparability)
 
