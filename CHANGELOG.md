@@ -42,6 +42,88 @@ Foundation for native WebSocket support (WS-2 through WS-5).
   streaming should keep using the existing chunked transfer-encoding
   path; a follow-up will add partial hijack once full hijack lands.
 
+### WS-2 — RFC 6455 handshake (Upgrade: websocket → 101)
+
+New module `Hyperion::WebSocket::Handshake` (lib/hyperion/websocket/handshake.rb).
+The Rack adapter now intercepts the HTTP/1.1 → WebSocket upgrade
+handshake per RFC 6455 §1.3 / §4.2 transparently, BEFORE the app sees
+the env.
+
+#### Detection
+
+A request is a WS upgrade attempt when both:
+
+* `Upgrade` contains the `websocket` token (case-insensitive)
+* `Connection` contains the `upgrade` token (case-insensitive,
+  comma-separated list — `Connection: keep-alive, Upgrade` is valid)
+
+Other Upgrade variants (e.g. `Upgrade: h2c`) flow through the normal
+HTTP path untouched. Hyperion intercepts ONLY `websocket`.
+
+#### Validation (RFC 6455 §4.2.1)
+
+Each MUST is enforced. On failure Hyperion writes the response itself:
+
+* Method != `GET` → `400`
+* `HTTP/1.0` (or earlier) → `400`
+* Missing `Host:` → `400`
+* Missing `Sec-WebSocket-Key:` → `400`
+* `Sec-WebSocket-Key` doesn't decode to exactly 16 bytes → `400`
+* `Sec-WebSocket-Version` missing or not `13` → `426 Upgrade Required`
+  with `Sec-WebSocket-Version: 13` so the client knows what to retry
+* `Origin` not in the allow-list (when one is configured) → `400`
+
+#### Env handover convention (Option B)
+
+On a valid handshake the adapter stashes
+`env['hyperion.websocket.handshake'] = [:ok, accept_value, subprotocol]`
+and lets the app proceed. The app is responsible for:
+
+1. reading the accept value out of env,
+2. calling `env['rack.hijack'].call` to take the socket (WS-1),
+3. writing the 101 response (helper:
+   `Hyperion::WebSocket::Handshake.build_101_response(accept, subprotocol)`).
+
+This mirrors faye-websocket / ActionCable behaviour — Hyperion stays
+neutral on the WS protocol layer and lets the app drive.
+
+#### Optional subprotocol selector
+
+`Handshake.validate(env, subprotocol_selector: ->(offers) { … })` —
+the proc receives the array of client-offered subprotocols (from
+`Sec-WebSocket-Protocol`) and may return one of them or nil. The
+result lands in slot 3 of the handshake tuple. The server MUST NOT
+echo a protocol the client didn't offer (RFC 6455 §4.2.2); a return
+value not in the offer list is silently dropped.
+
+#### Optional origin allow-list
+
+Default: any origin accepted (browsers enforce CORS-style
+restrictions on the WS upgrade independently). Override per-call via
+`Handshake.validate(env, origin_allow_list: %w[https://example.com])`,
+or globally via `HYPERION_WS_ORIGIN_ALLOW_LIST` (comma-separated).
+The full Hyperion::Config DSL plumbing is deferred to WS-4 / WS-5;
+the env-var fallback covers the operator escape hatch in the meantime.
+
+#### Test vector confirmation
+
+Per RFC 6455 §1.3:
+
+```
+key    = "dGhlIHNhbXBsZSBub25jZQ=="
+accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+```
+
+`Hyperion::WebSocket::Handshake.accept_value(key)` returns the
+canonical accept value (asserted in spec).
+
+#### Public types
+
+* `Hyperion::WebSocket::HandshakeError < StandardError` — raised by
+  no Hyperion code in WS-2 itself; supplied for downstream consumers
+  (middleware, ActionCable bridges) that want to translate a
+  failing `validate` tuple into an exception.
+
 ## [2.0.1] - 2026-04-30
 
 Phase 8 — close the last two static-file rps gaps. Hyperion 2.0.0 still

@@ -3,6 +3,7 @@
 require 'stringio'
 require_relative '../version'
 require_relative '../pool'
+require_relative '../websocket/handshake'
 
 module Hyperion
   module Adapter
@@ -145,6 +146,27 @@ module Hyperion
         # has no `rack.hijack` key, matching pre-2.1 behaviour.
         def call(app, request, connection: nil)
           env, input = build_env(request, connection: connection)
+
+          # 2.1.0 (WS-2) — RFC 6455 §4.2 handshake interception. Runs
+          # AFTER env is built (so the WS module sees the same env keys
+          # the app would see) but BEFORE app.call. Branches:
+          #   * :not_websocket   — request is plain HTTP; no-op
+          #   * :ok              — valid WS handshake; stash the
+          #     [:ok, accept, subprotocol] tuple in env so the app can
+          #     read accept_value without re-running SHA1/base64. The
+          #     app is still responsible for writing the 101 response
+          #     to the hijacked socket (Option B from the WS-2 plan,
+          #     mirrors faye-websocket / ActionCable convention).
+          #   * :bad_request / :upgrade_required — short-circuit; the
+          #     app never sees the env. Hyperion writes the 4xx itself.
+          ws_result = Hyperion::WebSocket::Handshake.validate(env)
+          case ws_result.first
+          when :ok
+            env['hyperion.websocket.handshake'] = ws_result
+          when :bad_request, :upgrade_required
+            return websocket_handshake_failure_response(ws_result)
+          end
+
           status, headers, body = app.call(env)
           [status, headers, body]
         rescue StandardError => e
@@ -182,6 +204,19 @@ module Hyperion
         end
 
         private
+
+        # 2.1.0 (WS-2) — translate a Handshake.validate failure tuple
+        # into a Rack response triple. 400 for protocol errors,
+        # 426 for unsupported Sec-WebSocket-Version (RFC 6455 §4.4)
+        # — the 426 path always carries `sec-websocket-version: 13`
+        # so the client sees the version Hyperion supports.
+        def websocket_handshake_failure_response(ws_result)
+          tag, body, extra_headers = ws_result
+          status = tag == :upgrade_required ? 426 : 400
+          response_headers = { 'content-type' => 'text/plain' }
+          extra_headers.each { |k, v| response_headers[k.to_s] = v.to_s }
+          [status, response_headers, [body.to_s]]
+        end
 
         def build_env(request, connection: nil)
           host_header = request.header('host') || ''
