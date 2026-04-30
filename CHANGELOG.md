@@ -104,7 +104,91 @@ implementation ships because:
      CGlue installs (which is every modern Linux + macOS).
 
 The next gate for the default flip is a Rails-shape bench (~30
-response headers per stream). Tracked as a 2.4-B follow-up.
+response headers per stream). Tracked as a separate H2 follow-up.
+
+### 2.4-B — GC-pressure reduction round-2 (long-run stability)
+
+**Why this matters.** Phase 11 (2.2.0) cut Adapter::Rack hot path
+allocations -53% (19 → 9 obj/req) and locked the number with
+`yjit_alloc_audit_spec`. But the *long-run* server hot path under
+sustained traffic includes more than the adapter — the C parser, the
+WebSocket frame ser/de, and the connection lifecycle each ship their
+own per-message allocations that scale with **message rate**, not just
+request count. A single keep-alive connection pipelined with 1000
+requests, or a chat-style WebSocket connection echoing 1000 messages,
+should not allocate 1000 connection-state objects — only the
+truly-per-message ones.
+
+**The audit.** `bench/gc_audit_2_4_b.rb` drove four sustained workloads
+(HTTP keep-alive GET, chunked POST, WS recv, WS send w/ permessage-
+deflate) under `GC.disable` for 5000-10000 iters and measured per-
+iter `total_allocated_objects` deltas plus GC.count over the window.
+`bench/gc_audit_2_4_b_trace.rb` ran the same workloads under
+`ObjectSpace.trace_object_allocations` for file:line attribution.
+Top sites identified, written up at `bench/gc_audit_2_4_b.md`:
+
+| # | Site                                          | Fix                                                            |
+|---|-----------------------------------------------|----------------------------------------------------------------|
+| 1 | `parser.c:state_init` 6 empty placeholders   | S1 — Qnil sentinels, lazy alloc on first append                |
+| 2 | `parser.c:on_headers_complete` cl_key/te_key  | S2 — pre-interned frozen globals at Init_hyperion_http         |
+| 3 | `parser.c:stash_pending_header` reset empties | S1 (rolled into) — reset to Qnil, not fresh empty Strings      |
+| 4 | `frame.rb:Builder.build` `payload.b`         | S4 — branch on `encoding == BINARY_ENCODING`, skip no-op clone |
+| 5 | `frame.rb:Parser.parse` `slice.b` + `(+'').b`| S5 — drop redundant `.b` + share frozen `EMPTY_BIN_PAYLOAD`    |
+
+**What ships:**
+
+| Deliverable | Where | Why |
+|---|---|---|
+| C parser lazy field alloc + frozen smuggling-defense keys | `ext/hyperion_http/parser.c` | Saves 6 empty-String allocations per parse() in state_init, 2 fresh empty Strings per parsed header in stash_pending_header, 2 cl_key/te_key Strings per parse(). Lazy Qnil → empty-String coercion at Request build means the Ruby surface is unchanged. |
+| WebSocket frame `.b` clone elimination + frozen empty payload | `lib/hyperion/websocket/frame.rb` | `Builder.build` skips `payload.b` when input is already ASCII-8BIT. `Parser.parse` / `parse_with_cursor` drop the redundant `slice.b` (the WS `@inbuf` is binary by construction) and share one frozen `EMPTY_BIN_PAYLOAD` const for empty frames. |
+| `bench/gc_audit_2_4_b.rb` + `gc_audit_2_4_b_trace.rb` + `gc_audit_2_4_b.md` | NEW | Sustained-workload audit harness covering 4 hot paths; writeup with measured before/after per site. |
+| `spec/hyperion/parser_alloc_audit_spec.rb` | NEW (4 examples) | Locks per-parse allocation counts: ≤12 for minimal GET, ≤22 for 5-header GET, ≤20 for chunked POST. Plus an identity invariant on the EMPTY_STR coercion. |
+| `spec/hyperion/websocket_frame_alloc_audit_spec.rb` | NEW (4 examples) | Locks Builder.build (≤4 obj/call unmasked), Parser.parse (≤11 masked, ≤9 unmasked), and the EMPTY_BIN_PAYLOAD frozen-identity invariant. |
+| `spec/hyperion/long_run_stability_spec.rb` | NEW (1 example, `:perf` tagged) | Drives 10000 keep-alive GETs over 100 connections, asserts ≤65 obj/req and ≥1 GC per 500 reqs. Excluded from default suite via `spec_helper.rb` `filter_run_excluding(:perf)`; operators run via `--tag perf` after allocation-pressure changes. |
+
+**Measured (5000-iter steady-state, no YJIT, macOS arm64):**
+
+| case                          | 2.3.0 | 2.4-B | delta |
+|-------------------------------|------:|------:|------:|
+| GET /, 1 header (parse)       | 19.00 |  9.00 | **-53%** |
+| GET /a?q=1, 5 headers (parse) | 36.00 | 18.00 | **-50%** |
+| POST chunked, 4 chunks (parse)| 27.00 | 16.00 | **-41%** |
+| WS Builder.build unmasked     |   3+1 |     3 | -25%  |
+| WS Parser.parse unmasked      |     9 |     8 | -11%  |
+
+**Sustained-load GC frequency (10000 iters, openclaw-vm Linux Ruby 3.3.3):**
+
+| workload          | 2.3.0 GC freq | 2.4-B GC freq | delta    |
+|-------------------|--------------:|--------------:|---------:|
+| chunked POST parse| 1 GC / 689    | 1 GC / 952    | **-28%** |
+| ws recv (masked)  | 1 GC / 625    | 1 GC / 625    |   0%     |
+
+(WS recv unchanged because the masked-frame audit path goes through
+`CFrame.unmask` regardless of S5; the regression spec exercises the
+unmasked-side win that S5 captures.)
+
+**wrk validation (openclaw-vm, 30s, -t4 -c200, hyperion -w4 -t5):**
+
+| build  | req/s | p50    | p99    | std-dev |
+|--------|------:|-------:|-------:|--------:|
+| 2.3.0  | 14833 | 1.27ms | 2.64ms | 329µs   |
+| 2.4-B  | 14985 | 1.26ms | 2.61ms | 330µs   |
+
+Throughput is adapter-bound at this scale — the win is in GC pressure,
+not raw rps. p99 + std-dev sit within noise on a 30s run; the
+`long_run_stability_spec` is the regression guard for sustained-load
+behaviour. The user-relevant 2.4 win for **long-running production
+servers** is GC frequency -28% on the chunked path that scales with
+real upload volume.
+
+Sites considered + deferred (with rationale in `bench/gc_audit_2_4_b.md`):
+* @inbuf initial capacity 8KB → 16KB — verified 95th-percentile fits
+  in 4KB; bump would regress 10k-keep-alive RSS without payback.
+* WS frame parse 8-element Array — Ruby façade surface; deferred.
+* Per-conn env Hash pool — already pooled by Phase 11.
+
+Spec count: 788 → 796 default-run + 1 (`:perf`-tagged) = 797 total.
+No version bump (release task is 2.4-fix-F).
 
 ## [2.3.0] - 2026-05-01
 
