@@ -318,11 +318,10 @@ RSpec.describe Hyperion::Http::Sendfile do
       skip 'splice path inert on this host' unless described_class.splice_supported?
 
       with_socket_pair(payload.bytesize) do |client, reader|
-        # Drive the splice primitive directly — copy_to_socket no longer
-        # routes through it (plain sendfile is the production streaming
-        # path; persistent per-thread pipes risked leaking residual
-        # bytes between requests on EPIPE). We still own the primitive
-        # and verify byte integrity for callers that opt in.
+        # 2.2.0 — the splice primitive is back on the production hot
+        # path through copy_to_socket for files > SPLICE_THRESHOLD.
+        # We still drive it directly here to assert the C-level
+        # byte-integrity contract independent of the Ruby façade.
         remaining = payload.bytesize
         cursor    = 0
         total     = 0
@@ -350,6 +349,228 @@ RSpec.describe Hyperion::Http::Sendfile do
       # `.copy_to_socket — round-trip integrity` already covers byte
       # equality on this host, so we just assert the gate is closed.
       expect(described_class.splice_supported?).to be(false)
+    end
+  end
+
+  describe '2.2.0 — splice fresh-pipe lifecycle' do
+    # Helper: count open fds owned by this process.  On Linux we read
+    # /proc/self/fd; on macOS we use lsof piped through wc -l.  We
+    # don't care about the absolute number — only the delta across a
+    # batch of requests.  If the splice path leaks pipe fds (the
+    # 2.0.1 disable rationale), this delta grows with the request
+    # count.  The 2.2.0 fresh-pipe layout closes both fds on every
+    # exit path, so the delta is bounded by transient fds (Tempfile,
+    # TCPSocket pair) — a handful at most.
+    def open_fd_count
+      if File.directory?('/proc/self/fd')
+        Dir.children('/proc/self/fd').size
+      else
+        # macOS fallback: count fds via lsof.  Slower, but only used
+        # when we actually need a delta on a non-Linux host (where
+        # the splice path is inert anyway and the test asserts the
+        # primitive path through copy_splice).
+        `lsof -p #{Process.pid} 2>/dev/null | wc -l`.to_i
+      end
+    end
+
+    it 'closes both pipe fds on every successful copy_splice call (no fd leak across 1000 requests)' do
+      skip 'splice path not compiled' unless described_class.respond_to?(:copy_splice)
+      skip 'splice path inert on this host' unless described_class.splice_supported?
+
+      # Build one tempfile, reuse it across 1000 connections so the
+      # only fd-cycling source is the splice path itself.
+      small = Tempfile.new(%w[hy-sf-leak .bin]).tap do |f|
+        f.binmode
+        f.write('X' * 200_000) # 200 KiB — above SPLICE_THRESHOLD
+        f.flush
+        f.rewind
+      end
+
+      begin
+        # Warm the path once to amortize one-time allocations
+        # (libc internal buffers, glibc thread-local malloc cache,
+        # whatever).  Then snapshot the fd count.
+        with_socket_pair(small.size) do |client, reader|
+          described_class.copy_splice(client, small, 0, small.size)
+          client.close
+          reader.value
+        end
+
+        baseline = open_fd_count
+
+        1000.times do
+          with_socket_pair(small.size) do |client, reader|
+            remaining = small.size
+            cursor    = 0
+            while remaining.positive?
+              bytes, status = described_class.copy_splice(client, small, cursor, remaining)
+              break if bytes.zero? && status == :unsupported
+
+              cursor    += bytes
+              remaining -= bytes
+              break if status == :done
+            end
+            client.close
+            reader.value
+          end
+        end
+
+        # Allow up to ~32 fds of slack — the test infrastructure
+        # itself (Tempfile, TCPServer/TCPSocket, Thread join handles)
+        # opens transient fds that don't always get reaped between
+        # iterations.  The 2.0.1 cached-pipe leak would have grown
+        # by 2× num_threads (one pipe pair per thread), but the
+        # actual concern is unbounded growth: 1000 calls → 1000+
+        # leaked fds.  An fd delta that stays below 32 across
+        # 1000 calls is comfortably within the no-leak regime.
+        delta = open_fd_count - baseline
+        expect(delta).to be < 32,
+                         "fd count grew by #{delta} across 1000 splice calls — pipe pair leak suspected"
+      ensure
+        small.close!
+      end
+    end
+
+    it 'closes both pipe fds even when the peer closes mid-transfer (EPIPE)' do
+      skip 'splice path not compiled' unless described_class.respond_to?(:copy_splice)
+      skip 'splice path inert on this host' unless described_class.splice_supported?
+
+      # Build a 4 MiB file so a slow drain on the reader side keeps
+      # bytes parked in the pipe long enough for us to slam the
+      # peer fd shut.
+      big = Tempfile.new(%w[hy-sf-epipe .bin]).tap do |f|
+        f.binmode
+        f.write('Y' * (4 * 1024 * 1024))
+        f.flush
+        f.rewind
+      end
+
+      begin
+        baseline = open_fd_count
+
+        50.times do
+          server = TCPServer.new('127.0.0.1', 0)
+          port   = server.addr[1]
+          slammer = Thread.new do
+            conn = server.accept
+            # Read just a tiny bit then slam shut — forces EPIPE
+            # mid-splice on the writer side.
+            begin
+              conn.read(1024)
+            rescue StandardError
+              # ignore
+            end
+            conn.close
+          end
+          client = TCPSocket.new('127.0.0.1', port)
+
+          begin
+            # Issue splice calls until we either finish or hit EPIPE.
+            remaining = big.size
+            cursor    = 0
+            loop do
+              break if remaining.zero?
+
+              bytes, status = described_class.copy_splice(client, big, cursor, remaining)
+              break if bytes.zero? && status == :unsupported
+
+              cursor    += bytes
+              remaining -= bytes
+              break if status == :done
+            end
+          rescue Errno::EPIPE, Errno::ECONNRESET, Errno::EBADF
+            # Expected — peer slammed.  We're testing the lifecycle,
+            # not the error class.
+          ensure
+            client.close
+            slammer.join
+            server.close
+          end
+        end
+
+        # 50 mid-transfer EPIPEs MUST NOT leak pipe fds.  Each splice
+        # call pays pipe2 + 2× close even on the error path.
+        delta = open_fd_count - baseline
+        expect(delta).to be < 32,
+                         "fd count grew by #{delta} across 50 EPIPE-mid-transfer splice calls — pipe pair leak on error path"
+      ensure
+        big.close!
+      end
+    end
+
+    it 'preserves byte equality between splice and plain sendfile for the same payload' do
+      skip 'splice path not compiled' unless described_class.respond_to?(:copy_splice)
+      skip 'splice path inert on this host' unless described_class.splice_supported?
+
+      # Drive the same 1 MiB payload through both primitives and
+      # assert the wire bytes are identical — guards against subtle
+      # off-by-one bugs in the offset bookkeeping after the cursor
+      # advance through pipe -> socket short-writes.
+      via_splice = String.new(encoding: Encoding::BINARY)
+      via_sendfile = String.new(encoding: Encoding::BINARY)
+
+      with_socket_pair(payload.bytesize) do |client, reader|
+        remaining = payload.bytesize
+        cursor    = 0
+        while remaining.positive?
+          bytes, status = described_class.copy_splice(client, tempfile, cursor, remaining)
+          break if bytes.zero? && status == :unsupported
+
+          cursor    += bytes
+          remaining -= bytes
+          break if status == :done
+        end
+        client.close
+        via_splice = reader.value
+      end
+
+      tempfile.rewind
+      with_socket_pair(payload.bytesize) do |client, reader|
+        remaining = payload.bytesize
+        cursor    = 0
+        while remaining.positive?
+          bytes, status = described_class.copy(client, tempfile, cursor, remaining)
+          break if bytes.zero? && status == :unsupported
+
+          cursor    += bytes
+          remaining -= bytes
+          break if status == :done
+        end
+        client.close
+        via_sendfile = reader.value
+      end
+
+      expect(via_splice.bytesize).to eq(payload.bytesize)
+      expect(via_sendfile.bytesize).to eq(payload.bytesize)
+      expect(via_splice).to eq(via_sendfile)
+      expect(via_splice).to eq(payload)
+    end
+
+    it 'falls back to plain sendfile when splice_runtime_supported? is stubbed false' do
+      skip 'native ext not loaded' unless described_class.respond_to?(:copy_splice)
+
+      # Force the runtime gate closed and assert copy_splice is
+      # never called from the production hot path.  Plain `copy`
+      # carries the transfer.
+      allow(described_class).to receive(:splice_runtime_supported?).and_return(false)
+      allow(described_class).to receive(:copy_splice).and_call_original
+
+      with_socket_pair(payload.bytesize) do |client, reader|
+        written = described_class.copy_to_socket(client, tempfile, 0, payload.bytesize)
+        client.close
+        expect(written).to eq(payload.bytesize)
+        expect(reader.value).to eq(payload)
+      end
+
+      expect(described_class).not_to have_received(:copy_splice)
+    ensure
+      # Reset the cached runtime flag so the next spec sees the
+      # real value (RSpec's allow already drops stub at end of
+      # example, but the production path may also have called
+      # mark_splice_unsupported! during a fall-back run).
+      if described_class.instance_variable_defined?(:@splice_runtime_supported)
+        described_class.remove_instance_variable(:@splice_runtime_supported)
+      end
     end
   end
 

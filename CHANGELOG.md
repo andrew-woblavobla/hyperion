@@ -2,6 +2,84 @@
 
 ## [Unreleased] - 2.2.0
 
+### Static-file splice path re-enabled (fresh per-request pipe pair)
+
+The `splice(2)`-through-pipe primitive shipped in 2.0.1 (Phase 8b) was
+**disabled in the production hot path** in the same release because the
+cached per-thread pipe pair leaked residual bytes between requests on
+EPIPE: if `splice(file -> pipe)` succeeded but `splice(pipe -> sock)`
+failed mid-transfer (peer closed), the unread bytes stayed in the pipe
+and were sent on the NEXT connection's socket. 2.0.1 fell back to plain
+`sendfile(2)` for the 1 MiB row and parked the splice primitive as
+optional — kept in the C ext for callers that opted in, but no longer
+on `copy_to_socket`'s default route.
+
+2.2.0 fixes the correctness bug at the lifecycle layer rather than
+abandoning the path. The splice path is now back on the production hot
+path for files > 64 KiB on Linux.
+
+* **Fresh `pipe2(O_CLOEXEC | O_NONBLOCK)` pair per call.**
+  `Hyperion::Http::Sendfile.copy_splice` opens its own pipe pair on
+  every call and closes both fds before returning — on success, on
+  EAGAIN, on error, on EOF. No persistent state, no `pthread_key_t`,
+  no destructor. The 2.0.1 cached layout is gone entirely. The
+  per-thread TLS cache and its destructor were removed from the C ext;
+  the splice primitive is now stateless across calls.
+* **Correctness contract.** A pipe never carries bytes for more than
+  one transfer. The (in_n - written) bytes that may be parked in the
+  pipe on a mid-transfer `EAGAIN` / `EPIPE` are dropped when we close
+  the pipe; the Ruby caller's cursor arithmetic compensates by
+  re-reading from `cursor + bytes_actually_on_socket` on the next
+  call. No cross-connection byte leak is possible.
+* **fd lifecycle.** Each `copy_splice` call pays exactly 3 syscalls of
+  pipe overhead: 1 `pipe2` + 2 `close`s. New spec
+  `'closes both pipe fds on every successful copy_splice call (no fd leak
+  across 1000 requests)'` runs 1000 sequential 200-KiB transfers and
+  asserts the open-fd count grows by < 32 across the batch. Companion
+  spec `'closes both pipe fds even when the peer closes mid-transfer
+  (EPIPE)'` slams the peer mid-splice 50× and asserts the same fd
+  bound on the error path.
+* **Production wiring.** `lib/hyperion/http/sendfile.rb` —
+  `native_copy_loop` now branches on `splice_runtime_supported? &&
+  len > SPLICE_THRESHOLD`. On Linux + supported kernel, splice runs;
+  on `:unsupported` from the kernel (very old kernels return ENOSYS /
+  EINVAL the first time we call splice), `mark_splice_unsupported!`
+  flips the cached gate to `false` and the rest of the process falls
+  through to plain `sendfile(2)` from the same cursor — no bytes
+  duplicated, no bytes skipped. `NotImplementedError` from the C
+  primitive (defensive: should never fire on a Linux build) follows
+  the same fall-back path.
+* **Splice-vs-sendfile byte equality.** New spec `'preserves byte
+  equality between splice and plain sendfile for the same payload'`
+  drives the same 1 MiB asset through both primitives and asserts
+  the wire bytes are identical — guards against subtle off-by-one
+  bugs in the offset bookkeeping after pipe -> socket short-writes.
+* **Splice runtime probe.** Added
+  `Hyperion::Http::Sendfile.splice_runtime_supported?` (lazy, cached
+  for the lifetime of the process). Tracks the C ext's
+  `splice_supported?` flag at boot and switches to `false` if the
+  runtime kernel rejects splice. `mark_splice_unsupported!` is the
+  one-way transition; the runtime gate never re-opens within a
+  process.
+* **Specs.** `spec/hyperion/http_sendfile_spec.rb` gains 4 new
+  examples under `2.2.0 — splice fresh-pipe lifecycle`. Three are
+  Linux-pending on macOS / BSD (the splice path is inert there); the
+  4th (`'falls back to plain sendfile when splice_runtime_supported?
+  is stubbed false'`) runs everywhere and asserts the production
+  fall-back wiring routes through `copy()` and never hits
+  `copy_splice`. Spec count **662 → 666**. Existing 662 stay green.
+* **macOS arm64 / Linux x86_64 portability.** The splice path stays
+  `#ifdef HYP_SF_LINUX`; non-Linux builds see `splice_supported?`
+  return `false` and the streaming loop goes straight to plain
+  `sendfile(2)`. The C ext compiles cleanly on macOS arm64 (verified
+  on this branch).
+* **Bench validation deferred.** openclaw-vm rejected publickey at
+  the time of this commit (same regression flagged in Phase 11). The
+  fresh-pipe lifecycle is correctness work; the projected 5–10% rps
+  win on the 1 MiB static row vs the 2.0.1 baseline (1,697 r/s)
+  will be re-measured in the 2.2.0 release sweep (#124) once SSH
+  access is restored.
+
 ### Phase 11 — YJIT allocation audit (hot-path tuning)
 
 Pure-Ruby allocation reduction on the request hot path. The C-ext fast

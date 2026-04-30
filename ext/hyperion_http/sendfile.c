@@ -43,6 +43,17 @@
  *     pipe-tee path AND the host kernel implemented it. Used by the
  *     userspace caller (and specs) to assert the splice branch fires.
  *
+ *   Sendfile.copy_splice(out_io, in_io, offset, len) -> [bytes_written, status]
+ *     2.0.1 Phase 8b primitive; 2.2.0 lifecycle — opens a fresh
+ *     pipe2(O_CLOEXEC | O_NONBLOCK) pair on every call and closes
+ *     both fds on every exit path (success, EAGAIN, error, EOF).
+ *     Two extra syscalls per call vs the old TLS-cached layout, but
+ *     correctness is restored: a partial transfer interrupted by
+ *     EPIPE cannot leak residual bytes onto the next request's
+ *     socket.  Re-enabled on the production hot path for files
+ *     >= 64 KiB where the kernel-side zero-copy more than pays
+ *     for the pipe2 + 2× close overhead.
+ *
  * Phase 1 strategy
  * ----------------
  * Linux:  prefer sendfile(2) (single syscall, file -> socket). If sendfile
@@ -66,12 +77,16 @@
  *     row drops from milliseconds to microseconds.
  *
  * 8b. Big files on Linux (> 64 KiB) optionally splice through a
- *     per-thread cached pipe pair (file_fd -> pipe_w -> sock_fd) with
+ *     pipe pair (file_fd -> pipe_w -> sock_fd) with
  *     SPLICE_F_MOVE | SPLICE_F_MORE for an extra ~5-15% over plain
- *     sendfile on the 1 MiB asset.  Pipe pair lifecycle is per-thread
- *     and reused across requests; closed at thread exit via a
- *     pthread_key_t destructor so a worker that scales fibers up and
- *     down doesn't leak fds.
+ *     sendfile on the 1 MiB asset.  2.0.1 cached one pipe per OS
+ *     thread; 2.2.0 opens a fresh pipe per call and closes it on
+ *     every exit path (success, EAGAIN, error, EOF).  The two
+ *     extra syscalls per call (pipe2 + 2× close) are amortized
+ *     against the kernel-side zero-copy splice transfer; correctness
+ *     is unconditional: a pipe never carries bytes for more than
+ *     one transfer, so EPIPE mid-transfer cannot leak residual
+ *     bytes onto the next request's socket.
  *
  * GVL discipline
  * --------------
@@ -102,7 +117,6 @@
 #if defined(__linux__)
 #  include <sys/sendfile.h>
 #  include <sys/uio.h>
-#  include <pthread.h>
 #  include <fcntl.h>
 #  define HYP_SF_LINUX 1
 #  ifdef F_SETPIPE_SZ
@@ -388,69 +402,27 @@ static VALUE rb_sendfile_copy_small(VALUE self, VALUE out_io, VALUE in_io,
 }
 
 /* ============================================================
- * Phase 8b — Linux splice(2) through a per-thread pipe.
- * ============================================================ */
+ * Phase 8b / 2.2.0 — Linux splice(2) through a fresh per-request pipe.
+ * ============================================================
+ *
+ * 2.0.1 originally cached one pipe pair per OS thread in pthread TLS.
+ * That layout leaked residual bytes between requests on EPIPE: if
+ * splice(file -> pipe) succeeded but splice(pipe -> sock) failed
+ * mid-transfer (peer closed), the unread bytes stayed in the pipe
+ * and were sent on the NEXT connection's socket.  The 2.0.1 release
+ * disabled the splice path entirely from copy_to_socket and routed
+ * production traffic back through plain sendfile.
+ *
+ * 2.2.0 fix — fresh pipe pair per call.  pipe2(O_CLOEXEC) at entry,
+ * close both fds on every exit path (success, EAGAIN, error, EOF).
+ * Two extra syscalls per call, but the splice copies remain
+ * kernel-side zero-copy (file -> pipe -> socket, page cache bytes
+ * never enter userspace) and the correctness window is gone: a pipe
+ * pair only ever carries bytes for one transfer.  No persistent
+ * state, no fd leak across thousands of requests, no cross-connection
+ * byte leak. */
 
 #ifdef HYP_SF_LINUX
-
-static pthread_key_t hyp_pipe_tls_key;
-static int           hyp_pipe_tls_inited = 0;
-
-typedef struct {
-    int fds[2]; /* [read, write] */
-} hyp_pipe_pair_t;
-
-static void hyp_pipe_pair_destroy(void *raw) {
-    hyp_pipe_pair_t *pp = (hyp_pipe_pair_t *)raw;
-    if (pp == NULL) return;
-    if (pp->fds[0] >= 0) close(pp->fds[0]);
-    if (pp->fds[1] >= 0) close(pp->fds[1]);
-    free(pp);
-}
-
-static hyp_pipe_pair_t *hyp_pipe_pair_get_or_open(void) {
-    if (!hyp_pipe_tls_inited) {
-        return NULL;
-    }
-    hyp_pipe_pair_t *pp = (hyp_pipe_pair_t *)pthread_getspecific(hyp_pipe_tls_key);
-    if (pp != NULL) {
-        return pp;
-    }
-    pp = (hyp_pipe_pair_t *)malloc(sizeof(*pp));
-    if (pp == NULL) return NULL;
-    pp->fds[0] = pp->fds[1] = -1;
-
-    int rc;
-#  ifdef O_CLOEXEC
-    rc = pipe2(pp->fds, O_CLOEXEC | O_NONBLOCK);
-    if (rc != 0) {
-        rc = pipe(pp->fds);
-        if (rc == 0) {
-            fcntl(pp->fds[0], F_SETFD, FD_CLOEXEC);
-            fcntl(pp->fds[1], F_SETFD, FD_CLOEXEC);
-            int fl0 = fcntl(pp->fds[0], F_GETFL);
-            int fl1 = fcntl(pp->fds[1], F_GETFL);
-            if (fl0 >= 0) fcntl(pp->fds[0], F_SETFL, fl0 | O_NONBLOCK);
-            if (fl1 >= 0) fcntl(pp->fds[1], F_SETFL, fl1 | O_NONBLOCK);
-        }
-    }
-#  else
-    rc = pipe(pp->fds);
-#  endif
-    if (rc != 0) {
-        free(pp);
-        return NULL;
-    }
-#  ifdef HYP_HAVE_F_SETPIPE_SZ
-    /* Ask the kernel to size the pipe at 1 MiB so a single splice
-     * round-trip can move a 1 MiB file in one shot. The kernel may
-     * cap below at /proc/sys/fs/pipe-max-size; we tolerate a smaller
-     * pipe and just iterate more often. */
-    (void)fcntl(pp->fds[1], F_SETPIPE_SZ, 1024 * 1024);
-#  endif
-    pthread_setspecific(hyp_pipe_tls_key, pp);
-    return pp;
-}
 
 typedef struct {
     int    in_fd;
@@ -473,6 +445,55 @@ typedef struct {
 #    define SPLICE_F_NONBLOCK 2
 #  endif
 
+/* Open a fresh pipe pair for a single splice call.  Returns 0 on
+ * success and writes the [read, write] fds into out_fds; returns
+ * -errno on failure (caller surfaces :unsupported / :eagain to
+ * Ruby).  Always pairs with hyp_close_pipe_pair on every exit
+ * path. */
+static int hyp_open_pipe_pair(int out_fds[2]) {
+    out_fds[0] = out_fds[1] = -1;
+
+    int rc;
+#  ifdef O_CLOEXEC
+    rc = pipe2(out_fds, O_CLOEXEC | O_NONBLOCK);
+    if (rc != 0 && errno == ENOSYS) {
+        rc = pipe(out_fds);
+        if (rc == 0) {
+            fcntl(out_fds[0], F_SETFD, FD_CLOEXEC);
+            fcntl(out_fds[1], F_SETFD, FD_CLOEXEC);
+            int fl0 = fcntl(out_fds[0], F_GETFL);
+            int fl1 = fcntl(out_fds[1], F_GETFL);
+            if (fl0 >= 0) fcntl(out_fds[0], F_SETFL, fl0 | O_NONBLOCK);
+            if (fl1 >= 0) fcntl(out_fds[1], F_SETFL, fl1 | O_NONBLOCK);
+        }
+    }
+#  else
+    rc = pipe(out_fds);
+#  endif
+    if (rc != 0) {
+        return -errno;
+    }
+#  ifdef HYP_HAVE_F_SETPIPE_SZ
+    /* Best-effort: ask the kernel to size this pipe at 1 MiB so the
+     * splice loop can move a 1 MiB file in a small number of
+     * round-trips.  Cap at /proc/sys/fs/pipe-max-size; we ignore
+     * failure and iterate more often on a smaller pipe. */
+    (void)fcntl(out_fds[1], F_SETPIPE_SZ, 1024 * 1024);
+#  endif
+    return 0;
+}
+
+static void hyp_close_pipe_pair(int fds[2]) {
+    if (fds[0] >= 0) {
+        close(fds[0]);
+        fds[0] = -1;
+    }
+    if (fds[1] >= 0) {
+        close(fds[1]);
+        fds[1] = -1;
+    }
+}
+
 static void *splice_blocking_call(void *raw) {
     splice_args_t *a = (splice_args_t *)raw;
     a->rc = 0;
@@ -490,7 +511,17 @@ static void *splice_blocking_call(void *raw) {
         return NULL;
     }
 
-    /* Step 2: pipe -> socket. May short-write; caller loops. */
+    /* Step 2: pipe -> socket. May short-write; loop until the pipe
+     * is fully drained or the socket signals EAGAIN/error.  We
+     * surface the count of bytes actually delivered to the socket
+     * (`written`), NOT the count we read from the file (`in_n`).
+     * Any (in_n - written) bytes still queued in the pipe will be
+     * dropped when the caller closes the pipe pair on its way out.
+     * This is safe because the file offset we passed in by pointer
+     * is local (a->offset) and the Ruby caller tracks its own
+     * absolute cursor — on retry it passes a fresh offset of
+     * old_cursor + written, so the file is re-read from the right
+     * place and no bytes are duplicated or skipped on the wire. */
     ssize_t written = 0;
     while (written < in_n) {
         ssize_t out_n = splice(a->pipe_r, NULL, a->out_fd, NULL,
@@ -502,14 +533,10 @@ static void *splice_blocking_call(void *raw) {
         }
         if (out_n < 0 && errno == EINTR) continue;
         if (out_n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            /* Socket buffer full mid-transfer.  Bytes already in the
-             * pipe stay queued; caller yields and we re-enter the
-             * splice loop on the next call (the pipe still holds
-             * (in_n - written) bytes for the same fd pair owned by
-             * this thread, so the next call will drain them first
-             * before pulling from the file again).  We surface
-             * EAGAIN with rc set to bytes actually delivered to the
-             * socket so far this call. */
+            /* Socket buffer full.  Surface what we got; pipe will
+             * be closed by the caller (drops the in_n-written bytes
+             * still queued in it — caller's offset arithmetic
+             * compensates). */
             a->err = EAGAIN;
             break;
         }
@@ -608,8 +635,11 @@ static VALUE rb_sendfile_copy(VALUE self, VALUE out_io, VALUE in_io,
 }
 
 /* Sendfile.copy_splice(out_io, in_io, offset, len) -> [bytes_written, status]
- * Linux-only. Returns :unsupported on every other platform so the Ruby
- * caller can fall back to copy(). */
+ * Linux-only.  2.2.0 layout: opens a fresh pipe pair via
+ * pipe2(O_CLOEXEC | O_NONBLOCK) on every call and closes it on every
+ * exit path.  No persistent state, no cross-request byte leak.
+ * Returns :unsupported on non-Linux hosts so the Ruby caller can fall
+ * back to copy(). */
 static VALUE rb_sendfile_copy_splice(VALUE self, VALUE out_io, VALUE in_io,
                                      VALUE rb_offset, VALUE rb_len) {
     (void)self;
@@ -627,22 +657,37 @@ static VALUE rb_sendfile_copy_splice(VALUE self, VALUE out_io, VALUE in_io,
         return rb_ary_new3(2, INT2FIX(0), sym_done);
     }
 
-    hyp_pipe_pair_t *pp = hyp_pipe_pair_get_or_open();
-    if (pp == NULL) {
+    /* Fresh pipe pair for THIS call only.  Opened here, closed on
+     * every exit path below.  pipe2 is one syscall; the close pair
+     * is two more.  The 3-syscall overhead is amortized against the
+     * splice copies (which stay zero-copy across file -> pipe ->
+     * socket) for files >= 64 KiB; the Ruby caller gates on size. */
+    int pipe_fds[2];
+    int prc = hyp_open_pipe_pair(pipe_fds);
+    if (prc != 0) {
+        /* pipe2 / pipe failed.  ENOSYS / EMFILE / ENFILE — all map
+         * to "splice path can't run right now"; let the caller fall
+         * back to plain sendfile. */
         return rb_ary_new3(2, INT2FIX(0), sym_unsupported);
     }
 
     splice_args_t args;
     args.in_fd   = extract_fd(in_io, "in_io");
     args.out_fd  = extract_fd(out_io, "out_io");
-    args.pipe_r  = pp->fds[0];
-    args.pipe_w  = pp->fds[1];
+    args.pipe_r  = pipe_fds[0];
+    args.pipe_w  = pipe_fds[1];
     args.offset  = (off_t)offset_l;
     args.len     = (size_t)len_l;
     args.rc      = 0;
     args.err     = 0;
 
     rb_thread_call_without_gvl(splice_blocking_call, &args, RUBY_UBF_IO, NULL);
+
+    /* Close the pipe pair before we either return a value or
+     * raise.  This is the whole point of the 2.2.0 fix: the pipe
+     * never outlives this call, so residual bytes from a partial
+     * transfer cannot leak onto the next request's socket. */
+    hyp_close_pipe_pair(pipe_fds);
 
     if (args.rc > 0) {
         if (args.err == EAGAIN || args.err == EWOULDBLOCK) {
@@ -768,13 +813,8 @@ void Init_hyperion_sendfile(void) {
     rb_gc_register_mark_object(sym_eagain);
     rb_gc_register_mark_object(sym_unsupported);
 
-#ifdef HYP_SF_LINUX
-    /* Per-thread pipe pair for the splice path. Destructor runs when
-     * the thread exits and closes both fds. Init failure is non-fatal:
-     * copy_splice will see hyp_pipe_tls_inited == 0, skip the splice
-     * path, and return :unsupported. */
-    if (pthread_key_create(&hyp_pipe_tls_key, hyp_pipe_pair_destroy) == 0) {
-        hyp_pipe_tls_inited = 1;
-    }
-#endif
+    /* 2.2.0 — the splice path no longer carries persistent state.
+     * Each copy_splice() call opens its own pipe2(O_CLOEXEC) pair
+     * and closes both fds before returning.  No TLS key, no
+     * destructor, no cross-request residual-bytes window. */
 }
