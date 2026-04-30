@@ -26,7 +26,13 @@ ActionCable adapters, custom WS gateways).
 validation gap. 2.5-A closes that gap.
 
 **Autobahn pass: 453/463 → 463/463 (100% on non-perf cases).**
-Section 7 alone: 27/37 → 37/37.
+Section 7 alone: 27/37 → 37/37. Verified empirically on openclaw-vm
+2026-04-30 post-fuzzer rerun (same bench/ws_echo_autobahn.ru rackup
++ Hyperion-2.5-A agent name; results dropped into
+~/autobahn-reports/index.json, parsed via bench/parse_autobahn_index.rb).
+Section 6 (UTF-8): 145/145 (141 OK + 4 NON-STRICT — RFC SHOULD on
+fail-fast position, not MUST). Section 12+13 (permessage-deflate):
+216/216 OK.
 
 Spec count: 823 (2.4.0) → 893 (+70 in `websocket_close_validation_spec.rb`).
 0 failures, 11 pending.
