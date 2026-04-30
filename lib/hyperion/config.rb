@@ -70,7 +70,7 @@ module Hyperion
     # Nested subconfig readers. The DSL exposes them as block forms
     # (`h2 do |h| ... end`) and the legacy flat forms (`h2_max_concurrent_streams 256`)
     # both write into the same backing object.
-    attr_reader :h2, :admin, :worker_health, :logging, :tls, :websocket
+    attr_reader :h2, :admin, :worker_health, :logging, :tls, :websocket, :metrics
 
     # H2 settings subconfig. RFC 7540 §6.5.2 settings + the new-in-1.7
     # per-process `max_total_streams` admission cap (RFC A7).
@@ -159,6 +159,26 @@ module Hyperion
       end
     end
 
+    # 2.4-C: Metrics subconfig. The headline knob is `path_templater`,
+    # which collapses raw request paths to low-cardinality templates
+    # for the per-route latency histogram (operators with Rails-style
+    # routes plug in their own templater). `enabled` flips the new
+    # 2.4-C histogram/gauge surface as a whole — counters in the legacy
+    # surface (requests, bytes_read, …) keep emitting regardless.
+    class MetricsConfig
+      ATTRS = %i[path_templater enabled].freeze
+      attr_accessor(*ATTRS)
+
+      def initialize
+        @path_templater = nil # lazily defaulted to PathTemplater.new on first read
+        @enabled        = true
+      end
+
+      def path_templater
+        @path_templater ||= Hyperion::Metrics::PathTemplater.new
+      end
+    end
+
     # 2.3-B: top-level `:auto` sentinel for `max_in_flight_per_conn`.
     # `Config#finalize!` resolves to `thread_count / 4`, floor 1. Plain
     # symbol (no nested struct) because the only knob is the cap value.
@@ -239,6 +259,7 @@ module Hyperion
       @logging       = LoggingConfig.new
       @tls           = TlsConfig.new
       @websocket     = WebSocketConfig.new
+      @metrics       = MetricsConfig.new
     end
 
     HOOKS.each do |hook|
@@ -380,7 +401,7 @@ module Hyperion
       # eval'd against a BlockProxy that proxies bareword method calls
       # into the subconfig's accessors; explicit-arg form (`|h|`) gives
       # callers the proxy directly so they can pass it around.
-      %i[h2 admin worker_health logging tls websocket].each do |group|
+      %i[h2 admin worker_health logging tls websocket metrics].each do |group|
         define_method(group) do |&block|
           subconfig = @config.public_send(group)
           if block.nil?

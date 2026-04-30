@@ -654,6 +654,7 @@ module Hyperion
       # `\x00\x00\xff\xff` per RFC 7692 §7.2.1. Resets the deflater
       # context if `server_no_context_takeover` was negotiated.
       def deflate_message(bin)
+        original_size = bin.bytesize
         compressed = @deflater.deflate(bin, Zlib::SYNC_FLUSH)
         # The 4-byte trailer is the last 4 bytes of every SYNC_FLUSH
         # output; strip exactly once. If the deflater somehow produced
@@ -664,7 +665,32 @@ module Hyperion
           compressed = compressed.byteslice(0, compressed.bytesize - 4)
         end
         @deflater.reset if @server_no_takeover
+        # 2.4-C: observe the compression ratio so operators can confirm
+        # permessage-deflate is worth its CPU cost on real chat traffic.
+        # Skip the observation when the compressed payload is too small
+        # to give a meaningful ratio (degenerate empty-message case) —
+        # the histogram bucket layout starts at 1.5×, anything below
+        # that is noise.
+        observe_deflate_ratio(original_size, compressed.bytesize)
         compressed
+      end
+
+      DEFLATE_RATIO_HISTOGRAM = :hyperion_websocket_deflate_ratio
+      DEFLATE_RATIO_BUCKETS   = [1.5, 2.0, 5.0, 10.0, 20.0, 50.0].freeze
+
+      def observe_deflate_ratio(original_size, compressed_size)
+        return if compressed_size <= 0 || original_size <= 0
+
+        # Lazy-register the family on the active runtime's metrics sink.
+        # Idempotent — re-registration with the same shape is a no-op.
+        metrics = Hyperion.metrics
+        metrics.register_histogram(DEFLATE_RATIO_HISTOGRAM,
+                                   buckets: DEFLATE_RATIO_BUCKETS,
+                                   label_keys: [])
+        ratio = original_size.to_f / compressed_size
+        metrics.observe_histogram(DEFLATE_RATIO_HISTOGRAM, ratio)
+      rescue StandardError
+        nil
       end
 
       # Inflate a compressed message. Appends the 4-byte sync trailer

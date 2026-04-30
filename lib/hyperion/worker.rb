@@ -102,6 +102,17 @@ module Hyperion
       # worker until the boot hook has returned.
       @config.on_worker_boot.each { |h| h.call(@worker_index) }
 
+      # 2.4-C: register the io_uring active gauge for this worker.
+      # `Hyperion::IOUring.resolve_policy!` was already called by the
+      # Server constructor; if it returned true, this worker is using
+      # the io_uring accept path and the gauge value is 1.
+      io_uring_active = @io_uring != :off && Hyperion::IOUring.resolve_policy!(@io_uring) ? 1 : 0
+      Hyperion.metrics.set_gauge(
+        :hyperion_io_uring_workers_active,
+        io_uring_active,
+        [Process.pid.to_s]
+      )
+
       tcp_server = @listener || build_reuseport_listener
       server.adopt_listener(tcp_server)
 
@@ -112,6 +123,12 @@ module Hyperion
       begin
         server.start
       ensure
+        # 2.4-C: clear the per-worker io_uring gauge slot at shutdown
+        # so post-shutdown scrapes don't claim the policy is still
+        # active for this worker.
+        Hyperion.metrics.set_gauge(:hyperion_io_uring_workers_active,
+                                   0,
+                                   [Process.pid.to_s])
         # `on_worker_shutdown` fires when the accept loop exits — either
         # due to graceful SIGTERM or a hard error. Use it to flush metrics,
         # close DB connections cleanly, etc.

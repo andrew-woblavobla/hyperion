@@ -86,7 +86,16 @@ module Hyperion
     end
 
     def handle_metrics
-      body = PrometheusExporter.render(Hyperion.stats)
+      # 2.4-C: render the full surface — legacy counters + histograms +
+      # gauges + labeled counters. The exporter falls back to the legacy
+      # `render(stats)` body when the sink doesn't expose the new
+      # snapshot helpers (defensive: third-party Metrics adapters that
+      # quack-implement the 1.x surface still emit a valid scrape body).
+      body = if Hyperion.metrics.respond_to?(:histogram_snapshot)
+               PrometheusExporter.render_full(Hyperion.metrics)
+             else
+               PrometheusExporter.render(Hyperion.stats)
+             end
       [200, { 'content-type' => METRICS_CONTENT_TYPE }, [body]]
     end
 

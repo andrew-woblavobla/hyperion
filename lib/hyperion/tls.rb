@@ -186,6 +186,48 @@ module Hyperion
       nil
     end
 
+    # 2.4-C — gauge name for the per-worker count of active connections
+    # whose TLS_TX is currently driven by the kernel module. Exposed as
+    # a module constant so the Server (handshake-complete path) and
+    # Connection (close path) can share the same identifier without
+    # plumbing.
+    KTLS_ACTIVE_CONNECTIONS_GAUGE = :hyperion_tls_ktls_active_connections
+
+    # Mark an SSLSocket as kTLS-tracked. Bumps the worker's gauge by
+    # one. Idempotent on the same socket — calling twice is a no-op so
+    # signal-driven re-handshakes don't double-count. Returns true when
+    # the gauge was actually incremented (kTLS engaged for this peer),
+    # false otherwise.
+    def track_ktls_handshake!(ssl_socket)
+      return false unless ssl_socket
+      return false if ssl_socket.instance_variable_get(:@hyperion_ktls_tracked)
+
+      active = ktls_active?(ssl_socket)
+      return false unless active
+
+      ssl_socket.instance_variable_set(:@hyperion_ktls_tracked, true)
+      Hyperion.metrics.increment_gauge(KTLS_ACTIVE_CONNECTIONS_GAUGE,
+                                       [Process.pid.to_s])
+      true
+    rescue StandardError
+      false
+    end
+
+    # Counterpart to `track_ktls_handshake!`. Called by Connection's
+    # ensure block when a socket flagged as kTLS-tracked is closed.
+    # Idempotent.
+    def untrack_ktls_handshake!(ssl_socket)
+      return false unless ssl_socket
+      return false unless ssl_socket.instance_variable_get(:@hyperion_ktls_tracked)
+
+      ssl_socket.instance_variable_set(:@hyperion_ktls_tracked, false)
+      Hyperion.metrics.decrement_gauge(KTLS_ACTIVE_CONNECTIONS_GAUGE,
+                                       [Process.pid.to_s])
+      true
+    rescue StandardError
+      false
+    end
+
     private_class_method def linux_ktls_kernel?
       sysname = Etc.uname[:sysname]
       return false unless sysname == 'Linux'

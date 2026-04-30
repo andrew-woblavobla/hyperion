@@ -61,9 +61,22 @@ module Hyperion
       defined?(::Hyperion::CParser) ? ::Hyperion::CParser.new : ::Hyperion::Parser.new
     end
 
+    # 2.4-C — histogram bucket edges for the per-route request duration
+    # histogram. Powers-of-5 spread covers 1ms to 10s, the realistic range
+    # for any HTTP-served workload. Frozen so the same Array is reused
+    # across every Connection (cheaper hist registration, no per-conn
+    # allocation).
+    REQUEST_DURATION_BUCKETS = [0.001, 0.005, 0.025, 0.1, 0.5, 2.5, 10.0].freeze
+
+    REQUEST_DURATION_HISTOGRAM = :hyperion_request_duration_seconds
+
+    # Pre-bucketed status-class strings. Lookup `STATUS_CLASS[status / 100]`
+    # avoids `"#{n}xx"` interpolation per request.
+    STATUS_CLASS = %w[0xx 1xx 2xx 3xx 4xx 5xx 6xx 7xx 8xx 9xx].each(&:freeze).freeze
+
     def initialize(parser: self.class.default_parser, writer: ResponseWriter.new, thread_pool: nil,
                    log_requests: nil, max_body_bytes: MAX_BODY_BYTES, runtime: nil,
-                   max_in_flight_per_conn: nil)
+                   max_in_flight_per_conn: nil, path_templater: nil)
       @parser         = parser
       @writer         = writer
       @thread_pool    = thread_pool
@@ -116,6 +129,29 @@ module Hyperion
                       else
                         log_requests
                       end
+      # 2.4-C: cache the path-templater ref at construction. Reading it
+      # via Hyperion::Metrics.default_path_templater per request would
+      # add a method dispatch + a memo branch on every observation — we
+      # keep the existing pattern of caching boot-time refs as ivars so
+      # the per-request observe stays a single Hash lookup.
+      @path_templater = path_templater || Hyperion::Metrics.default_path_templater
+      register_request_duration_histogram!
+    end
+
+    # 2.4-C: register the per-route histogram family on this Connection's
+    # metrics sink. Idempotent — `Metrics#register_histogram` no-ops on
+    # re-registration with the same shape. Called once per Connection so
+    # the histogram exists before the first observe.
+    def register_request_duration_histogram!
+      @metrics.register_histogram(
+        REQUEST_DURATION_HISTOGRAM,
+        buckets: REQUEST_DURATION_BUCKETS,
+        label_keys: %w[method path status]
+      )
+    rescue StandardError
+      # Histogram registration is observability — never block a Connection
+      # from booting because the metrics sink misbehaved.
+      nil
     end
 
     # 2.1.0 (WS-1): the connection itself caches the live socket so that
@@ -226,7 +262,11 @@ module Hyperion
         @metrics.increment(:bytes_read, body_end)
         @metrics.increment(:requests_total)
         @metrics.increment(:requests_in_flight)
-        request_started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) if @log_requests
+        # 2.4-C: capture start time for the per-route duration histogram.
+        # Same Process.clock_gettime that the access-log path was already
+        # paying — at default-ON log_requests the second call here is
+        # avoided (we reuse `request_started_at`).
+        request_started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         # 2.3-B per-conn fairness gate. Returns true when the slot was
         # reserved (caller must release in ensure), false when the cap
         # was hit and a 503 was emitted. nil cap → admit always (hot
@@ -272,6 +312,12 @@ module Hyperion
         @writer.write(socket, status, headers, body, keep_alive: keep_alive)
         @metrics.increment_status(status)
         log_request(request, status, request_started_at) if @log_requests
+        # 2.4-C: per-route duration histogram observation. Templating the
+        # path (e.g. `/users/123` → `/users/:id`) keeps cardinality
+        # bounded; the templater itself is LRU-cached so the cost on a
+        # repeated path is one Hash#[] + one Hash re-insert. We swallow
+        # any exception — observability must never block a response.
+        observe_request_duration(request, status, request_started_at)
         request_count += 1
 
         return unless keep_alive
@@ -305,6 +351,10 @@ module Hyperion
       # fiber exits. Skip the close branch entirely; the app is the sole
       # closer from this point on.
       unless @hijacked
+        # 2.4-C: drop the per-worker kTLS gauge for this socket if it
+        # was tracked at handshake time. No-op for plain TCP and for
+        # TLS-without-kTLS sockets.
+        Hyperion::TLS.untrack_ktls_handshake!(socket) if defined?(Hyperion::TLS)
         begin
           socket.close unless socket.closed?
         rescue StandardError
@@ -335,6 +385,12 @@ module Hyperion
       return true if admitted
 
       @metrics.increment(:per_conn_overload_rejects)
+      # 2.4-C: also feed the labeled counter so operators can break
+      # rejections down per worker (one row per worker_id at scrape
+      # time) without losing the legacy unlabeled counter for back-
+      # compat dashboards.
+      @metrics.increment_labeled_counter(:hyperion_per_conn_rejections_total,
+                                         [Process.pid.to_s])
       @metrics.increment_status(503)
       unless @overload_warned
         @logger.warn do
@@ -696,6 +752,28 @@ module Hyperion
         request.peer_address,
         request.http_version
       )
+    end
+
+    # 2.4-C — observe one sample on the per-route request-duration
+    # histogram. Best-effort: a misbehaving templater or sink degrades
+    # silently to no observation. The label tuple Array is fresh per
+    # call (3 small Strings) — that's the only allocation cost the
+    # observation imposes on the response path. Histogram observation
+    # itself reuses the per-(name, labels_tuple) accumulator after the
+    # first samples for a given templated path, so steady-state per-
+    # route observations are zero-allocation past the tuple Array.
+    def observe_request_duration(request, status, started_at)
+      duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+      method   = request.method
+      template = @path_templater.template(request.path)
+      class_ = STATUS_CLASS[status / 100] || STATUS_CLASS[0]
+      @metrics.observe_histogram(
+        REQUEST_DURATION_HISTOGRAM,
+        duration,
+        [method, template, class_]
+      )
+    rescue StandardError
+      nil
     end
   end
 end

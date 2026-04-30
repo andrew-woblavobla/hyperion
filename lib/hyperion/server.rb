@@ -529,6 +529,10 @@ module Hyperion
         ssl.sync_close = true
         ssl.accept # blocks; under Async this yields cooperatively via the scheduler
         log_ktls_state_once(ssl)
+        # 2.4-C: bump the per-worker active-kTLS-connections gauge if
+        # the kernel module accepted this connection. Connection#serve
+        # decrements on close.
+        Hyperion::TLS.track_ktls_handshake!(ssl)
         ssl
       else
         socket, = listening_io.accept_nonblock
@@ -551,6 +555,7 @@ module Hyperion
         ssl.sync_close = true
         ssl.accept
         log_ktls_state_once(ssl)
+        Hyperion::TLS.track_ktls_handshake!(ssl)
         ssl
       else
         socket, = @server.accept

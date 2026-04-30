@@ -43,6 +43,25 @@ module Hyperion
       @reply_pool = Queue.new
       size.times { @reply_pool << Queue.new }
       @workers = Array.new(size) { spawn_worker }
+      # 2.4-C: snapshot-time gauge — operator scrape sees the live
+      # inbox depth as of /-/metrics scrape, not a stale-since-init
+      # number. The block reads `Queue#size` (cheap, lock-free) so the
+      # scrape path doesn't perturb the running pool.
+      register_queue_depth_gauge!
+    end
+
+    THREADPOOL_QUEUE_DEPTH_GAUGE = :hyperion_threadpool_queue_depth
+
+    def queue_size
+      @inbox.size
+    end
+
+    def register_queue_depth_gauge!
+      Hyperion.metrics.set_gauge(THREADPOOL_QUEUE_DEPTH_GAUGE,
+                                 nil,
+                                 [Process.pid.to_s]) { @inbox.size }
+    rescue StandardError
+      nil
     end
 
     # HTTP/1.1 path: hand the whole socket to a worker thread. The worker
