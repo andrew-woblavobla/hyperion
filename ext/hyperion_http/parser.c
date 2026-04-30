@@ -1235,4 +1235,17 @@ void Init_hyperion_http(void) {
      * link arrangement as sendfile. */
     extern void Init_hyperion_websocket(void);
     Init_hyperion_websocket();
+
+    /* 2.4-A (2.4.0) — sibling C unit owns Hyperion::H2Codec::CGlue.
+     * Direct C → Rust HPACK encode/decode bridge that bypasses the
+     * Fiddle layer on the per-call hot path. Defines the v3 ABI;
+     * Ruby's H2Codec::Encoder/Decoder dispatch through CGlue when
+     * `available?` returns true and fall back to the v2 (Fiddle) path
+     * transparently otherwise. The `dlopen` of the Rust cdylib is
+     * deferred to `H2Codec.load!`'s call to `CGlue.install(path)` —
+     * we don't want to probe the filesystem from Init time because
+     * the Rust crate may not have built (no cargo on host) and a
+     * fail-fast crash here would break parser.c entirely. */
+    extern void Init_hyperion_h2_codec_glue(void);
+    Init_hyperion_h2_codec_glue();
 }

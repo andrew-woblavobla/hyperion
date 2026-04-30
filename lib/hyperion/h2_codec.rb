@@ -34,10 +34,22 @@ module Hyperion
       @available == true
     end
 
+    # 2.4-A — has the C glue (`Hyperion::H2Codec::CGlue`) loaded AND
+    # successfully resolved the Rust HPACK symbols via dlopen/dlsym?
+    # Distinct from `available?` because CGlue can fail to load (older
+    # systems without dlfcn, hardened sandboxes blocking dlopen) while
+    # the Fiddle path still works. When this is true the per-call
+    # encode/decode hot path bypasses Fiddle entirely.
+    def self.cglue_available?
+      load!
+      @cglue_available == true
+    end
+
     # Force a reload (test seam). Unsets the memoized state so the next
     # `available?` call probes the filesystem again.
     def self.reset!
       @available = nil
+      @cglue_available = nil
       @lib = nil
     end
 
@@ -105,6 +117,47 @@ module Hyperion
       def encode(headers)
         return ''.b if headers.empty?
 
+        # 2.4-A — fast path: when the C glue loaded successfully,
+        # bypass Fiddle entirely. The C ext walks the headers array,
+        # builds the argv quad buffer on the C stack, and calls
+        # `hyperion_h2_codec_encoder_encode_v2` directly via a cached
+        # function pointer. The only Ruby allocation per call is the
+        # final `byteslice(0, written)` which copies the encoded bytes
+        # into a new owned String — that's the contract callers rely
+        # on (`protocol-http2`'s Compressor#encode returns a String,
+        # not a slice into shared mutable memory).
+        if H2Codec.cglue_available?
+          # Pad the scratch String with zero bytes so its length matches
+          # capacity — the C ext writes into RSTRING_PTR up to RSTRING_LEN
+          # and then truncates back via rb_str_set_len after encoding.
+          # The first encode pads the full SCRATCH_OUT_DEFAULT (16 KiB);
+          # subsequent calls find the length already at capacity and
+          # skip the pad entirely. On the rare oversize-frame case we
+          # catch OutputOverflow, grow, and retry — much cheaper than
+          # paying a per-call worst-case computation.
+          if @scratch_out.bytesize < @scratch_out_capacity
+            @scratch_out << ("\x00".b * (@scratch_out_capacity - @scratch_out.bytesize))
+          end
+          written = nil
+          loop do
+            written = H2Codec::CGlue.encoder_encode_v3(@ptr.to_i, headers, @scratch_out)
+            break
+          rescue H2Codec::OutputOverflow
+            # Frame exceeded the running scratch capacity — double
+            # and retry. The grown scratch persists for subsequent
+            # calls so this is a one-time tax per encoder lifetime
+            # (per oversized frame size class).
+            @scratch_out_capacity *= 2
+            @scratch_out = String.new(capacity: @scratch_out_capacity, encoding: Encoding::ASCII_8BIT)
+            @scratch_out << ("\x00".b * @scratch_out_capacity)
+          end
+          # Single allocation: copy the encoded bytes out into an owned
+          # String. byteslice on a binary String returns a new
+          # ASCII-8BIT String of exactly `written` bytes.
+          return @scratch_out.byteslice(0, written)
+        end
+
+        # v2 (Fiddle) fallback — kept verbatim from fix-B (2.2.x).
         # 1) Reset scratch buffers (length 0, capacity retained).
         @scratch_blob.clear
         argv_ints = @scratch_argv_ints
@@ -189,11 +242,17 @@ module Hyperion
     # Ruby-friendly decoder wrapper. `#decode(bytes)` → array of
     # [name, value] byte pairs.
     class Decoder
+      DECODER_SCRATCH_DEFAULT = 16_384
+      private_constant :DECODER_SCRATCH_DEFAULT
+
       def initialize
         raise 'H2Codec native library unavailable' unless H2Codec.available?
 
         @ptr = H2Codec.decoder_new
         ObjectSpace.define_finalizer(self, self.class.finalizer(@ptr))
+        # 2.4-A — per-decoder reusable scratch buffer for the v3 path.
+        @scratch_out = String.new(capacity: DECODER_SCRATCH_DEFAULT, encoding: Encoding::ASCII_8BIT)
+        @scratch_out_capacity = DECODER_SCRATCH_DEFAULT
       end
 
       def self.finalizer(ptr)
@@ -209,6 +268,29 @@ module Hyperion
         # — a single-bit Huffman input can decode to 8 bits but
         # adding the framing bytes per pair makes 8x conservative.
         capacity = (bytes.bytesize * 8) + 4096
+
+        # 2.4-A — fast path: reuse a per-decoder scratch and dispatch
+        # through the C glue. The Rust ABI writes `[u32 name_len][name]
+        # [u32 val_len][val]` repeated; we unpack that in Ruby.
+        if H2Codec.cglue_available?
+          if capacity > @scratch_out_capacity
+            new_cap = @scratch_out_capacity
+            new_cap *= 2 while new_cap < capacity
+            @scratch_out = String.new(capacity: new_cap, encoding: Encoding::ASCII_8BIT)
+            @scratch_out_capacity = new_cap
+          end
+          # Pad the scratch to its full capacity so RSTRING_LEN ==
+          # @scratch_out_capacity inside the C ext (the ext reads
+          # RSTRING_LEN to know the writable region size).
+          if @scratch_out.bytesize < @scratch_out_capacity
+            @scratch_out << ("\x00".b * (@scratch_out_capacity - @scratch_out.bytesize))
+          end
+          written = H2Codec::CGlue.decoder_decode_v3(@ptr.to_i, bytes, @scratch_out)
+          return [] if written.zero?
+
+          return unpack_headers(@scratch_out.byteslice(0, written))
+        end
+
         out = (+'').b
         out.force_encoding(Encoding::ASCII_8BIT)
         out << ("\x00".b * capacity)
@@ -294,12 +376,38 @@ module Hyperion
                                               Fiddle::TYPE_INT)
 
       @available = true
+
+      # 2.4-A — try to install the C glue with the same path the
+      # Fiddle loader just used. CGlue is defined by the bundled C
+      # extension (`hyperion_http/hyperion_http.bundle`); if that
+      # extension didn't compile or the dlopen fails, `@cglue_available`
+      # stays nil and Encoder/Decoder transparently fall back to the
+      # v2 (Fiddle) path. No warning on this branch — it's purely a
+      # perf optimization, not a correctness gate.
+      install_cglue(path)
     rescue Fiddle::DLError, StandardError => e
       warn "[hyperion] H2Codec failed to load (#{e.class}: #{e.message}); using Ruby fallback"
       @lib = nil
       @available = false
+      @cglue_available = false
     end
     # rubocop:enable Metrics/MethodLength
+
+    # 2.4-A — wire the C extension's dlopen-based path. We require the
+    # bundled C extension (already loaded by `c_parser.rb` at gem boot
+    # in normal use, but we guard the constant lookup in case someone
+    # required `hyperion/h2_codec` directly without the C ext). Returns
+    # true iff CGlue is now installed and `encoder_encode_v3` is safe
+    # to call.
+    def self.install_cglue(path)
+      @cglue_available = false
+      return unless defined?(Hyperion::H2Codec::CGlue)
+      return unless Hyperion::H2Codec::CGlue.respond_to?(:install)
+
+      @cglue_available = Hyperion::H2Codec::CGlue.install(path) ? true : false
+    rescue StandardError
+      @cglue_available = false
+    end
 
     def self.candidate_paths
       gem_lib = File.expand_path('../hyperion_h2_codec', __dir__)

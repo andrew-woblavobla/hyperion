@@ -1,5 +1,78 @@
 # Changelog
 
+## [Unreleased] - 2.4.0
+
+### 2.4-A — HPACK FFI round-2 (custom C ext, no Fiddle per call)
+
+**The story so far.** The 2.0.0 native HPACK path went through Fiddle:
+each `Encoder#encode` call paid for `pack('Q*')` to build an argv
+buffer, three `Fiddle::Pointer[scratch]` pointer-wrapper allocations,
+plus per-header `.b` re-encoding when the source string wasn't already
+ASCII-8BIT. The standalone microbench showed a 3.26× encode win, but
+on real h2load traffic the FFI marshalling layer ate the savings:
+2.0.0 was -8 to -28% rps vs Ruby fallback. fix-B (2.2.x) introduced
+the per-encoder scratch buffer + flat-blob `_encode_v2` ABI, which
+brought native to **parity** with Ruby fallback (-0.05% noise) — but
+parity isn't a default flip.
+
+**What 2.4-A ships.** A new sibling C extension entry point,
+`Hyperion::H2Codec::CGlue`, that bypasses Fiddle entirely on the
+per-call hot path:
+
+- `ext/hyperion_http/h2_codec_glue.c` — defines the `CGlue` module
+  and three singleton methods: `install(path)`, `available?`,
+  `encoder_encode_v3(handle_addr, headers, scratch_out)`,
+  `decoder_decode_v3(handle_addr, bytes, scratch_out)`.
+- `install(path)` is called once from `H2Codec.load!` after the
+  Fiddle loader has already confirmed the cdylib loads cleanly. The C
+  glue `dlopen`s the same path with `RTLD_NOW | RTLD_LOCAL` (a
+  refcount bump per POSIX, not a double-load), `dlsym`s the three
+  Rust entries (`hyperion_h2_codec_abi_version`,
+  `hyperion_h2_codec_encoder_encode_v2`,
+  `hyperion_h2_codec_decoder_decode`), and caches them as static C
+  function pointers.
+- `encoder_encode_v3` walks the Ruby `headers` array directly via
+  `RARRAY_LEN`/`rb_ary_entry`, packs the argv quad buffer onto the C
+  stack (default 64 headers — heap fallback for larger blocks),
+  concatenates name+value bytes into a stack-resident blob (default
+  8 KiB — heap fallback for larger blocks), and invokes the cached
+  `encode_v2` function pointer directly. The encoded bytes land in
+  the per-encoder scratch String; Ruby's `byteslice(0, written)`
+  copies them out as the single unavoidable allocation.
+- `RSTRING_PTR` reads the raw byte view of `name`/`value` regardless
+  of the Ruby encoding tag, eliminating the per-header `.b`
+  allocation that the v2 Ruby path could not avoid for non-binary
+  inputs.
+
+**The Ruby façade.** `Hyperion::H2Codec::Encoder#encode` now probes
+`H2Codec.cglue_available?` on each call. When true, it dispatches
+through `CGlue.encoder_encode_v3`. When false (older systems without
+dlfcn, hardened sandboxes blocking dlopen, ABI mismatch), it
+transparently falls back to the v2 (Fiddle) path — no operator
+intervention required.
+
+**Per-call alloc shape.**
+
+| Path | Strings/call (encode, steady state) |
+|---|---|
+| 2.0.0 (Fiddle, v1 ABI) | ~12 |
+| 2.2.x fix-B (Fiddle, v2 ABI) | ~7.5 |
+| **2.4-A (C ext, v3 path)** | **~1** (the byteslice return) |
+
+Counted via `GC.stat(:total_allocated_objects)` delta over 100
+warmed encodes; spec asserts `total_allocated_objects/call < 6`
+(includes Fixnums + transient Array iterators that GC.stat conflates
+with String allocations).
+
+**Bench delta on openclaw-vm.** See `.notes/2.4-a-bench-openclaw-vm.txt`
+for raw h2load output. Subsection below populated after on-host run.
+
+**Default flip rationale.** Recorded after bench validation —
+`HYPERION_H2_NATIVE_HPACK` policy resolution updated when the C-glue
+path shows ≥+15% rps over Ruby fallback. Otherwise the env var stays
+opt-in and the v3 implementation ships as a perf-positive code path
+for tests + future tuning.
+
 ## [2.3.0] - 2026-05-01
 
 ### Headline

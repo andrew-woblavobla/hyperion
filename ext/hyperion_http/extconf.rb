@@ -17,6 +17,7 @@ $srcs = %w[
   parser.c
   sendfile.c
   websocket.c
+  h2_codec_glue.c
   llhttp.c
   api.c
   http.c
@@ -33,5 +34,13 @@ $CFLAGS << ' -O2 -fno-strict-aliasing'
 have_header('sys/sendfile.h') # Linux: sendfile64
 have_header('sys/uio.h')      # BSD/Darwin sendfile + Linux iovec plumbing
 have_header('sys/socket.h')
+
+# 2.4-A: h2_codec_glue.c calls dlopen/dlsym to wire the Rust HPACK
+# cdylib without going through Fiddle on the per-call hot path. macOS
+# ships dlopen in libSystem (no extra link flag needed); Linux glibc
+# requires `-ldl` (musl rolls dlopen into libc, but `have_library`
+# returns true on both because the symbol resolves either way).
+have_header('dlfcn.h')
+have_library('dl', 'dlopen')
 
 create_makefile('hyperion_http/hyperion_http')
