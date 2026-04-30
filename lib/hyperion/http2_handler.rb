@@ -6,6 +6,8 @@ require 'protocol/http2/server'
 require 'protocol/http2/framer'
 require 'protocol/http2/stream'
 
+require_relative 'http2/native_hpack_adapter'
+
 module Hyperion
   # Real HTTP/2 dispatch driven by `protocol-http2`.
   #
@@ -419,16 +421,30 @@ module Hyperion
     #                       per-process stream cap (RFC A7). nil keeps
     #                       the 1.6.x unbounded behaviour.
     #
-    # 2.0.0 (Phase 6b) probes `Hyperion::H2Codec.available?` at
-    # construction so the handler knows whether the native HPACK path
-    # is operational. The connection state machine continues to be
-    # driven by `protocol-http2`'s framer + HPACK Compressor /
-    # Decompressor (battle-tested, RFC-conformant); the native codec
-    # is exposed as `Hyperion::H2Codec::Encoder` / `Decoder` for direct
-    # use, and a future Phase 6c will splice it into the framer's
-    # encode/decode hot paths once the protocol-http2 abstraction
-    # boundary is unified. The probe + boot log makes the swap state
-    # observable now.
+    # 2.0.0 (Phase 6b) probed `Hyperion::H2Codec.available?` at
+    # construction so the handler knew whether the native HPACK path
+    # was operational, but the connection state machine still drove
+    # encode/decode through `protocol-http2`'s pure-Ruby Compressor /
+    # Decompressor.
+    #
+    # 2.2.0 (Phase 10 / RFC §3 Phase 6c) ships the wiring infrastructure:
+    # {Hyperion::Http2::NativeHpackAdapter} + {#install_native_hpack}
+    # replace the per-connection HPACK encode/decode boundary with
+    # the Rust crate when AND ONLY WHEN both:
+    #   1. `Hyperion::H2Codec.available?` is true (cdylib loaded), AND
+    #   2. `ENV['HYPERION_H2_NATIVE_HPACK']` is one of `1`/`true`/`yes`/`on`.
+    #
+    # The default is OFF because local h2load benchmarking on macOS
+    # showed the Fiddle FFI per-call marshalling overhead dominates
+    # for typical 3–8-header HEADERS frames — the standalone microbench's
+    # 3.26× encode win does not translate to wire wins until the FFI
+    # marshalling layer is rewritten to amortize allocation. Keeping the
+    # default OFF preserves 2.0.0/2.1.0 behavior; flipping the env var
+    # gives operators the swap they want to A/B test in their own env.
+    # The framer + stream state machine + flow control + HEADERS /
+    # CONTINUATION framing all stay in `protocol-http2`; only the
+    # HPACK byte-pump is replaced when the swap is enabled. Frame ser/de
+    # in Rust (Phase 6d) is a separate, larger lift.
     def initialize(app:, thread_pool: nil, h2_settings: nil, runtime: nil, h2_admission: nil)
       @app          = app
       @thread_pool  = thread_pool
@@ -443,9 +459,36 @@ module Hyperion
         @metrics = Hyperion.metrics
         @logger  = Hyperion.logger
       end
-      @h2_admission     = h2_admission
-      @h2_codec_native  = Hyperion::H2Codec.available?
+      @h2_admission       = h2_admission
+      @h2_codec_available = Hyperion::H2Codec.available?
+      # Phase 10 (Phase 6c, 2.2.0): wire the native HPACK adapter into
+      # the per-connection HPACK boundary, but ONLY when the operator
+      # opts in via `HYPERION_H2_NATIVE_HPACK=1`. The default is OFF
+      # because local benchmarking on macOS showed Fiddle FFI per-call
+      # marshalling overhead (Pointer[] allocation, pack('Q*'), output
+      # buffer pre-fill) outweighs the encode/decode CPU savings on
+      # the typical 3–8-header HEADERS frame. The infrastructure is
+      # in place; flip the env var when:
+      #   * The Ruby-side FFI marshalling layer in `H2Codec::Encoder#encode`
+      #     is rewritten to amortize allocation across calls (a follow-up
+      #     phase), or
+      #   * Your host is Linux with high-FFI-throughput cargo cult
+      #     (asdf-installed cargo or a glibc that aligns FFI calls
+      #     differently from macOS BSD libc).
+      # When OFF: `protocol-http2`'s pure-Ruby HPACK Compressor /
+      # Decompressor handles everything as in 2.0.0/2.1.0.
+      @h2_native_hpack_enabled = @h2_codec_available && env_flag_enabled?('HYPERION_H2_NATIVE_HPACK')
+      @h2_codec_native = @h2_native_hpack_enabled # back-compat ivar — preserved for codec_native? readers
       record_codec_boot_state
+    end
+
+    # Read an env-var flag with the usual truthiness rules (any of
+    # 1/true/yes/on, case-insensitive). Anything else → false.
+    def env_flag_enabled?(name)
+      v = ENV[name]
+      return false if v.nil? || v.empty?
+
+      %w[1 true yes on].include?(v.downcase)
     end
 
     # 2.0.0 Phase 6b: emit a single-shot boot log line per process
@@ -456,24 +499,44 @@ module Hyperion
       return if Hyperion::Http2Handler.instance_variable_get(:@codec_state_logged)
 
       Hyperion::Http2Handler.instance_variable_set(:@codec_state_logged, true)
-      mode = @h2_codec_native ? 'native (Rust)' : 'fallback (protocol-http2)'
+      mode =
+        if @h2_native_hpack_enabled
+          'native (Rust) — HPACK on hot path'
+        elsif @h2_codec_available
+          'fallback (protocol-http2 / pure Ruby HPACK) — native available, opt-in via HYPERION_H2_NATIVE_HPACK=1'
+        else
+          'fallback (protocol-http2 / pure Ruby HPACK) — native unavailable'
+        end
       @logger.info do
         {
           message: 'h2 codec selected',
           mode: mode,
-          native_available: @h2_codec_native
+          native_available: @h2_codec_available,
+          native_enabled: @h2_native_hpack_enabled,
+          hpack_path: @h2_native_hpack_enabled ? 'native' : 'pure-ruby'
         }
       end
-      @metrics.increment(:h2_codec_native_selected) if @h2_codec_native
-      @metrics.increment(:h2_codec_fallback_selected) unless @h2_codec_native
+      @metrics.increment(:h2_codec_native_selected) if @h2_native_hpack_enabled
+      @metrics.increment(:h2_codec_fallback_selected) unless @h2_native_hpack_enabled
     end
 
     # Read-only accessor used by tests + diagnostics. true = the
-    # `Hyperion::H2Codec` Rust extension loaded successfully and is
-    # available for direct encode/decode calls. The wire path itself
-    # may still route through `protocol-http2` until Phase 6c.
+    # `Hyperion::H2Codec` Rust extension loaded successfully AND
+    # `HYPERION_H2_NATIVE_HPACK=1` is set, so `build_server` will
+    # wire the native adapter onto every new connection's
+    # `encode_headers` / `decode_headers` boundary. The 2.2.0 default
+    # is false (opt-in) — see `#initialize` for the rationale and the
+    # bench numbers in CHANGELOG/docs that pinned the default off.
     def codec_native?
-      @h2_codec_native
+      @h2_native_hpack_enabled
+    end
+
+    # True when the Rust crate loaded successfully, regardless of
+    # whether the operator opted in to wiring it into the wire path.
+    # Useful for diagnostics/health endpoints that want to surface
+    # "native is available but currently disabled".
+    def codec_available?
+      @h2_codec_available
     end
 
     def serve(socket)
@@ -632,6 +695,7 @@ module Hyperion
 
     def build_server(framer)
       server = ::Protocol::HTTP2::Server.new(framer)
+      install_native_hpack(server) if @h2_native_hpack_enabled
       server.define_singleton_method(:accept_stream) do |stream_id, &block|
         unless valid_remote_stream_id?(stream_id)
           raise ::Protocol::HTTP2::ProtocolError, "Invalid stream id: #{stream_id}"
@@ -644,6 +708,53 @@ module Hyperion
         end
       end # quiet rubocop unused-warning placeholder; not actually returned
       server
+    end
+
+    # Phase 10 (Phase 6c): swap the per-connection HPACK encode/decode
+    # entry points to route through the Rust crate. We replace
+    # `encode_headers` / `decode_headers` on the `Protocol::HTTP2::Server`
+    # instance via singleton methods — protocol-http2's framer + stream
+    # state machine call `connection.encode_headers(headers, buffer)` and
+    # `connection.decode_headers(data)` whenever HEADERS / CONTINUATION
+    # frames cross the wire, so this is exactly the boundary where the
+    # native codec slots in. The adapter holds one Encoder + one Decoder
+    # for this connection; their dynamic tables persist across all
+    # HEADERS frames in their respective directions, matching RFC 7541's
+    # per-direction HPACK context model.
+    #
+    # The Ruby `@encoder` / `@decoder` Context ivars on the
+    # `Protocol::HTTP2::Connection` superclass remain in place but are
+    # never consulted — the singleton-method overrides shortcut past
+    # them. That's safe: protocol-http2 only touches those Contexts
+    # through `encode_headers` / `decode_headers`, which we now own.
+    #
+    # If the substitution surface ever shifts in protocol-http2 (e.g.
+    # a future version inlines the call), this method becomes a no-op
+    # safely — `define_singleton_method` doesn't fail when the parent
+    # method is absent, but downstream calls would. The codec-boot log
+    # makes the substitution observable, so a regression would surface
+    # quickly via the integration spec.
+    def install_native_hpack(server)
+      adapter = Hyperion::Http2::NativeHpackAdapter.new
+      server.define_singleton_method(:encode_headers) do |headers, buffer = String.new.b|
+        adapter.encode_headers(headers, buffer)
+      end
+      server.define_singleton_method(:decode_headers) do |data|
+        adapter.decode_headers(data)
+      end
+      # Stash the adapter so introspection (and the encode-mutex synchronisation
+      # boundary, since adapter state is mutated under it) can reach it.
+      server.instance_variable_set(:@hyperion_native_hpack, adapter)
+      adapter
+    rescue StandardError => e
+      # Defence in depth: if the adapter ctor fails for any reason, log and
+      # fall back to protocol-http2's Ruby Compressor/Decompressor. Better
+      # than crashing the connection on first HEADERS frame.
+      @logger.warn do
+        { message: 'h2 native hpack install failed; falling back to Ruby HPACK',
+          error: e.class.name, detail: e.message }
+      end
+      nil
     end
 
     def dispatch_stream(stream, writer_ctx, peer_addr = nil)

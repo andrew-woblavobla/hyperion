@@ -2,6 +2,92 @@
 
 ## [Unreleased] - 2.2.0
 
+### Phase 10 — Rust HPACK wired into the HTTP/2 hot path (Phase 6c from the 2.0 RFC)
+
+The Rust HPACK encoder/decoder shipped in 2.0.0 sat behind
+`Hyperion::H2Codec::{Encoder,Decoder}` but the wire path still routed
+HPACK through `protocol-http2`'s pure-Ruby `Compressor`/`Decompressor`.
+Phase 10 closes that gap with an adapter shim and a per-connection swap.
+
+* **`Hyperion::Http2::NativeHpackAdapter`** (`lib/hyperion/http2/native_hpack_adapter.rb`)
+  — wraps one `H2Codec::Encoder` + one `H2Codec::Decoder`, exposing
+  `#encode_headers(headers, buffer)` and `#decode_headers(bytes)` —
+  exactly the surface `Protocol::HTTP2::Connection` calls when HEADERS /
+  CONTINUATION frames cross the wire. The adapter holds per-connection
+  HPACK state (RFC 7541 dynamic table per direction) for the lifetime
+  of one h2 connection.
+* **Substitution mechanism (Option A — per-connection swap).**
+  `Http2Handler#build_server` constructs the `Protocol::HTTP2::Server`
+  and, when the swap is enabled, overrides `encode_headers` and
+  `decode_headers` on the server instance via `define_singleton_method`,
+  routing both through the adapter. Protocol-http2's framer, stream
+  state machine, flow control, and HEADERS/CONTINUATION framing all
+  remain untouched — only the HPACK byte-pump is replaced. Frame
+  ser/de in Rust is **deferred to a future Phase 6d**.
+* **Rust encoder gained dynamic-table search.** Previously the encoder
+  added entries to the dynamic table (path 2/3) but never consulted
+  them on subsequent calls — every header was re-emitted as a literal.
+  That made wire bytes ~6× bigger than `protocol-hpack`'s output on
+  repeated headers, swamping any FFI win. The encoder now searches
+  the dynamic table for full and name-only matches before falling
+  through to literal-with-incremental-indexing for novel names. After
+  the fix, native + fallback produce identically-compressed wire bytes
+  (`space savings 93.74%` vs `93.75%` on h2load `/`). The change is
+  gated by 6 Rust unit tests (`cargo test`) which all stay green.
+* **Wholly-novel names** now go through "literal with incremental
+  indexing" (prefix `0x40`) instead of "literal without indexing"
+  (`0x00`), so future repeats can collapse via dynamic-table lookup.
+  Both encodings are RFC 7541-conformant; existing decoders accept
+  both. The `h2_codec_spec` parity test was updated to match.
+* **Opt-in default.** Local h2load benchmarking on macOS (M-series,
+  `-c 1 -m 100 -n 5000`, hello.ru, 1 worker, `-t 64`) showed:
+  | Workload | 2.1.0 baseline (Ruby HPACK only) | 2.2.0 default (env unset) | 2.2.0 native (`HYPERION_H2_NATIVE_HPACK=1`) |
+  |---|---:|---:|---:|
+  | h2 GET hello | n/a (different host) | **9,740 r/s** | 7,418 r/s |
+  | h2 POST `h2_post.ru` `-d 1 KiB` | n/a | **8,007 r/s** | 7,350 r/s |
+  | h2 headers-heavy | n/a | **8,742 r/s** | 6,312 r/s |
+  Native is ~10–25% slower on this host *despite* the standalone
+  microbench's 3.26× encode / 1.98× decode wins. Root cause: per-
+  HEADERS-frame Fiddle FFI marshalling overhead (`Fiddle::Pointer[]`
+  per header, `pack('Q*')` × 4, capacity-byte output buffer pre-fill,
+  `byteslice`) outweighs the encode/decode CPU savings when the
+  typical frame carries 3–8 small headers. The microbench measured a
+  tight loop over many headers in one call, which doesn't model real
+  h2 traffic.
+  Until the FFI marshalling layer is rewritten to amortize allocation
+  (a follow-up phase), the wiring ships **opt-in** behind
+  `ENV['HYPERION_H2_NATIVE_HPACK']` (accepts `1`/`true`/`yes`/`on`,
+  case-insensitive). Default is OFF — bytewise identical 2.0.0/2.1.0
+  behavior, no surprise regression for upgraders. Operators who want
+  to A/B test on Linux (where FFI cost may differ) can flip the env
+  var and watch their own dashboards.
+* **Boot log** — `Http2Handler` records a single-shot `h2 codec selected`
+  info line with `mode`, `native_available`, `native_enabled`, and
+  `hpack_path` so the substitution state is observable. Three modes:
+  `native (Rust) — HPACK on hot path`,
+  `fallback (...) — native available, opt-in via HYPERION_H2_NATIVE_HPACK=1`,
+  and `fallback (...) — native unavailable`.
+* **`Http2Handler#codec_native?`** now reflects the wired-on state
+  (available AND opt-in), and `Http2Handler#codec_available?` reports
+  the crate-loaded state. Both surfaces stay green for diagnostics.
+* **Specs** — `spec/hyperion/http2_native_hpack_spec.rb` adds 14
+  examples covering: encode/decode parity (200 randomized header
+  sets, both directions, native ↔ Ruby decoders cross-check),
+  stateful dynamic-table behavior across 3 successive blocks, and
+  Http2Handler integration in three states (env-on swap installed,
+  available-but-env-unset no-swap, unavailable no-swap). Spec count
+  **646 → 660** (12 new + 2 reframed).
+* **`SSH/openclaw-vm` bench reproduction NOT performed** — the bench
+  host was offline (port 22 refused) for the duration of this work,
+  so the 2.1.0 row-10 baseline (1,597 r/s) couldn't be reproduced
+  side-by-side. The macOS local numbers above are the substitute. If
+  Linux/openclaw shows a different verdict on `HYPERION_H2_NATIVE_HPACK=1`,
+  the env-var gate makes that operator-flippable without a re-release.
+
+Out of scope for Phase 10 (deferred to a future phase): Rust frame
+ser/de (parallel framer state machine — Phase 6d), Ruby-side FFI
+allocation amortization, opt-in default flip.
+
 ### Phase 9 — kernel TLS (KTLS_TX) on Linux
 
 `OP_ENABLE_KTLS` is now flipped on the SSL context after a Linux-kernel

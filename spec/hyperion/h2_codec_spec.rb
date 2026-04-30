@@ -31,11 +31,17 @@ RSpec.describe Hyperion::H2Codec, if: Hyperion::H2Codec.available? do
       expect(bytes).to include('example.com')
     end
 
-    it 'encodes a fully-novel name as a literal-without-indexing block' do
+    it 'encodes a fully-novel name as a literal-with-incremental-indexing block' do
+      # Phase 10 (2.2.0): novel names now go through "literal with
+      # incremental indexing" (prefix 0x40 with 6-bit zero index +
+      # literal name + literal value) instead of "literal without
+      # indexing" (0x00). The wire format is RFC 7541-compliant in
+      # both shapes but indexing makes repeats collapse to a 1-byte
+      # reference, which closes the bench gap with protocol-hpack's
+      # Ruby Compressor.
       enc = described_class.new
       bytes = enc.encode([%w[x-hyperion-test yes]])
-      # 0x00 + lit name + lit value
-      expect(bytes.bytes.first).to eq(0x00)
+      expect(bytes.bytes.first).to eq(0x40)
       expect(bytes).to include('x-hyperion-test')
       expect(bytes).to include('yes')
     end

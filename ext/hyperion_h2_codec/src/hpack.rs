@@ -3,10 +3,14 @@
 //! Scope:
 //! - Static table (61 entries from RFC 7541 Appendix A).
 //! - Indexed Header Field encoding when name+value match a static slot.
+//! - Indexed Header Field encoding when name+value match a *dynamic*
+//!   slot (Phase 10, RFC §3 Phase 6c) — closes the wire-bytes gap
+//!   with protocol-hpack on repeated headers, which is what makes
+//!   wiring the codec into the hot path actually faster.
 //! - Indexed-Name + Literal Value with incremental indexing (`0x40`)
-//!   when name matches a static slot.
-//! - Literal Header Field without indexing (`0x00`) for fully-novel
-//!   names. We deliberately do NOT emit Huffman-encoded strings — h2
+//!   when name matches a static OR dynamic slot, AND for wholly-novel
+//!   names (so future repeats hit the indexed path).
+//! - We deliberately do NOT emit Huffman-encoded strings — h2
 //!   conformance allows raw octets and the wire-size win on
 //!   server-side response headers is small (<10% on real workloads).
 //!
@@ -16,9 +20,7 @@
 //! embedded inline in `huffman.rs`.
 //!
 //! Dynamic table: maintained per-encoder/per-decoder, default 4096
-//! bytes (RFC 7541 §6.5). Operators that want to disable indexing can
-//! ask the encoder for a "literal-only" mode (not yet exposed at the
-//! FFI level — Phase 6c).
+//! bytes (RFC 7541 §6.5).
 
 use crate::frames::HpackError;
 
@@ -253,14 +255,33 @@ impl Encoder {
     }
 
     pub fn encode_header(&mut self, name: &[u8], value: &[u8], out: &mut Vec<u8>) {
-        // 1) full static-table match → 0x80 | index
+        // 1) full static-table match → 0x80 | index. Cheapest path; takes
+        // priority over the dynamic table for headers like `:method GET`
+        // where the static index is shorter or equal.
         for (i, (n, v)) in STATIC_TABLE.iter().enumerate() {
             if *n == name && *v == value {
                 encode_integer(7, i + 1, 0x80, out);
                 return;
             }
         }
-        // 2) name-only static match → 0x40 | index, then literal value
+        // 2) full dynamic-table match → 0x80 | (STATIC_TABLE_LEN + 1 + offset).
+        // Phase 10 (Phase 6c) — without this branch the encoder never
+        // re-uses dyn-table inserts on repeated headers, so a stream
+        // that re-sends the same `cookie: …` collapses to a literal
+        // every time. Adding the search closes the wire-bytes gap with
+        // protocol-hpack's Ruby Compressor (which DOES search the
+        // dynamic table); fixes the regression where wire-mode native
+        // HPACK ran slower than fallback because of the missing
+        // compression.
+        for (off, e) in self.dyn_table.entries.iter().enumerate() {
+            if e.name == name && e.value == value {
+                let idx = STATIC_TABLE_LEN + 1 + off;
+                encode_integer(7, idx, 0x80, out);
+                return;
+            }
+        }
+        // 3) name-only static match → 0x40 | index, then literal value;
+        // insert into dyn table so future repeats hit branch (2).
         for (i, (n, _)) in STATIC_TABLE.iter().enumerate() {
             if *n == name {
                 encode_integer(6, i + 1, 0x40, out);
@@ -269,10 +290,29 @@ impl Encoder {
                 return;
             }
         }
-        // 3) literal name + value, no indexing → prefix 0x00, name lit, value lit.
-        out.push(0x00);
+        // 4) name-only dynamic match → 0x40 | (STATIC_TABLE_LEN + 1 + off),
+        // literal value, insert new entry. Same shape as (3) but the
+        // name comes from the dyn table instead of the static one.
+        for (off, e) in self.dyn_table.entries.iter().enumerate() {
+            if e.name == name {
+                let idx = STATIC_TABLE_LEN + 1 + off;
+                encode_integer(6, idx, 0x40, out);
+                encode_string(value, out);
+                self.dyn_table.add(name.to_vec(), value.to_vec());
+                return;
+            }
+        }
+        // 5) Wholly novel name. Use literal-with-incremental-indexing
+        // (0x40 prefix, 6-bit zero index, name lit, value lit) so
+        // future repeats can collapse via branches (2)/(4). Previously
+        // emitted as "literal without indexing" (0x00 prefix), which
+        // is RFC-compliant but leaves zero compression on the table —
+        // since the wire path is now hot, paying one slot in the dyn
+        // table is the right tradeoff.
+        out.push(0x40);
         encode_string(name, out);
         encode_string(value, out);
+        self.dyn_table.add(name.to_vec(), value.to_vec());
     }
 }
 
