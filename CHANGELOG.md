@@ -20,9 +20,19 @@ tracks did not produce the rps wins the brief estimated:
   stayed flat on the bench rows we ran (workloads bound elsewhere).
 * Splice fix — Correctness fix lands (per-request fresh
   `pipe2(O_CLOEXEC | O_NONBLOCK)` closes the cross-conn bytes-leak
-  window from 2.0.1) but per-chunk `pipe2 + 2× close` on 64 KiB
-  chunks regressed static 1 MiB by -23%. Gated to opt-in via
-  `HYPERION_HTTP_SPLICE=1`; default off preserves 2.1.0 plain-sendfile rps.
+  window from 2.0.1). 2.2.x fix-A subsequently hoisted the pipe out
+  of the chunk loop (one `pipe2` per response, reused across all
+  chunks via `copy_splice_into_pipe`); syscall count for a 1 MiB
+  request fell from 64 → 19 (-3.4×). **The 2026-04-30 follow-up
+  bench (post fix-A) measured splice-ON 1,048 r/s vs splice-OFF
+  1,086 r/s on the same host.** Splice is correctness-equivalent on
+  this kernel+workload but NOT faster than plain `sendfile(2)` —
+  the pipe is a kernel buffer that adds a syscall per chunk
+  (file→pipe + pipe→socket vs sendfile's single file→socket);
+  zero-copy guarantee is identical. Gated to opt-in via
+  `HYPERION_HTTP_SPLICE=1`; default off preserves 2.1.0
+  plain-sendfile rps. Operators on different kernels can flip the
+  env var to A/B.
 
 The fixes that would unlock the perf wins (FFI-marshalling rewrite for
 Phase 10, pipe-hoist out of the chunk loop for splice, larger-payload
