@@ -66,6 +66,14 @@ module Hyperion
       METHOD_KEY     = 'REQUEST_METHOD'
       PROTO_KEY      = 'SERVER_PROTOCOL'
 
+      # Phase 11 — frozen sentinel returned by `validate` for plain HTTP
+      # requests (the overwhelmingly common branch). Pre-Phase-11 the
+      # function allocated a fresh `[:not_websocket, nil, nil]` Array on
+      # every non-WS request — one Array per HTTP request. The caller
+      # only reads `.first` and `case` on the tag, never mutates the
+      # tuple, so a frozen shared instance is safe.
+      NOT_WEBSOCKET_RESULT = [:not_websocket, nil, nil].freeze
+
       # Validate WS-upgrade preconditions on a Rack env.
       #
       # Returns a 3-tuple. The first slot is a Symbol tag the caller
@@ -110,7 +118,7 @@ module Hyperion
       #   independently. Pass [] to reject all browser-originated WS,
       #   pass ['https://example.com'] to allow only that origin.
       def self.validate(env, subprotocol_selector: nil, origin_allow_list: default_origin_allow_list)
-        return [:not_websocket, nil, nil] unless websocket_upgrade?(env)
+        return NOT_WEBSOCKET_RESULT unless websocket_upgrade?(env)
 
         # Once we've decided this IS a WS attempt, every subsequent
         # validation failure is a 4xx, NOT a passthrough. The order

@@ -88,11 +88,26 @@ module Hyperion
         reset: ->(env) { env.clear }
       )
 
+      # Phase 11 — shared frozen empty buffer for StringIO reset. Pre-Phase-11
+      # the reset lambda allocated a fresh `+''` per request (one String per
+      # acquire). The next call to `build_env` immediately swaps in
+      # `input.string = request.body`, so we never mutate this buffer — a
+      # single frozen empty String is sufficient as a "clean slate" sentinel.
+      EMPTY_INPUT_BUFFER = String.new('', encoding: Encoding::ASCII_8BIT).freeze
+
+      # Phase 11 — frozen literal constants for env values that pre-Phase-11
+      # were rebuilt per request:
+      #   * SERVER_SOFTWARE — `"Hyperion/#{VERSION}"` interpolated each call.
+      #   * RACK_VERSION    — `[3, 0]` Array literal allocated each call.
+      # The Array is frozen so Rack apps can't mutate the shared instance.
+      SERVER_SOFTWARE_VALUE = "Hyperion/#{Hyperion::VERSION}".freeze
+      RACK_VERSION          = [3, 0].freeze
+
       INPUT_POOL = Hyperion::Pool.new(
         max_size: 256,
         factory: -> { StringIO.new },
         reset: lambda { |io|
-          io.string = +''
+          io.string = EMPTY_INPUT_BUFFER
           io.rewind
         }
       )
@@ -167,8 +182,12 @@ module Hyperion
             return websocket_handshake_failure_response(ws_result)
           end
 
-          status, headers, body = app.call(env)
-          [status, headers, body]
+          # Phase 11 — return the app's tuple directly. Pre-Phase-11
+          # destructured it into 3 locals and re-built the [status, headers,
+          # body] Array (one Array allocation per request). Apps already
+          # return a [status, headers, body] triple per Rack spec, so the
+          # rebuild is pure overhead.
+          app.call(env)
         rescue StandardError => e
           Hyperion.metrics.increment(:app_errors)
           Hyperion.logger.error do
@@ -233,7 +252,7 @@ module Hyperion
           # in Ruby regardless of c_build_env_available?.
           env['SERVER_NAME']       = server_name
           env['SERVER_PORT']       = server_port
-          env['SERVER_SOFTWARE']   = "Hyperion/#{Hyperion::VERSION}"
+          env['SERVER_SOFTWARE']   = SERVER_SOFTWARE_VALUE
           # Rack apps (Rack::Attack throttles, IpHelper.real_ip, audit logging)
           # require REMOTE_ADDR. Fall back to localhost when no peer info is
           # available — typically when a Request is constructed in specs
@@ -264,7 +283,7 @@ module Hyperion
           else
             env['rack.hijack?'] = false
           end
-          env['rack.version']      = [3, 0]
+          env['rack.version']      = RACK_VERSION
           env['rack.multithread']  = false
           env['rack.multiprocess'] = false
           env['rack.run_once']     = false
@@ -298,11 +317,32 @@ module Hyperion
             env['CONTENT_LENGTH'] = env['HTTP_CONTENT_LENGTH'] if env.key?('HTTP_CONTENT_LENGTH')
           end
 
-          [env, input]
+          # Phase 11 — reuse a per-thread 2-element scratch Array for the
+          # `env, input = build_env(...)` destructuring return. Pre-Phase-11
+          # allocated a fresh `[env, input]` Array per request; the caller
+          # destructures immediately and never holds onto the Array, so a
+          # mutable per-thread tuple is safe (each request runs to the
+          # destructure on the same thread before any nested build_env call
+          # could observe it).
+          tup = (Thread.current[:__hyperion_build_env_tuple__] ||= [nil, nil])
+          tup[0] = env
+          tup[1] = input
+          tup
         end
 
+        # Phase 11 — frozen "no port specified" sentinels so the
+        # overwhelmingly common host_header == "host" / "host:80" /
+        # "host:443" branches don't allocate a fresh Array on every
+        # request. The caller destructures into `server_name, server_port =
+        # split_host(...)` immediately and never holds the returned Array,
+        # so a per-thread mutable scratch Array is safe (and the frozen
+        # `LOCALHOST_DEFAULTS` sentinel covers the empty-host cases without
+        # any allocation at all).
+        LOCALHOST_DEFAULTS = %w[localhost 80].freeze
+        DEFAULT_PORT_80    = '80'
+
         def split_host(host_header)
-          return %w[localhost 80] if host_header.empty?
+          return LOCALHOST_DEFAULTS if host_header.empty?
 
           if host_header.start_with?('[')
             close = host_header.index(']')
@@ -315,19 +355,36 @@ module Hyperion
             # on header-parse failures, so we degrade gracefully instead.
             unless close
               Hyperion.metrics.increment(:malformed_host_header)
-              return %w[localhost 80]
+              return LOCALHOST_DEFAULTS
             end
 
             name = host_header[0..close]
             rest = host_header[(close + 1)..]
-            port = rest&.start_with?(':') ? rest[1..] : '80'
-            [name, port.to_s.empty? ? '80' : port]
-          elsif host_header.include?(':')
-            name, port = host_header.split(':', 2)
-            [name, port]
+            port = rest&.start_with?(':') ? rest[1..] : DEFAULT_PORT_80
+            split_host_tuple(name, port.to_s.empty? ? DEFAULT_PORT_80 : port)
+          elsif (idx = host_header.index(':'))
+            # Phase 11 — replace `split(':', 2)` (allocates 2 Strings + 1
+            # transient Array that's then discarded for a fresh `[name,
+            # port]` literal). Hand-rolled byteslice keeps the 2 substring
+            # allocations (unavoidable — the env hash retains them) but
+            # routes the surrounding container through the per-thread
+            # scratch tuple, dropping 1 Array allocation per request.
+            split_host_tuple(host_header.byteslice(0, idx),
+                             host_header.byteslice(idx + 1, host_header.bytesize - idx - 1))
           else
-            [host_header, '80']
+            split_host_tuple(host_header, DEFAULT_PORT_80)
           end
+        end
+
+        # Per-thread 2-element scratch Array for split_host's return tuple.
+        # See note on `__hyperion_build_env_tuple__` in build_env — the
+        # caller destructures immediately; no nested split_host call can
+        # observe the same thread's tuple before the destructure completes.
+        def split_host_tuple(name, port)
+          tup = (Thread.current[:__hyperion_split_host_tuple__] ||= [nil, nil])
+          tup[0] = name
+          tup[1] = port
+          tup
         end
       end
     end

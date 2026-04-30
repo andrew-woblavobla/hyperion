@@ -24,4 +24,11 @@ end
 
 RSpec::Core::RakeTask.new(:spec)
 
+namespace :bench do
+  desc 'Phase 11 — print per-request allocation count for the request hot path'
+  task :yjit_alloc do
+    ruby '-Ilib', 'bench/yjit_alloc_audit.rb'
+  end
+end
+
 task default: :spec

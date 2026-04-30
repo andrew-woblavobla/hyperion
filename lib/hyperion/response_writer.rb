@@ -76,8 +76,24 @@ module Hyperion
       # Phase 1 buffers the full body so Content-Length is exact.
       # Phase 2 introduces chunked transfer-encoding for streaming bodies;
       # Phase 5 batches via IO::Buffer to avoid this intermediate String.
-      buffered = +''
-      body.each { |chunk| buffered << chunk }
+      #
+      # Phase 11 — single-element-Array fast path. The overwhelmingly
+      # common Rack body shape is `[body_string]` (Rails ActionController,
+      # Sinatra, Grape, hand-rolled lambdas). For that shape we skip the
+      # `+''` accumulator entirely and treat body[0] as the buffered
+      # bytes directly. Multi-chunk bodies and Enumerator-style bodies
+      # still take the original loop. Saves one String allocation per
+      # response on the hot path; saves the per-chunk `<<` overhead too.
+      buffered = nil
+      if body.is_a?(Array) && body.length == 1
+        chunk = body[0]
+        buffered = chunk if chunk.is_a?(String)
+      end
+
+      if buffered.nil?
+        buffered = +''
+        body.each { |chunk| buffered << chunk }
+      end
 
       reason = REASONS[status] || 'Unknown'
       date_str = cached_date

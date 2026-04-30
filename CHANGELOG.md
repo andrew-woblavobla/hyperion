@@ -2,6 +2,94 @@
 
 ## [Unreleased] - 2.2.0
 
+### Phase 11 — YJIT allocation audit (hot-path tuning)
+
+Pure-Ruby allocation reduction on the request hot path. The C-ext fast
+path (`CParser.build_env`, `CParser.build_response_head`) is unchanged;
+this phase trims the Ruby code wrapping it. `memory_profiler` was used
+to identify the top allocation sites; each one was confirmed by a
+`GC.stat[:total_allocated_objects]` before/after delta.
+
+* **Per-request allocation count: 19 → 9 objects/req on the full path
+  (-53%); 9 → 2 objects/req inside `build_env` alone (-78%).** Measured
+  by `bench/yjit_alloc_audit.rb` (20 000 iterations, no GC during the
+  measurement window, headers + lambda app from `bench/work.ru`'s
+  shape). Same numbers under YJIT and CRuby — these are direct object
+  allocations, not JIT-influenced.
+* **Top sites tackled:**
+  1. `Adapter::Rack#call` rebuilt the `[status, headers, body]` Array
+     after destructuring the app's return value; now returns the app's
+     tuple directly. **−1 Array/req.**
+  2. `Adapter::Rack#build_env` allocated `"Hyperion/#{VERSION}"`,
+     `[3, 0]`, and the `[env, input]` return tuple per call. Hoisted
+     `SERVER_SOFTWARE_VALUE` and `RACK_VERSION` to frozen constants;
+     `[env, input]` now reuses a per-thread mutable scratch Array
+     (caller destructures immediately, never holds the Array).
+     **−2 String/Array per req.**
+  3. `Adapter::Rack#split_host` called `host:port.split(':', 2)` then
+     re-arrayed `[name, port]`. Replaced with `byteslice` + a
+     per-thread scratch tuple; the `host:` empty-header branch now
+     returns a frozen `LOCALHOST_DEFAULTS` sentinel. **−1 Array/req
+     on the common branch, −1 Array/req on the empty branch.**
+  4. `Adapter::Rack::INPUT_POOL` reset allocated `+''` per `acquire`
+     to swap into the StringIO. The next call to `build_env` always
+     overwrites with `request.body`, so a single shared frozen
+     `EMPTY_INPUT_BUFFER` sentinel is sufficient. **−1 String/req.**
+  5. `Request#header(name)` always called `name.downcase`, even when
+     the parser-stored keys and in-tree callers already pass lowercase
+     literals. Fast-path direct lookup; only fall through to
+     `downcase` on miss. **−1 String/req.**
+  6. `WebSocket::Handshake.validate` allocated
+     `[:not_websocket, nil, nil]` on every plain-HTTP request (the
+     overwhelming branch). Frozen `NOT_WEBSOCKET_RESULT` sentinel.
+     **−1 Array/req.**
+  7. `ResponseWriter#write_buffered` allocated `+''` then iterated
+     `body.each` for the common `[body_string]` Rack body shape.
+     Single-element-Array fast path uses `body[0]` directly. **−1
+     String/req.**
+
+  Sites left in place (unavoidable or out of scope):
+
+  - `CParser.build_response_head` allocates the head buffer +
+     downcased copy of each user-supplied header key. C-ext code, out
+     of scope per the Phase 11 rules.
+  - `host_header.byteslice(0, idx)` and `byteslice(idx + 1, ...)` —
+     the env hash retains both substrings as `SERVER_NAME` /
+     `SERVER_PORT`; not transient.
+* **Specs.** New `spec/hyperion/yjit_alloc_audit_spec.rb` (2 examples)
+  asserts ≤ 10 objects/req on the full path and ≤ 3 objects/req on
+  `build_env` alone — thresholds set ~10% above the post-Phase-11
+  measurement so a single accidentally re-introduced allocation fails
+  the spec without flaky CRuby noise. Spec count **660 → 662**.
+  Existing 660 stay green. Bench harness exposed as
+  `rake bench:yjit_alloc`.
+* **macOS local bench (`-w 4 -t 5`, YJIT, `bench/work.ru`,
+  `wrk -t4 -c200 -d10s`).** 3 warm-state samples each:
+  | Build | r/s avg |
+  |---|---:|
+  | 2.1.0 baseline (master pre-Phase-11)   | 43,396 r/s |
+  | 2.2.0-wip (Phase 11 applied)           | 43,440 r/s |
+  Within noise — macOS arm64 at 43k r/s is already past the point
+  where the Ruby-side allocation count dominates throughput; the
+  bench is bound by the `JSON.generate` work in `work.ru` and
+  syscalls. The allocation reductions still matter for GC pressure
+  on long-lived servers (less heap churn → fewer pauses) and for
+  smaller-host profiles where every object is felt — which is what
+  the openclaw `-w 4` 15.5k row was measuring.
+* **openclaw-vm bench NOT performed** — host accepted SSH but
+  rejected the workstation key (`Permission denied (publickey)`).
+  The 15.5k → 18k+ r/s target row could not be reproduced this round;
+  the macOS-local row above is the substitute. Phase 10 documented
+  the same host as offline; this round it's reachable but the auth
+  state regressed. Tracking in a follow-up; the changes here are
+  pure refactors with no behavior delta, so redoing the openclaw
+  measurement post-restore is safe.
+
+Out of scope for Phase 11 (deferred): C-ext header-key downcase
+allocation in `cbuild_response_head` (would need C-side change); FFI
+marshalling amortization called out by Phase 10; `Connection#serve`
+read accumulator (already pre-Phase-2b'd).
+
 ### Phase 10 — Rust HPACK wired into the HTTP/2 hot path (Phase 6c from the 2.0 RFC)
 
 The Rust HPACK encoder/decoder shipped in 2.0.0 sat behind

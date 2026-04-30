@@ -18,7 +18,20 @@ module Hyperion
       freeze
     end
 
+    # Case-insensitive header lookup. Phase 11 — Hyperion's parser stores
+    # header names lowercased (the parser's normalisation contract), and
+    # the in-tree hot-path callers (Adapter::Rack#build_env,
+    # Connection#should_keep_alive?, Handshake#validate) all pass frozen
+    # lowercase literals. Pre-Phase-11 the unconditional `name.downcase`
+    # allocated a redundant copy per call. Fast-path direct hash lookup;
+    # only fall through to `downcase` when the literal lookup misses,
+    # which preserves the case-insensitive contract for mixed-case callers
+    # (specs, third-party middleware) without paying the allocation on
+    # every request.
     def header(name)
+      v = @headers[name]
+      return v unless v.nil?
+
       @headers[name.downcase]
     end
   end
