@@ -54,6 +54,11 @@ Gem::Specification.new do |spec|
   # boot under openssl 4. Falcon only requires `>= 3.0`, so this pin is
   # compatible with the rest of the gem graph.
   spec.add_dependency 'openssl', '>= 3.0', '< 4.0'
+  # WS-2 (2.1.0) uses `base64` for RFC 6455 Sec-WebSocket-Accept. Ruby 3.4
+  # promoted base64 from stdlib to a bundled gem, so we depend on it
+  # explicitly so `require 'base64'` works on 3.4+ without the user adding
+  # it to their own Gemfile.
+  spec.add_dependency 'base64', '~> 0.2'
 
   spec.add_development_dependency 'rspec', '~> 3.13'
   spec.add_development_dependency 'rake', '~> 13.0'
