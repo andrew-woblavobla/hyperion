@@ -520,3 +520,86 @@ runs other workloads in the background, so each sweep is a snapshot.
 The 2.0.1 numbers above are from a back-to-back rerun of both servers
 on the same wrk window so they're directly comparable to each other,
 even though absolute numbers differ from the 2026-04-29 column.
+
+## 2.2.x fix-C addendum (2026-04-29) — large-payload TLS bench harness
+
+**Phase 9 (kTLS_TX) was benched on the wrong workload.** The 2.2.0
+sweep ran the kTLS row against `bench/hello.ru` (5 B response body)
+and recorded -15% rps vs the 2.1.0 baseline (3,425 → 2,909). The
+regression read as "kTLS didn't help", but at hello-payload the
+cipher cost is a tiny fraction of per-request overhead — parser +
+dispatch + handshake CPU dominate, so any kernel-side cipher savings
+are invisible. The boot log confirmed kTLS engaged correctly
+(`ktls_active: true, cipher: TLS_AES_256_GCM_SHA384`,
+`/proc/modules: tls 155648 3 - Live`); the workload simply didn't
+exercise the cipher path enough to see the win.
+
+**fix-C ships two new bench rackups sized for the kTLS_TX sweet
+spot:**
+
+| Rackup | Payload | Why this size |
+|---|---|---|
+| `bench/tls_static_1m.ru` | 1 MiB static (Rack::Files via /tmp) | Big enough that the cipher accounts for most of the per-request cycles; pairs with the existing `bench/static.ru` for unencrypted comparison. |
+| `bench/tls_json_50k.ru` | ~50 KB JSON (600 items × 8× name multiplier) | Mid-payload row. Large enough that cipher cost is meaningful, small enough to fit in one kernel TCP send buffer (~6 MB on Linux default). 30-80 KB is the kTLS_TX sweet-spot range. |
+
+**Operator A/B knob: `HYPERION_TLS_KTLS`.** New env var added in
+`lib/hyperion/cli.rb` so operators can flip kernel-TLS on/off
+without rewriting their config DSL. Maps to `config.tls.ktls`:
+
+| `HYPERION_TLS_KTLS` | `config.tls.ktls` | Behaviour |
+|---|---|---|
+| unset / empty | `:auto` (default) | Linux ≥ 4.13 + OpenSSL ≥ 3.0: kTLS_TX on; elsewhere: off |
+| `auto` | `:auto` | Same as unset (explicitly) |
+| `on` | `:on` | Force enable; raise at boot if unsupported |
+| `off` | `:off` | Force disable; userspace SSL_write everywhere |
+| anything else | (unchanged) | Warn + ignore (not a security boundary) |
+
+**Bench harness (run on operator host):**
+
+```sh
+# Setup
+ruby -e 'File.binwrite("/tmp/hyperion_bench_1m.bin", "x" * (1024*1024))'
+
+# 50 KB JSON, kTLS auto (default)
+bundle exec hyperion --tls-cert /tmp/cert.pem --tls-key /tmp/key.pem \
+  -t 64 -w 1 -p 9601 bench/tls_json_50k.ru
+wrk -t4 -c64 -d20s --latency --timeout 8s https://127.0.0.1:9601/
+
+# 50 KB JSON, kTLS off
+HYPERION_TLS_KTLS=off bundle exec hyperion --tls-cert /tmp/cert.pem \
+  --tls-key /tmp/key.pem -t 64 -w 1 -p 9601 bench/tls_json_50k.ru
+wrk -t4 -c64 -d20s --latency --timeout 8s https://127.0.0.1:9601/
+
+# 1 MiB static, kTLS auto (default)
+bundle exec hyperion --tls-cert /tmp/cert.pem --tls-key /tmp/key.pem \
+  -t 64 -w 1 -p 9601 bench/tls_static_1m.ru
+wrk -t4 -c64 -d20s --latency --timeout 8s \
+  https://127.0.0.1:9601/hyperion_bench_1m.bin
+
+# 1 MiB static, kTLS off
+HYPERION_TLS_KTLS=off bundle exec hyperion --tls-cert /tmp/cert.pem \
+  --tls-key /tmp/key.pem -t 64 -w 1 -p 9601 bench/tls_static_1m.ru
+wrk -t4 -c64 -d20s --latency --timeout 8s \
+  https://127.0.0.1:9601/hyperion_bench_1m.bin
+```
+
+Take the median of 3 runs per row (run-to-run variance on this
+bench host is ~3-5%).
+
+### Bench measurement status — PENDING (SSH gap)
+
+| Row | kTLS off (r/s) | kTLS auto (r/s) | Δ |
+|---|---|---|---|
+| TLS h1 50 KB JSON `-t 64 -w 1` | _pending_ | _pending_ | _pending_ |
+| TLS h1 1 MiB static `-t 64 -w 1` | _pending_ | _pending_ | _pending_ |
+| TLS h1 hello (re-bench, sanity) | _pending_ | _pending_ | _pending_ |
+
+**Same SSH gap as Phase 9 / 10 / 11 / fix-A.** The fix-C landing
+session could not reach openclaw-vm (publickey rejection from the
+agent's session); the bench harness ships ready for the maintainer
+to run from a session with working SSH. Target: kTLS auto ≥ +30%
+rps over kTLS off on at least one of the two large-payload rows.
+If the bench shows that, the Phase 9 framing in the held-2.2.0
+CHANGELOG can be updated to remove the "didn't materialize"
+caveat. If it shows parity or a regression, the kTLS perf claim
+gets dropped from 2.2.0 entirely.

@@ -37,8 +37,95 @@ tracks did not produce the rps wins the brief estimated:
 The fixes that would unlock the perf wins (FFI-marshalling rewrite for
 Phase 10, pipe-hoist out of the chunk loop for splice, larger-payload
 TLS bench harness for Phase 9) are queued for the 2.2.x follow-up
-sprint. **No version tag.** Code is on master (commits b4ca6a0,
+sprint. fix-A (splice pipe-hoist), fix-B (HPACK FFI rewrite), and
+fix-C (large-payload TLS bench harness) have landed on master in that
+order; the rps deltas the held-status table below carries reflect
+fix-A + fix-B measurements; the kTLS large-payload row is still
+PENDING the maintainer running the new bench rackups (see fix-C
+section). **No version tag.** Code is on master (commits b4ca6a0,
 4d8af74, 5c00b15, e105bc6); operators should continue running 2.1.0.
+
+### fix-C — large-payload TLS bench harness (rackups + `HYPERION_TLS_KTLS` env-var)
+
+**The 2026-04-30 Phase 9 -15% TLS regression diagnosed: wrong workload.**
+Phase 9 shipped kTLS_TX on Linux ≥ 4.13 + OpenSSL ≥ 3.0 and the boot
+probe correctly engaged kernel-TLS on openclaw-vm
+(`ktls_active: true, cipher: TLS_AES_256_GCM_SHA384`,
+`/proc/modules: tls 155648 3 - Live`). The TLS h1 row in the 2.2.0
+sweep used `bench/hello.ru` (5 B response body) and recorded -15% rps
+(3,425 → 2,909) — the regression read as "kTLS didn't help", but at
+hello-payload the cipher cost is a tiny fraction of per-request
+overhead (parser + dispatch + handshake CPU dominate). The kTLS_TX
+win compounds with **larger payloads** where SSL_write would
+otherwise burn userspace cycles encrypting MBs of data; the
+hello-payload bench simply didn't exercise that path.
+
+**fix-C ships the workload that does exercise it:**
+
+* **`bench/tls_static_1m.ru`** — 1 MiB static asset over TLS via
+  `Rack::Files`. Pairs with `bench/static.ru` for the unencrypted
+  comparison. At 1 MiB the cipher accounts for most of the
+  per-request cycles — userspace SSL_write copies & encrypts in
+  Ruby-land; kTLS_TX hands the symmetric key to the kernel and goes
+  through `sendfile`+`KTLS_TX_OFFLOAD` paths.
+* **`bench/tls_json_50k.ru`** — ~50 KB JSON (600 items × 8× name
+  multiplier, verified 50,039 bytes on ruby 3.3.3). Sized to the
+  kTLS_TX sweet spot: large enough that cipher cost is meaningful,
+  small enough to fit in one kernel TCP send buffer in a single
+  syscall (default `net.ipv4.tcp_wmem` max ~6 MB on Linux). 30-80 KB
+  is the sweet-spot range; the spec asserts the payload lands inside
+  it so an operator tweaking the multiplier can't accidentally drift
+  out.
+
+**Operator A/B knob: `HYPERION_TLS_KTLS` env-var.** Phase 9 only
+exposed kTLS via the `tls.ktls` DSL knob — operators wanting to A/B
+kernel-TLS vs userspace SSL_write had to rewrite their config file
+between bench rows. fix-C adds a 3-state env-var bridge in
+`lib/hyperion/cli.rb` (`apply_ktls_env_override!`) that runs right
+after `config.merge_cli!` and overrides the resolved knob:
+
+| `HYPERION_TLS_KTLS` | `config.tls.ktls` | Behaviour |
+|---|---|---|
+| unset / empty | `:auto` (default) | Linux ≥ 4.13 + OpenSSL ≥ 3.0: kTLS_TX on; elsewhere: off |
+| `auto` | `:auto` | Same as unset, explicit |
+| `on` | `:on` | Force enable; raise at boot if unsupported |
+| `off` | `:off` | Force disable; userspace SSL_write everywhere |
+| anything else | (unchanged) | Warn + ignore (not a security boundary) |
+
+The unknown-value branch warns rather than aborting boot — the env
+var is a convenience knob for operators benchmarking, not a
+security boundary, and a typo shouldn't crash the process.
+
+**Specs.** `spec/hyperion/bench_tls_rackups_spec.rb` (new file)
+adds 9 examples:
+
+* `bench/tls_json_50k.ru` parses cleanly via `Rack::Builder.parse_file`,
+  responds 200 with `application/json`, and the payload lands in
+  the 30-80 KB range.
+* `bench/tls_static_1m.ru` parses cleanly, serves a 1 MiB asset
+  written into a tempdir via `HYPERION_BENCH_ASSET_DIR`.
+* `HYPERION_TLS_KTLS` env-var → `config.tls.ktls` mapping for all
+  3 valid states + unset + empty + unknown (warn + ignore).
+
+The static-asset spec writes its own fixture into `Dir.mktmpdir` so
+it doesn't touch `/tmp` outside the test run. Spec count
+**673 → 682** (+9).
+
+**Bench measurement status: PENDING.** Same SSH gap as Phase 9 / 10
+/ 11 / fix-A: the fix-C landing session could not reach openclaw-vm
+(publickey rejection); the bench harness ships ready for the
+maintainer to run from a session with working SSH. The held-2.2.0
+bench-sweep table below carries the placeholder rows; once the
+large-payload bench runs, this CHANGELOG entry should be updated
+with the rps + p99 numbers and either:
+
+* **kTLS auto ≥ +30% rps over kTLS off on at least one large-payload row →** drop the "Phase 9 — kTLS engages cleanly but the cipher win didn't surface" caveat from the held-status preamble; replace it with the win number.
+* **Parity or regression on both large-payload rows →** drop the kTLS perf claim from the 2.2.0 framing entirely; keep the correctness work (kTLS_TX engages on supported hosts) but remove the rps line item.
+
+The bench harness is the missing piece, not the kTLS implementation
+itself — the kernel-side path is correct (boot log + `/proc/modules`
+confirm it), it just hasn't been measured on a workload where the
+win can show.
 
 ### fix-B — Rust HPACK FFI marshalling rewrite (per-encoder scratch buffer + flat-blob ABI)
 

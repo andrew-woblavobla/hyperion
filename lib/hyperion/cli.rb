@@ -20,6 +20,12 @@ module Hyperion
       config = config_path ? Hyperion::Config.load(config_path) : Hyperion::Config.new
       config.merge_cli!(cli_opts)
 
+      # 2.2.x fix-C: env-var override for the kTLS knob so operators can
+      # A/B kernel-TLS vs userspace SSL_write without rewriting their
+      # config file. Useful for the large-payload TLS bench harness
+      # (`bench/tls_static_1m.ru`, `bench/tls_json_50k.ru`).
+      apply_ktls_env_override!(config)
+
       # Install logger early so every subsequent log call honours the operator's
       # chosen format/level (config file or CLI) before anything else logs.
       # 1.8.0: write directly to the default Runtime — `Hyperion.logger=` now
@@ -309,6 +315,31 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
       end
     end
     private_class_method :maybe_enable_yjit
+
+    # 2.2.x fix-C: env-var bridge for `tls.ktls`. Operators running the
+    # large-payload TLS bench harness (`bench/tls_static_1m.ru` /
+    # `bench/tls_json_50k.ru`) need to A/B kernel-TLS vs userspace
+    # SSL_write without editing their config file — the bench script
+    # flips `HYPERION_TLS_KTLS=off` for the userspace baseline and
+    # leaves it unset (`:auto`) for the kTLS run. Unknown values are
+    # ignored (with a warn) rather than aborting boot — the env var is
+    # a convenience knob, not a security boundary, and a typo
+    # shouldn't crash the process.
+    def self.apply_ktls_env_override!(config)
+      raw = ENV['HYPERION_TLS_KTLS']
+      return if raw.nil? || raw.empty?
+
+      case raw
+      when 'off'  then config.tls.ktls = :off
+      when 'on'   then config.tls.ktls = :on
+      when 'auto' then config.tls.ktls = :auto
+      else
+        Hyperion.logger.warn do
+          { message: 'HYPERION_TLS_KTLS ignored (must be off|on|auto)', value: raw }
+        end
+      end
+    end
+    private_class_method :apply_ktls_env_override!
 
     # Probe table for fiber-cooperative I/O libraries. If `async_io: true` is
     # set but none of these are loaded, the operator has likely flipped the
