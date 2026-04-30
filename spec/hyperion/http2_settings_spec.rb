@@ -56,6 +56,7 @@ RSpec.describe Hyperion::Http2Handler do
     it 'clamps max_frame_size below the spec floor (16384) and warns' do
       logger = instance_double(Hyperion::Logger)
       allow(logger).to receive(:warn)
+      allow(logger).to receive(:info) # Phase 6b: Http2Handler#initialize logs codec boot state
       allow(Hyperion).to receive(:logger).and_return(logger)
 
       handler = handler_with(max_frame_size: 100)
