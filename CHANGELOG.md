@@ -1,12 +1,27 @@
 # Changelog
 
-## [Unreleased] - 2.3.0
+## [2.3.0] - 2026-05-01
 
-In-progress release. First of five 2.3.0 streams (2.3-A through 2.3-E)
-plus the version-bump release task (2.3-fix-F). The user's deployment
-shape is plaintext h1 behind nginx + LB (TLS terminated upstream), so
-the headline target is the unmovable kernel-accept boundary on the
-plaintext h1 path.
+### Headline
+
+A WebSocket-bandwidth + operator-knobs release. The 2.3.0 sprint
+targeted the user's nginx-fronted plaintext-h1 + WebSocket
+production topology. The headline wins:
+
+| Track | Result |
+|---|---|
+| 2.3-C — WebSocket permessage-deflate (RFC 7692) | **20× wire reduction** on chat-style JSON; chat workloads / ActionCable fan-out save bandwidth at the cost of ~30-40% encode-CPU |
+| 2.3-D — WS multi-process bench client | +176% msg/s, p99 halved (debunked fix-E's single-process tail as client-side GVL, not server-side) |
+| 2.3-A — io_uring accept on Linux 5.6+ (opt-in) | At parity with epoll on hello — Ruby-dispatch-bound at this rate, not accept-syscall-bound. Path engages cleanly; ships opt-in for high-accept-churn workloads |
+| 2.3-B — Per-conn fairness + TLS handshake throttle | Defense-in-depth knobs; `max_in_flight_per_conn` defaults to nil (no behavior change), operators opt-in via config / CLI / env |
+
+Spec count: 698 (2.2.0) → 776 (2.3.0).
+
+New operator knobs:
+- `HYPERION_IO_URING={on,off,auto}` (env) + `c.io_uring = :auto/:on/:off` (DSL)
+- `c.max_in_flight_per_conn = N` / `--max-in-flight-per-conn N` / `HYPERION_MAX_IN_FLIGHT_PER_CONN=N`
+- `c.tls.handshake_rate_limit = N` / `--tls-handshake-rate-limit N` / `HYPERION_TLS_HANDSHAKE_RATE_LIMIT=N`
+- `c.websocket.permessage_deflate = :auto/:on/:off` (DSL) / `HYPERION_WS_DEFLATE={on,off,auto}`
 
 ### 2.3-A — io_uring accept on Linux 5.6+, opt-in via `HYPERION_IO_URING=on`
 
