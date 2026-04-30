@@ -133,18 +133,39 @@ ABI`:
 Existing 13 native HPACK specs (parity, stateful-dyn-table,
 Http2Handler integration) stay green. Spec count **668 → 673**.
 
-**Bench validation on openclaw-vm.** Bench host had no `cargo` at the
-time of the 2026-04-30 sweep (Phase 10's bench reported
-`Hyperion::H2Codec.available? == false`). fix-B installed `rustup`
-toolchain stable on the host (`/home/ubuntu/.cargo`) and re-benched.
-See "Bench sweep notes (post fix-B)" below for the actual result.
+**Bench validation on openclaw-vm (2026-04-30, post fix-B).** Bench
+host had no `cargo` at the time of the original 2.2.0 sweep (Phase 10's
+bench reported `Hyperion::H2Codec.available? == false`). fix-B installed
+`rustup` toolchain stable on the host, rebuilt the cdylib via
+`cargo build --release`, and re-benched.
 
-**Default-on flip.** [DEFERRED — see bench notes below.] If the bench
-flips native HPACK ahead of the Ruby fallback, the env-var gate
-(`HYPERION_H2_NATIVE_HPACK=1`) drops to default-on. If parity is the
-best we get on the bench host, the gate stays default-OFF (no
-regression vs 2.1.0) and the maintainer can re-bench from a session
-with a different host profile to decide.
+Workload: `h2load -c 1 -m 100 -n 5000 https://127.0.0.1:<port>/`,
+hello.ru behind hyperion `-t 64 -w 1`, 4-round mean per side:
+
+| Side | Round 1 | Round 2 | Round 3 | Round 4 | Mean |
+|---|---:|---:|---:|---:|---:|
+| Ruby fallback (baseline) | 1606.29 | 1601.19 | 1615.71 | 1616.02 | **1609.80** |
+| Rust HPACK fix-B (`HYPERION_H2_NATIVE_HPACK=1`) | 1594.78 | 1606.90 | 1623.95 | 1610.23 | **1608.97** |
+
+Delta: **-0.05% (fully within run-to-run noise)**. Phase 10's reported
+-8% to -28% regression is **eliminated**. The native path is now at
+parity with the Ruby fallback on this workload — the per-call
+allocation overhead the v1 ABI paid (and that overwhelmed the encode
+kernel win on small-headers traffic) is gone.
+
+**Default-on flip: NOT TAKEN.** The brief required
+`native HPACK ≥ Ruby fallback rps` AND a clear margin to flip default-on.
+Parity on the bench host counts as the regression being fixed, but
+isn't enough to flip the default — the encode kernel is too small a
+fraction of the per-request budget on this hello-payload workload for
+a clear win to surface. **The `HYPERION_H2_NATIVE_HPACK=1` env-var
+gate stays default-OFF.** Operators on different workloads (heavy
+header sets, large dyn-table churn) can flip the env var to A/B; the
+no-regression guarantee on smaller workloads is what fix-B locks in.
+
+A larger-payload h2 bench (e.g., 16 KB headers, the workload Phase 10's
+microbench measured) would likely surface the kernel win — that's
+queued behind a workload generator the bench harness doesn't have yet.
 
 ### fix-A — splice pipe-hoist (per-chunk → per-response)
 
