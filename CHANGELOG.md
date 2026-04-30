@@ -1,6 +1,39 @@
 # Changelog
 
-## [Unreleased] - 2.5.0
+## [2.5.0] - 2026-04-29
+
+### Headline
+
+A correctness + observability + RFC-conformance release. The 2.5.0
+sprint settled three open questions from prior releases and opened
+the door for first-class production observability integrations.
+
+| Track | Result |
+|---|---|
+| 2.5-A — RFC 6455 §7.4.1 close-code validation | autobahn-testsuite **453/463 → 463/463 (100% on non-perf cases)**. Section 7 closed: 27/37 → 37/37. |
+| 2.5-B — Rails-shape h2 bench | **+18% rps** native HPACK vs Ruby fallback on 25-header response. **[breaking-default-change]: `HYPERION_H2_NATIVE_HPACK` flipped to ON by default** when Rust crate available. |
+| 2.5-C — Request lifecycle hooks | `Runtime#on_request_start` / `on_request_end`. NewRelic / AppSignal / OpenTelemetry / DataDog wire without monkey-patching. Zero-cost path preserved. |
+| 2.5-D — Compression-bomb fuzz | 6 adversarial vectors (ratio bomb, malformed sync trailer, mid-message dict corruption, zero-length, min-window-bits, compressed control frame). All PASS — 2.3-C's defense holds. |
+
+Spec count: 823 (2.4.0) → 907 (2.5.0). 0 failures, 11 pending.
+
+### Breaking change
+
+`HYPERION_H2_NATIVE_HPACK` default flipped from OFF to ON when the
+Rust crate is available (the typical case — it builds out of the box
+on macOS/Linux + cargo). Operators who explicitly want the prior
+2.4.x Ruby-fallback default must set `HYPERION_H2_NATIVE_HPACK=off`.
+
+Migration: most operators see +18% h2 rps on header-heavy workloads
+(Rails apps, gRPC metadata, etc.) and no change on hello-shape
+workloads (HPACK is <1% of per-stream CPU on 2-header responses).
+Operators on hosts where the Rust crate didn't build see the same
+Ruby fallback as 2.0.x–2.4.x — no behavior change.
+
+New operator visibility:
+- `Hyperion::Runtime#on_request_start { |req, env| ... }` — hook fires before app.call
+- `Hyperion::Runtime#on_request_end { |req, env, response, error| ... }` — hook fires after app.call
+- See `docs/OBSERVABILITY.md` "Custom request lifecycle hooks (2.5-C)" for NewRelic/AppSignal/OpenTelemetry/DataDog/Prometheus recipes
 
 ### 2.5-A — WebSocket close-payload validation (RFC 6455 §7.4.1 + §5.5.1)
 
