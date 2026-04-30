@@ -656,17 +656,28 @@ Two scenarios, both 1 KiB messages, 3 runs each, median reported.
 | WS echo (10 conns × 1000 msgs, latency, `-t 256`) | 6,205 | 1.58 ms | 2.02 ms | 2.99 ms |
 | WS echo (200 conns × 1000 msgs, throughput, `-t 256`) | 5,346 | 37.19 ms | 43.12 ms | 93.68 ms |
 
-**Bench host caveat — these numbers are from MacBook dev hardware,
-not openclaw-vm.** SSH to the openclaw-vm bench host (the box that
-carries every other row in this report) was not reachable this
-session — `connect to host 192.168.31.14 port 22: Connection refused`
-on 2026-04-29. The 50,000+ msg/s 16-vCPU target shape from the
-2.1.0 perf-note (docs/WEBSOCKETS.md) remains the openclaw-vm number
-to publish; the table above establishes the dev-hardware floor and
-exercises the full hijack + handshake + frame + unmask + echo
-pipeline end-to-end. Re-running on openclaw-vm with the same
-client + server commands is queued behind the next openclaw SSH
-window.
+**openclaw-vm follow-up bench (2026-04-30, Linux 16-vCPU, single worker):**
+
+| Workload | msg/s | p50 | p99 | max |
+|---|---:|---:|---:|---:|
+| WS echo (10 conns × 1000 msgs, latency, `-t 5`) | **1,962** | 2.51 ms | 3.27 ms | 4.58 ms |
+| WS echo (200 conns × 1000 msgs, throughput, `-t 256`) | **1,766** | 112 ms | 134 ms | 141 ms |
+
+**These are real numbers; the 50,000+ msg/s figure cited in the 2.1.0
+perf-note was aspirational, not measured.** A single-worker Hyperion
+on openclaw-vm pushes ~2 k msg/s against a single Ruby bench client
+(the client itself is also single-process and likely a meaningful
+portion of the bottleneck). To approach the 50 k msg/s figure an
+operator would need either a multi-process client (2-4×), multiple
+Hyperion workers (4×), and/or a non-Ruby client that doesn't pay
+per-msg parser overhead. Filed as a 2.3 follow-up: rerun with `-w 4`
++ multi-process client, plus an autobahn-testsuite RFC 6455
+conformance pass.
+
+The dev-hardware numbers above (Apple Silicon) were higher per-msg
+because per-message Ruby overhead is faster on M-series than on this
+x86_64 16-vCPU box; that's a typical Ruby-bench shape and explains
+the per-conn-thread vs throughput inversion.
 
 ### Reading the dev-hardware numbers
 
