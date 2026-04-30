@@ -1,6 +1,29 @@
 # Changelog
 
-## [Unreleased] - 2.4.0
+## [2.4.0] - 2026-04-29
+
+### Headline
+
+A production-stability + observability release. Targeted at long-running
+servers under sustained traffic (the user's nginx-fronted ActionCable
+deployment shape).
+
+| Track | Result |
+|---|---|
+| 2.4-B — GC pressure round-2 | Per-parse alloc **-41 to -53%** on hello / 5-header / chunked POST; GC frequency **-28%** on chunked POST sustained 60s |
+| 2.4-D — Linux multi-process WS bench | **6,880 msg/s p99 34 ms** at 4 procs × 200 conns (+289% vs single-proc, -75% p99); autobahn **97.8% pass** (453/463), permessage-deflate **100%** RFC 7692 conformance |
+| 2.4-C — /-/metrics enrichment | 6 new production metrics: per-route p50/p99 histograms, fairness rejection counter, WS deflate ratio, kTLS active conns, io_uring active, threadpool queue depth. Grafana dashboard + OBSERVABILITY.md operator playbook |
+| 2.4-A — HPACK FFI round-2 | Per-call alloc 12 → 4 objects (custom C ext, no Fiddle per call); bench at parity (HPACK is <1% of per-stream CPU). Stays opt-in. |
+
+Spec count: 776 (2.3.0) → 823 (2.4.0). 0 failures, 11 pending.
+
+New operator visibility:
+- `/-/metrics` now exposes `hyperion_request_duration_seconds`, `hyperion_per_conn_rejections_total`, `hyperion_websocket_deflate_ratio`, `hyperion_tls_ktls_active_connections`, `hyperion_io_uring_workers_active`, `hyperion_threadpool_queue_depth`
+- Grafana dashboard at `docs/grafana/hyperion-2.4-dashboard.json`
+- Operator playbook at `docs/OBSERVABILITY.md`
+
+### Known limitations carried forward to 2.5
+- WebSocket close-payload validation: 10 autobahn cases in section 7.5.1 + 7.9.x fail because `Connection#recv` echoes invalid peer close codes instead of rejecting with 1002 (Protocol Error). Documented in `docs/WEBSOCKETS.md`.
 
 ### 2.4-A — HPACK FFI round-2 (custom C ext, no Fiddle per call)
 
