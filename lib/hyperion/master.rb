@@ -246,7 +246,10 @@ module Hyperion
           # 2.2.0 Phase 9 — kernel TLS_TX policy.
           tls_ktls: @config.tls.ktls,
           # 2.3-A — io_uring accept policy.
-          io_uring: @config.io_uring
+          io_uring: @config.io_uring,
+          # 2.3-B — per-conn fairness cap + TLS handshake CPU throttle.
+          max_in_flight_per_conn: @config.max_in_flight_per_conn,
+          tls_handshake_rate_limit: @config.tls.handshake_rate_limit
         }
         # Hand the inherited socket to the worker in :share mode. In
         # :reuseport mode the worker binds its own with SO_REUSEPORT.

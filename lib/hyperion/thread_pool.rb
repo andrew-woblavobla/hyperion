@@ -28,10 +28,14 @@ module Hyperion
 
     attr_reader :size, :max_pending
 
-    def initialize(size:, max_pending: nil)
+    def initialize(size:, max_pending: nil, max_in_flight_per_conn: nil)
       @size        = size
       @max_pending = max_pending
-      @inbox       = Queue.new # multiplexes both kinds of jobs
+      # 2.3-B: per-conn fairness cap propagated to every Connection
+      # constructed by `:connection` jobs. nil (default) = no cap,
+      # matches 2.2.0. Positive integer = per-conn ceiling.
+      @max_in_flight_per_conn = max_in_flight_per_conn
+      @inbox = Queue.new # multiplexes both kinds of jobs
       # Pre-allocate one reply queue per in-flight slot for the legacy `#call`
       # path. Bounded by `size`: if all workers are busy, all reply queues are
       # checked out, and the next caller blocks on `@reply_pool.pop` until a
@@ -113,9 +117,13 @@ module Hyperion
             _, socket, app, max_request_read_seconds = job
             # Worker thread owns the connection for its full lifetime. Pass
             # thread_pool: nil so Connection#call_app inlines Adapter::Rack.call
-            # — the worker IS the pool, no further hop required.
+            # — the worker IS the pool, no further hop required. 2.3-B
+            # threads `max_in_flight_per_conn` so the per-conn fairness
+            # cap (if configured) takes effect on this worker's serve loop.
             begin
-              Hyperion::Connection.new.serve(socket, app, max_request_read_seconds: max_request_read_seconds)
+              Hyperion::Connection
+                .new(max_in_flight_per_conn: @max_in_flight_per_conn)
+                .serve(socket, app, max_request_read_seconds: max_request_read_seconds)
             rescue StandardError => e
               Hyperion.logger.error do
                 {

@@ -244,5 +244,101 @@ module Hyperion
     def parse_pem_chain(pem)
       pem.scan(PEM_CERT_RE).map { |block| OpenSSL::X509::Certificate.new(block) }
     end
+
+    # 2.3-B: TLS handshake CPU throttle. Per-worker token bucket sized
+    # at the operator's `tls.handshake_rate_limit` (handshakes/sec).
+    # Capacity == rate so a steady-state handshake stream of `rate`
+    # handshakes/sec passes cleanly while a burst above the rate is
+    # rate-limited; tokens refill at `rate` per second uniformly.
+    #
+    # **When this fires.** A flood of new TLS handshakes (e.g., during
+    # a deployment when nginx restarts and reconnects everything) can
+    # starve regular requests of CPU — RSA/ECDHE handshakes are the
+    # most expensive op the server does. The bucket caps that
+    # starvation by closing the TCP connection at the listener edge
+    # before SSL_accept runs; clients see a clean TCP RST/FIN and
+    # retry. Default `:unlimited` keeps 2.2.0 behaviour.
+    #
+    # **For nginx-fronted topologies** this is mostly defensive: nginx
+    # keeps long-lived upstream connections, so handshake rate is
+    # normally near-zero. Real value is for direct-exposure operators
+    # or staging environments where misconfiguration causes a
+    # handshake storm.
+    #
+    # **Concurrency.** A Mutex-guarded refill+take. Hold time is one
+    # `Process.clock_gettime` + a couple of arithmetic ops — tens of
+    # nanoseconds. Contention is bounded by handshake rate (orders
+    # of magnitude lower than request rate), so the mutex is never on
+    # the hot per-request path.
+    class HandshakeRateLimiter
+      attr_reader :rate, :capacity
+
+      # Build a limiter for `rate` handshakes/sec/worker, or `:unlimited`
+      # to short-circuit every `acquire_token!` to true (no throttle).
+      # Anything else raises ArgumentError so config typos surface at
+      # boot.
+      def initialize(rate)
+        if rate == :unlimited || rate.nil?
+          @rate     = :unlimited
+          @capacity = nil
+          @tokens   = nil
+          @last_refill_at = nil
+          @mutex    = nil
+        elsif rate.is_a?(Integer) && rate.positive?
+          @rate     = rate
+          @capacity = rate.to_f
+          @tokens   = @capacity
+          @last_refill_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          @mutex = Mutex.new
+        else
+          raise ArgumentError,
+                "tls.handshake_rate_limit must be a positive integer or :unlimited (got #{rate.inspect})"
+        end
+        @rejected = 0
+      end
+
+      # True when the bucket had a token to spend (handshake proceeds).
+      # False when the bucket is empty (caller should close the TCP
+      # connection without running SSL_accept — saves the CPU cost of
+      # the asymmetric crypto under handshake-storm conditions).
+      def acquire_token!
+        return true if @rate == :unlimited
+
+        @mutex.synchronize do
+          refill_locked!
+          if @tokens >= 1.0
+            @tokens -= 1.0
+            true
+          else
+            @rejected += 1
+            false
+          end
+        end
+      end
+
+      # Snapshot for stats / logging. `tokens` is the current bucket
+      # level (float), `rejected` is the cumulative count of denied
+      # handshake attempts since limiter construction.
+      def stats
+        return { rate: :unlimited, rejected: 0 } if @rate == :unlimited
+
+        @mutex.synchronize do
+          refill_locked!
+          { rate: @rate, capacity: @capacity, tokens: @tokens, rejected: @rejected }
+        end
+      end
+
+      private
+
+      # Refill must be called with @mutex held.
+      def refill_locked!
+        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        elapsed = now - @last_refill_at
+        return if elapsed <= 0
+
+        @tokens = [@tokens + (elapsed * @rate), @capacity].min
+        @last_refill_at = now
+      end
+    end
   end
 end

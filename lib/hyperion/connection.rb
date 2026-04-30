@@ -42,6 +42,18 @@ module Hyperion
                                      "\r\n" \
                                      "payload too large\n").freeze
 
+    # 2.3-B per-conn fairness 503. Connection stays alive (no
+    # `connection: close` here, no `Connection: close` to nginx) so
+    # the upstream peer can retry the request in 1s — nginx-friendly.
+    # Body is small + plain text + frozen so the reject path stays
+    # allocation-free on the hot path.
+    REJECT_503_PER_CONN_OVERLOAD = (+"HTTP/1.1 503 Service Unavailable\r\n" \
+                                     "content-type: text/plain\r\n" \
+                                     "content-length: 31\r\n" \
+                                     "retry-after: 1\r\n" \
+                                     "\r\n" \
+                                     "per-connection overload, retry\n").freeze
+
     # Default parser is the C-extension `CParser` when the extension built;
     # otherwise we fall back to the pure-Ruby `Parser`. Evaluated each call
     # because Ruby evaluates default kwargs at call time.
@@ -50,11 +62,21 @@ module Hyperion
     end
 
     def initialize(parser: self.class.default_parser, writer: ResponseWriter.new, thread_pool: nil,
-                   log_requests: nil, max_body_bytes: MAX_BODY_BYTES, runtime: nil)
+                   log_requests: nil, max_body_bytes: MAX_BODY_BYTES, runtime: nil,
+                   max_in_flight_per_conn: nil)
       @parser         = parser
       @writer         = writer
       @thread_pool    = thread_pool
       @max_body_bytes = max_body_bytes
+      # 2.3-B: per-conn fairness cap. nil disables the check entirely
+      # (the hot path stays branchless). Positive integer sets the
+      # in-flight ceiling. The counter + dedup-warn flag live as ivars
+      # so a single Connection's lifetime sees one warn at most, not
+      # one per rejected request.
+      @max_in_flight_per_conn = max_in_flight_per_conn
+      @in_flight              = 0
+      @in_flight_mutex        = Mutex.new if max_in_flight_per_conn
+      @overload_warned        = false
       # 1.7.0: explicit Runtime injection. When the caller passes
       # `runtime:`, that runtime is the sole source of metrics + logger
       # for this connection — no implicit fallback to module-level
@@ -205,10 +227,25 @@ module Hyperion
         @metrics.increment(:requests_total)
         @metrics.increment(:requests_in_flight)
         request_started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) if @log_requests
+        # 2.3-B per-conn fairness gate. Returns true when the slot was
+        # reserved (caller must release in ensure), false when the cap
+        # was hit and a 503 was emitted. nil cap → admit always (hot
+        # path stays branchless).
+        if @max_in_flight_per_conn && !per_conn_admit!(socket, peer_addr)
+          @metrics.decrement(:requests_in_flight)
+          request_count += 1
+          # Don't close — keep the conn alive so the upstream peer can
+          # retry after the in-flight request drains. Skip writer +
+          # logging (we wrote a canned response above) and proceed to
+          # the next iteration's read.
+          set_idle_timeout(socket)
+          next
+        end
         begin
           status, headers, body = call_app(app, request)
         ensure
           @metrics.decrement(:requests_in_flight)
+          per_conn_release! if @max_in_flight_per_conn
         end
 
         # 2.1.0 (WS-1): if the app called `env['rack.hijack'].call` during
@@ -277,6 +314,46 @@ module Hyperion
     end
 
     private
+
+    # 2.3-B per-conn fairness admit. Mutex-guarded compare-and-bump so
+    # async-io fibers / pipelined requests on the same OS thread don't
+    # race the counter. Returns true when the slot was reserved, false
+    # when the cap was hit (caller writes 503 + Retry-After). The 503
+    # path bumps a metric, emits a deduplicated warn, and writes a
+    # canned response — all best-effort; a peer that's gone away is
+    # silently swallowed.
+    def per_conn_admit!(socket, peer_addr)
+      cap = @max_in_flight_per_conn
+      admitted = @in_flight_mutex.synchronize do
+        if @in_flight >= cap
+          false
+        else
+          @in_flight += 1
+          true
+        end
+      end
+      return true if admitted
+
+      @metrics.increment(:per_conn_overload_rejects)
+      @metrics.increment_status(503)
+      unless @overload_warned
+        @logger.warn do
+          { message: 'per-connection in-flight cap hit, returning 503 + Retry-After',
+            remote_addr: peer_addr, cap: cap, in_flight: cap }
+        end
+        @overload_warned = true
+      end
+      begin
+        socket.write(REJECT_503_PER_CONN_OVERLOAD)
+      rescue StandardError
+        # Peer may have already gone — nothing to do.
+      end
+      false
+    end
+
+    def per_conn_release!
+      @in_flight_mutex.synchronize { @in_flight -= 1 if @in_flight.positive? }
+    end
 
     # Phase 2b: collapse @inbuf in place to retain only the carry-over (any
     # bytes past the parsed request boundary, used for keep-alive pipelining).

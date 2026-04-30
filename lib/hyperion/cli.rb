@@ -45,6 +45,12 @@ module Hyperion
       # fork). The env var is the sanctioned way to opt in.
       apply_io_uring_env_override!(config)
 
+      # 2.3-B: env-var overrides for the per-conn fairness cap and the
+      # TLS handshake CPU throttle. Same precedence rule as the other
+      # 2.x env-var bridges — outermost knob (env > CLI > config file).
+      apply_max_in_flight_per_conn_env_override!(config)
+      apply_tls_handshake_rate_limit_env_override!(config)
+
       # Install logger early so every subsequent log call honours the operator's
       # chosen format/level (config file or CLI) before anything else logs.
       # 1.8.0: write directly to the default Runtime — `Hyperion.logger=` now
@@ -215,6 +221,27 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
              'Default: max_concurrent_streams × workers × 4 (2.0.0 flip).') do |v|
           cli_opts[:h2_max_total_streams] = parse_h2_max_total_streams!(v)
         end
+        # 2.3-B: per-connection fairness cap. Defends against a greedy
+        # upstream connection (nginx pipelining many client requests
+        # through one keep-alive conn) hogging the worker thread pool.
+        # Recommended setting: thread_count / 4 (e.g., `4` for `-t 16`).
+        # `auto` resolves at finalize! to thread_count/4 (floor 1).
+        # Default unset (no cap) — opt-in operator hardening.
+        o.on('--max-in-flight-per-conn VALUE',
+             'Per-connection in-flight request cap. Integer >= 1, or `auto` ' \
+             '(thread_count/4, floor 1). Default: unset (no cap).') do |v|
+          cli_opts[:max_in_flight_per_conn] = parse_max_in_flight_per_conn!(v)
+        end
+        # 2.3-B: TLS handshake CPU throttle. Token-bucket budget for
+        # SSL_accept calls per second per worker. Defends direct-exposure
+        # operators against handshake storms; for nginx-fronted topologies
+        # this is mostly defensive (nginx keeps long-lived upstream conns).
+        # `unlimited` (default) preserves 2.2.0 behaviour.
+        o.on('--tls-handshake-rate-limit VALUE',
+             'TLS handshake CPU throttle: handshakes/sec/worker. Integer >= 1 ' \
+             'or `unlimited` (default).') do |v|
+          cli_opts[:tls_handshake_rate_limit] = parse_tls_handshake_rate_limit!(v)
+        end
         o.on('-h', '--help', 'show help') do
           puts o
           exit 0
@@ -250,7 +277,9 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
                           admin_token: config.admin.token,
                           tls_session_cache_size: config.tls.session_cache_size,
                           tls_ktls: config.tls.ktls,
-                          io_uring: config.io_uring)
+                          io_uring: config.io_uring,
+                          max_in_flight_per_conn: config.max_in_flight_per_conn,
+                          tls_handshake_rate_limit: config.tls.handshake_rate_limit)
       warn_c_parser_unavailable
 
       # Pre-allocate Rack env-pool entries and eager-touch lazy constants.
@@ -439,6 +468,88 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
       end
     end
     private_class_method :apply_io_uring_env_override!
+
+    # 2.3-B: shared parser for `--max-in-flight-per-conn VALUE` and
+    # `HYPERION_MAX_IN_FLIGHT_PER_CONN=VALUE`. Returns either a positive
+    # Integer (explicit cap) or the `:auto` sentinel which `Config#finalize!`
+    # later resolves to `thread_count / 4`. Anything else raises
+    # `OptionParser::InvalidArgument` so CLI typos surface at boot.
+    def self.parse_max_in_flight_per_conn!(raw)
+      case raw
+      when 'auto', ':auto'
+        Hyperion::Config::MAX_IN_FLIGHT_PER_CONN_AUTO
+      when /\A\d+\z/
+        n = raw.to_i
+        unless n.positive?
+          raise OptionParser::InvalidArgument,
+                "--max-in-flight-per-conn: expected a positive integer or 'auto', got #{raw.inspect}"
+        end
+        n
+      else
+        raise OptionParser::InvalidArgument,
+              "--max-in-flight-per-conn: expected a positive integer or 'auto', got #{raw.inspect}"
+      end
+    end
+    private_class_method :parse_max_in_flight_per_conn!
+
+    # 2.3-B: env-var bridge for the per-conn fairness cap. Same value
+    # grammar as the CLI flag (`auto` or a positive integer). Unknown
+    # values warn and leave the config untouched — the env var is a
+    # convenience knob, not a security boundary.
+    def self.apply_max_in_flight_per_conn_env_override!(config)
+      raw = ENV['HYPERION_MAX_IN_FLIGHT_PER_CONN']
+      return if raw.nil? || raw.empty?
+
+      begin
+        config.max_in_flight_per_conn = parse_max_in_flight_per_conn!(raw)
+      rescue OptionParser::InvalidArgument
+        Hyperion.logger.warn do
+          { message: 'HYPERION_MAX_IN_FLIGHT_PER_CONN ignored (must be a positive integer or `auto`)',
+            value: raw }
+        end
+      end
+    end
+    private_class_method :apply_max_in_flight_per_conn_env_override!
+
+    # 2.3-B: shared parser for `--tls-handshake-rate-limit VALUE` and
+    # `HYPERION_TLS_HANDSHAKE_RATE_LIMIT=VALUE`. Returns either a
+    # positive Integer (handshakes/sec/worker) or the `:unlimited`
+    # sentinel which keeps the 2.2.0 (no-throttle) behaviour. Anything
+    # else raises `OptionParser::InvalidArgument`.
+    def self.parse_tls_handshake_rate_limit!(raw)
+      case raw
+      when 'unlimited', ':unlimited'
+        :unlimited
+      when /\A\d+\z/
+        n = raw.to_i
+        unless n.positive?
+          raise OptionParser::InvalidArgument,
+                "--tls-handshake-rate-limit: expected a positive integer or 'unlimited', got #{raw.inspect}"
+        end
+        n
+      else
+        raise OptionParser::InvalidArgument,
+              "--tls-handshake-rate-limit: expected a positive integer or 'unlimited', got #{raw.inspect}"
+      end
+    end
+    private_class_method :parse_tls_handshake_rate_limit!
+
+    # 2.3-B: env-var bridge for the TLS handshake throttle. Same value
+    # grammar as the CLI flag.
+    def self.apply_tls_handshake_rate_limit_env_override!(config)
+      raw = ENV['HYPERION_TLS_HANDSHAKE_RATE_LIMIT']
+      return if raw.nil? || raw.empty?
+
+      begin
+        config.tls.handshake_rate_limit = parse_tls_handshake_rate_limit!(raw)
+      rescue OptionParser::InvalidArgument
+        Hyperion.logger.warn do
+          { message: 'HYPERION_TLS_HANDSHAKE_RATE_LIMIT ignored (must be a positive integer or `unlimited`)',
+            value: raw }
+        end
+      end
+    end
+    private_class_method :apply_tls_handshake_rate_limit_env_override!
 
     # Probe table for fiber-cooperative I/O libraries. If `async_io: true` is
     # set but none of these are loaded, the operator has likely flipped the

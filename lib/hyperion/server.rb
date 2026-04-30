@@ -71,7 +71,9 @@ module Hyperion
                    admin_listener_host: '127.0.0.1', admin_token: nil,
                    tls_session_cache_size: TLS::DEFAULT_SESSION_CACHE_SIZE,
                    tls_ktls: :auto,
-                   io_uring: :off)
+                   io_uring: :off,
+                   max_in_flight_per_conn: nil,
+                   tls_handshake_rate_limit: :unlimited)
       validate_async_io!(async_io)
       @host                     = host
       @port                     = port
@@ -116,7 +118,20 @@ module Hyperion
       @io_uring_policy          = io_uring
       @io_uring_active          = io_uring != :off && Hyperion::IOUring.resolve_policy!(io_uring)
       log_io_uring_state_once
+      # 2.3-B: per-conn fairness cap (validated/finalized upstream by
+      # `Config#finalize!`; constructor accepts the resolved value, not
+      # a sentinel). nil = no cap (default). The cap propagates to
+      # every Connection the ThreadPool's `:connection` worker builds.
+      @max_in_flight_per_conn   = max_in_flight_per_conn
+      # 2.3-B: TLS handshake CPU throttle. One limiter per worker
+      # (per-Server). `:unlimited` short-circuits every `acquire_token!`
+      # to true so the hot path stays branchless. Built eagerly so
+      # bench harnesses can introspect via `server.tls_handshake_limiter`.
+      @tls_handshake_limiter    = Hyperion::TLS::HandshakeRateLimiter.new(tls_handshake_rate_limit)
     end
+
+    # Read-only handle for tests + bench harness introspection.
+    attr_reader :tls_handshake_limiter
 
     # Read-only handle to the per-worker SSL context (nil when the
     # listener is plain TCP). Exposed so the worker can call
@@ -191,7 +206,10 @@ module Hyperion
 
     def start
       listen unless @server
-      @thread_pool = ThreadPool.new(size: @thread_count, max_pending: @max_pending) if @thread_count.positive?
+      if @thread_count.positive?
+        @thread_pool = ThreadPool.new(size: @thread_count, max_pending: @max_pending,
+                                      max_in_flight_per_conn: @max_in_flight_per_conn)
+      end
       maybe_start_admin_listener
 
       if @tls || @async_io
@@ -255,9 +273,10 @@ module Hyperion
           # start_async_loop's `inline_h1_no_pool` branch.
           mode = DispatchMode.new(:inline_h1_no_pool)
           record_dispatch(mode)
-          Connection.new(runtime: @explicit_runtime ? @runtime : nil).serve(
-            socket, @app, max_request_read_seconds: @max_request_read_seconds
-          )
+          Connection.new(runtime: @explicit_runtime ? @runtime : nil,
+                         max_in_flight_per_conn: @max_in_flight_per_conn).serve(
+                           socket, @app, max_request_read_seconds: @max_request_read_seconds
+                         )
         end
       end
     end
@@ -399,9 +418,10 @@ module Hyperion
         #      and would defeat hyperion-async-pg / async-redis on the
         #      TLS h1 path.
         record_dispatch(mode)
-        Connection.new(runtime: @explicit_runtime ? @runtime : nil).serve(
-          socket, @app, max_request_read_seconds: @max_request_read_seconds
-        )
+        Connection.new(runtime: @explicit_runtime ? @runtime : nil,
+                       max_in_flight_per_conn: @max_in_flight_per_conn).serve(
+                         socket, @app, max_request_read_seconds: @max_request_read_seconds
+                       )
       when :threadpool_h1
         # HTTP/1.1 default plain-HTTP path, OR explicit async_io: false on
         # TLS (operator opted out of inline-on-fiber dispatch). Hand the
@@ -419,18 +439,20 @@ module Hyperion
           # started the pool — serve inline and count under
           # threadpool_h1 (the connection's logical mode).
           record_dispatch(mode)
-          Connection.new(runtime: @explicit_runtime ? @runtime : nil).serve(
-            socket, @app, max_request_read_seconds: @max_request_read_seconds
-          )
+          Connection.new(runtime: @explicit_runtime ? @runtime : nil,
+                         max_in_flight_per_conn: @max_in_flight_per_conn).serve(
+                           socket, @app, max_request_read_seconds: @max_request_read_seconds
+                         )
         end
       when :inline_h1_no_pool
         # `-t 0` on the TLS / async-wrap path. Rare config — debug /
         # spec aid (RFC §5 Q3 keeps `--async-io -t 0` valid). Counted
         # under its own bucket now (pre-1.7 it was un-counted).
         record_dispatch(mode)
-        Connection.new(runtime: @explicit_runtime ? @runtime : nil).serve(
-          socket, @app, max_request_read_seconds: @max_request_read_seconds
-        )
+        Connection.new(runtime: @explicit_runtime ? @runtime : nil,
+                       max_in_flight_per_conn: @max_in_flight_per_conn).serve(
+                         socket, @app, max_request_read_seconds: @max_request_read_seconds
+                       )
       end
     end
 

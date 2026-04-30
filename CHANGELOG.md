@@ -80,6 +80,81 @@ connections per request) can flip it on for A/B.
 
 Spec count: 698 (2.2.0) → 714 (+ 16 io_uring specs).
 
+### 2.3-B — per-conn fairness cap + TLS handshake CPU throttle
+
+**Why this matters.** The user's deployment shape is plaintext h1
+behind nginx + LB. nginx multiplexes many client requests onto a
+small number of upstream connections via HTTP/1.1 keep-alive. **One
+greedy upstream connection** (nginx pipelining many requests through
+it) can starve other connections — a CPU-bound JSON serialize in the
+wrong place lets one client hog the worker thread pool while
+everyone else's p99 climbs.
+
+Two related defences ship together:
+
+1. **Per-conn fairness cap.** `Hyperion::Connection` now carries an
+   in-flight counter and an optional ceiling. When a request arrives
+   and the cap would be exceeded, the connection answers with a
+   canned `503 Service Unavailable` + `Retry-After: 1` and stays
+   alive. nginx (or any peer) retries the request after the in-flight
+   work drains. Default cap = `nil` (no cap, matches 2.2.0); the
+   recommended setting is `pool/4` so no single conn can use more
+   than 25% of the worker's thread budget. `:auto` resolves at
+   `Config#finalize!` to `thread_count / 4`, floor 1.
+
+2. **TLS handshake CPU throttle.** A new
+   `Hyperion::TLS::HandshakeRateLimiter` token bucket caps SSL_accept
+   CPU per worker. Defends direct-exposure operators against
+   handshake storms (e.g., during a deployment when nginx restarts
+   and reconnects everything). Default = `:unlimited` (matches
+   2.2.0). For nginx-fronted topologies this is mostly defensive —
+   nginx keeps long-lived upstream conns so handshake rate is
+   normally near-zero.
+
+**What ships:**
+
+| Deliverable | Where | Why |
+|---|---|---|
+| `Hyperion::Connection` per-conn semaphore | `lib/hyperion/connection.rb` | Mutex-guarded `@in_flight` counter; admit/release helpers; canned `REJECT_503_PER_CONN_OVERLOAD` payload (no allocation per reject); deduplicated `:per_conn_overload_rejects` warn (one per Connection lifetime). |
+| `Hyperion::Config#max_in_flight_per_conn` | `lib/hyperion/config.rb` | Top-level knob (not nested — applies to every conn, not h2-specific). Tri-state: `nil` (default, no cap), positive Integer (explicit cap), `:auto` (resolves to `thread_count / 4`, floor 1, at finalize time). |
+| `Hyperion::Config#tls.handshake_rate_limit` | `lib/hyperion/config.rb` | Token-bucket budget in handshakes/sec/worker. `:unlimited` (default) or positive Integer. |
+| `Hyperion::TLS::HandshakeRateLimiter` | `lib/hyperion/tls.rb` | Mutex-guarded token-bucket. `acquire_token!` returns true when budget available, false when over budget. `:unlimited` short-circuits every call to true so the hot path stays branchless. |
+| CLI `--max-in-flight-per-conn VALUE` + `HYPERION_MAX_IN_FLIGHT_PER_CONN` env var | `lib/hyperion/cli.rb` | Same parser/env-var pattern as fix-D `--h2-max-total-streams`. `auto` resolves at finalize. |
+| CLI `--tls-handshake-rate-limit VALUE` + `HYPERION_TLS_HANDSHAKE_RATE_LIMIT` env var | `lib/hyperion/cli.rb` | Same pattern. `unlimited` is the default sentinel. |
+| Plumbing through Server / Worker / Master / ThreadPool | 4 files | The cap propagates from `Config` → CLI → `Server.new` → `ThreadPool` → every Connection the worker thread builds. The TLS limiter lives on `Server#tls_handshake_limiter` (one per worker). |
+| `spec/hyperion/per_conn_fairness_spec.rb` | NEW (24 examples) | Cap=nil = 2.2.0 behaviour; cap=N admits + rejects; 503 + Retry-After + per-connection overload body verified; metric + dedup-warn coverage; finalize! resolves `:auto` to `thread_count/4`; CLI flag + env var grammar tests. |
+| `spec/hyperion/tls_handshake_throttle_spec.rb` | NEW (19 examples) | Limiter `:unlimited` = no throttle (regression); 100/sec rate admits ~100, rejects ~100 in a 200-attempt burst; refill over 0.55s adds ~25 tokens; capacity bounded (no infinite accrual); thread-safety; CLI + env var coverage. |
+
+**Default unchanged.** The cap is an opt-in hardening tool, not a
+default flip. Existing operators upgrading from 2.2.0 → 2.3.0 see
+identical behaviour without setting either knob. Operators who want
+the fairness cap on for `-t 16` workers add
+`max_in_flight_per_conn :auto` to their config (or pass
+`--max-in-flight-per-conn auto` / set
+`HYPERION_MAX_IN_FLIGHT_PER_CONN=auto`). Pattern matches fix-D's
+`--h2-max-total-streams`: configure once, no daemon reload required.
+
+**Bench plan (deferred; openclaw-vm SSH key not loaded in this
+session).** The contended-workload shape is:
+
+```sh
+# Setup: a Rack app where one client gets a 50ms handler, others fast.
+# Run two wrk processes simultaneously: one client × 1000 req/s
+# (greedy, on one connection), 50 clients × 10 req/s (light, on
+# 50 connections). Measure p99 of the light clients.
+```
+
+Compare 2.2.0 baseline vs 2.3-B with `--max-in-flight-per-conn 4`
+(for `-t 16`). Target: light-client p99 -20-30%. Simpler proxy if
+the contended-workload bench is too involved to set up cleanly: run
+`wrk -t1 -c1` (single client, single conn) at peak rps, then
+`wrk -t1 -c100` (100 clients, 100 conns) at peak rps, compare
+per-conn-msg-rate. The bench will land as a separate `[bench]`
+commit when SSH is available.
+
+Spec count: 714 → 757 (+ 24 fairness + 19 throttle = 43 new specs,
+0 regressions).
+
 ## [2.2.0] - 2026-05-01
 
 ### Headline

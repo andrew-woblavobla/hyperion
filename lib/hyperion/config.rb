@@ -46,7 +46,18 @@ module Hyperion
       #   :on   — demand it; raise at boot if unsupported.
       # Default flips to :auto in 2.4 only after soak. Operators flip on
       # via `HYPERION_IO_URING={on,auto}` env var to A/B test.
-      io_uring: :off
+      io_uring: :off,
+      # 2.3-B: per-connection in-flight cap. nginx upstream keep-alive
+      # pipelines many client requests through one upstream connection;
+      # without this cap a single greedy upstream conn can hog the worker
+      # thread pool and starve siblings. Tri-state:
+      #   * Integer >= 1 — explicit cap (e.g., `4` for `-t 16`).
+      #   * :auto         — `Config#finalize!` resolves to `thread_count / 4`
+      #                     (rounded down, minimum 1). Operator opt-in.
+      #   * nil (default) — no cap; matches 2.2.0 behaviour. Hyperion is
+      #                     opt-in by default — the cap is a hardening tool
+      #                     that operators turn on, not a default flip.
+      max_in_flight_per_conn: nil
     }.freeze
 
     HOOKS = %i[before_fork on_worker_boot on_worker_shutdown].freeze
@@ -129,6 +140,11 @@ module Hyperion
       end
     end
 
+    # 2.3-B: top-level `:auto` sentinel for `max_in_flight_per_conn`.
+    # `Config#finalize!` resolves to `thread_count / 4`, floor 1. Plain
+    # symbol (no nested struct) because the only knob is the cap value.
+    MAX_IN_FLIGHT_PER_CONN_AUTO = :auto
+
     # TLS subconfig. New in 1.8.0 (Phase 4 — TLS session resumption).
     # `session_cache_size` controls the size of the in-process server-
     # side session cache used to short-circuit the full handshake when a
@@ -143,7 +159,7 @@ module Hyperion
     # Set to `:NONE` to disable rotation entirely (workloads that don't
     # care about ticket-key rotation security guarantees).
     class TlsConfig
-      ATTRS = %i[session_cache_size ticket_key_rotation_signal ktls].freeze
+      ATTRS = %i[session_cache_size ticket_key_rotation_signal ktls handshake_rate_limit].freeze
       attr_accessor(*ATTRS)
 
       DEFAULT_SESSION_CACHE_SIZE = 20_480
@@ -153,11 +169,21 @@ module Hyperion
       #   :on   — force enable; raise at boot if unsupported
       #   :off  — never enable, always use userspace SSL_write
       DEFAULT_KTLS               = :auto
+      # 2.3-B: TLS handshake CPU throttle. Token-bucket budget for
+      # SSL_accept calls per second per worker. Defends direct-exposure
+      # operators against handshake storms (e.g., many short-lived TLS
+      # clients reconnecting at once during a deployment). For the
+      # nginx-fronted topology this is mostly defensive — nginx keeps
+      # long-lived upstream conns so handshake rate is normally near-zero.
+      #   * Integer >= 1 — handshakes/sec/worker (capacity == rate).
+      #   * :unlimited (default) — no limit; matches 2.2.0 behaviour.
+      DEFAULT_HANDSHAKE_RATE_LIMIT = :unlimited
 
       def initialize
         @session_cache_size         = DEFAULT_SESSION_CACHE_SIZE
         @ticket_key_rotation_signal = DEFAULT_ROTATION_SIGNAL
         @ktls                       = DEFAULT_KTLS
+        @handshake_rate_limit       = DEFAULT_HANDSHAKE_RATE_LIMIT
       end
     end
 
@@ -181,7 +207,8 @@ module Hyperion
       worker_check_interval: %i[worker_health check_interval],
       log_level: %i[logging level],
       log_format: %i[logging format],
-      log_requests: %i[logging requests]
+      log_requests: %i[logging requests],
+      tls_handshake_rate_limit: %i[tls handshake_rate_limit]
     }.freeze
 
     def initialize
@@ -236,6 +263,12 @@ module Hyperion
       when H2Settings::UNBOUNDED
         @h2.max_total_streams = nil
       end
+      # 2.3-B: resolve the `:auto` sentinel for the per-conn fairness
+      # cap. `thread_count / 4` (floor 1) gives each conn at most 25% of
+      # the worker's thread budget — the recommended default. Operators
+      # who set an explicit integer at config time keep their value
+      # untouched; nil (no cap, 2.2.0 default) is also preserved.
+      @max_in_flight_per_conn = compute_max_in_flight_per_conn if @max_in_flight_per_conn == MAX_IN_FLIGHT_PER_CONN_AUTO
       self
     end
 
@@ -248,6 +281,19 @@ module Hyperion
       cap_per_conn = @h2.max_concurrent_streams || H2Settings.new.max_concurrent_streams
       worker_count = (workers && workers.positive? ? workers : 1)
       cap_per_conn * worker_count * 4
+    end
+
+    # 2.3-B per-conn fairness default: `thread_count / 4`, floor 1.
+    # Each conn caps at 25% of the worker's thread budget so a single
+    # greedy upstream connection can't starve siblings. Floor of 1
+    # ensures degenerate `-t 1` / `-t 2` / `-t 3` configurations still
+    # serve traffic (cap 1 = strictly serial per conn, but no rejects
+    # while no conn is currently dispatched).
+    def compute_max_in_flight_per_conn
+      threads = (@thread_count && @thread_count.positive? ? @thread_count : 1)
+      cap = threads / 4
+      cap = 1 if cap < 1
+      cap
     end
 
     # Apply CLI overrides on top of an existing config. Only non-nil values
