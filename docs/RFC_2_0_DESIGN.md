@@ -493,7 +493,7 @@ Belongs in 2.x or 3.0:
 - **JRuby / TruffleRuby first-class support.** Pure-Ruby parser path stays correct; perf work for non-MRI is its own track.
 - **Streaming request bodies (full duplex).** `Connection#read_request` buffers full body today. Phase-5 placeholder note in code; not a 2.0 commitment.
 - **kTLS / OpenSSL 4.x sendfile-with-encrypt.** Kernel-version-gated.
-- **WebSocket framing.** Not supported, no plans for 2.0.
+- **WebSocket framing.** Not supported in 2.0. **Shipped in 2.1.0** (WS-1/2/3/4 — Rack 3 full hijack, RFC 6455 handshake interception, native frame codec, per-connection wrapper). HTTP/1.1 only; WebSocket-over-HTTP/2 (RFC 8441 Extended CONNECT) and permessage-deflate (RFC 7692) remain out of scope. See [`docs/WEBSOCKETS.md`](WEBSOCKETS.md).
 - **Admin endpoints beyond drain + metrics** (`/-/reload`, `/-/config`). The admin port's single use case is metrics + drain.
 - **Multi-host listener config.** Run multiple Hyperion processes for multi-listener needs.
 

@@ -33,6 +33,7 @@ Default is **off** so fiber-unaware apps keep 1.2.0's raw-loop fast path. Flip i
 
 ## Why migrate
 
+- **ActionCable now works on a single-binary Hyperion deploy** (2.1.0+) — `mount ActionCable.server => '/cable'` runs in the same `hyperion` process as your HTTP/1.1, HTTP/2, and TLS traffic; no separate cable container, no nginx WS upgrade. See [`WEBSOCKETS.md`](WEBSOCKETS.md).
 - **Same throughput or better** at parity threads on every Rails workload tested. With access logs default-ON, Hyperion still beats Puma on hello-world (1.27×), production-cluster (1.17×), and Linux DB-backed (~1.02×). With `--no-log-requests` the lead widens.
 - **Structured access logs out of the box** — every request gets a JSON line with method/path/status/duration_ms/remote_addr. No `Rails::Rack::Logger` or `lograge` needed for basic operability.
 - **HTTP/2 + TLS native** — no nginx required just to talk h2 to browsers.

@@ -1,6 +1,20 @@
 # Changelog
 
-## [Unreleased] — 2.1.0
+## [2.1.0] - 2026-04-30
+
+**Headline:** WebSocket support — RFC 6455 over Rack 3 full hijack, with a
+native frame codec, a per-connection wrapper, and an e2e smoke test. Spec
+count **530 → 632 (+102)**.
+
+> **ActionCable on Hyperion is now a supported deployment model.** A single
+> `hyperion -w 4 -t 10 config.ru` process serves HTTP, HTTP/2, TLS, **and**
+> ActionCable from the same listener. The Rails-on-Puma split-deploy
+> ("puma for HTTP, separate cable container for WS") is no longer required.
+> See [`docs/WEBSOCKETS.md`](docs/WEBSOCKETS.md) for the recipe.
+
+Out of scope for 2.1.0, deferred to 2.2.x: WebSocket-over-HTTP/2
+(RFC 8441 Extended CONNECT), permessage-deflate (RFC 7692), send-side
+fragmentation. HTTP/1.1 is the sole transport for WS this release.
 
 ### Rack 3 hijack support (WS-1)
 
@@ -261,6 +275,13 @@ Deferred to a follow-up:
   regardless of payload size. Browsers / well-behaved clients
   handle multi-MB single frames; an opt-in `fragment_threshold:`
   can be added later if a use case shows up.
+
+### Test fixtures
+
+* `spec/hyperion/http2_settings_spec.rb` — relax the logger expectation
+  so the Phase 6b codec-boot info line ("h2 codec selected") doesn't
+  trip the spec on hosts where the native h2 codec is loaded. CI fix
+  on top of 2.0.1, folded into 2.1.0.
 
 ## [2.0.1] - 2026-04-30
 

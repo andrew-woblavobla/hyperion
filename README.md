@@ -11,9 +11,21 @@ gem install hyperion-rb
 bundle exec hyperion config.ru
 ```
 
+## What's new in 2.1.0
+
+**WebSockets.** RFC 6455 over Rack 3 full hijack, native frame codec,
+per-connection wrapper with auto-pong / close handshake / UTF-8 validation /
+per-message size cap. **ActionCable on Hyperion is now a single-binary
+deployment** — one `hyperion -w 4 -t 10 config.ru` process serves HTTP,
+HTTP/2, TLS, **and** `/cable` from the same listener; no separate cable
+container required. HTTP/1.1 only this release; WS-over-HTTP/2 (RFC 8441
+Extended CONNECT) and permessage-deflate (RFC 7692) defer to 2.2.x.
+See [`docs/WEBSOCKETS.md`](docs/WEBSOCKETS.md).
+
 ## Highlights
 
 - **HTTP/1.1 + HTTP/2 + TLS** out of the box (HTTP/2 with per-stream fiber multiplexing, WINDOW_UPDATE-aware flow control, ALPN auto-negotiation).
+- **WebSockets (RFC 6455)** — full handshake, native frame codec, per-connection wrapper. ActionCable + faye-websocket work on a single-binary deploy. See [`docs/WEBSOCKETS.md`](docs/WEBSOCKETS.md). (2.1.0+, HTTP/1.1 only.)
 - **Pre-fork cluster** with per-OS worker model: `SO_REUSEPORT` on Linux, master-bind + worker-fd-share on macOS/BSD (Darwin's `SO_REUSEPORT` doesn't load-balance).
 - **Hybrid concurrency**: fiber-per-connection for I/O, OS-thread pool for `app.call(env)` — synchronous Rack handlers (Rails, ActiveRecord, anything holding a global mutex) get true OS-thread concurrency.
 - **Vendored llhttp 9.3.0** C parser; pure-Ruby fallback for non-MRI runtimes.
