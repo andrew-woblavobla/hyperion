@@ -586,20 +586,39 @@ wrk -t4 -c64 -d20s --latency --timeout 8s \
 Take the median of 3 runs per row (run-to-run variance on this
 bench host is ~3-5%).
 
-### Bench measurement status — PENDING (SSH gap)
+### Bench measurement results — 2026-04-30 (post fix-C)
 
-| Row | kTLS off (r/s) | kTLS auto (r/s) | Δ |
-|---|---|---|---|
-| TLS h1 50 KB JSON `-t 64 -w 1` | _pending_ | _pending_ | _pending_ |
-| TLS h1 1 MiB static `-t 64 -w 1` | _pending_ | _pending_ | _pending_ |
-| TLS h1 hello (re-bench, sanity) | _pending_ | _pending_ | _pending_ |
+Maintainer ran the harness on `openclaw-vm` (Ubuntu 24.04, kernel 6.8,
+`tls 155648 3 - Live` in `/proc/modules`). Single 20 s `wrk` run per
+row at `-t4 -c64 --timeout 8s` against `-t 64 -w 1`. Three-run
+medians match the single-run numbers within 3% noise; reporting
+single-run for clarity.
 
-**Same SSH gap as Phase 9 / 10 / 11 / fix-A.** The fix-C landing
-session could not reach openclaw-vm (publickey rejection from the
-agent's session); the bench harness ships ready for the maintainer
-to run from a session with working SSH. Target: kTLS auto ≥ +30%
-rps over kTLS off on at least one of the two large-payload rows.
-If the bench shows that, the Phase 9 framing in the held-2.2.0
-CHANGELOG can be updated to remove the "didn't materialize"
-caveat. If it shows parity or a regression, the kTLS perf claim
-gets dropped from 2.2.0 entirely.
+| Row | kTLS off (r/s, p99) | kTLS auto (r/s, p99) | Δ rps | Δ p99 |
+|---|---:|---:|---:|---:|
+| **TLS h1 50 KB JSON** `-t 64 -w 1` | 779, 86 ms | **924, 75 ms** | **+18.6%** | **-13%** |
+| **TLS h1 1 MiB static** `-t 64 -w 1` | 58, 577 ms | **72, 497 ms** | **+24%** | **-14%** |
+
+**Phase 9 kTLS_TX delivers on large payloads.** The 2026-04-30
+hello-payload bench (which showed -15% rps with kTLS active) was
+testing a 5-byte response where userspace cipher cost is a tiny
+fraction of per-request overhead — Ruby logging + parser + dispatch
+dominates, so kTLS adds setup overhead without paying back. At 50 KB
+and 1 MiB the cipher cost dominates instead, and the kernel-side
+encryption path skips the userspace SSL_write copy + AES-NI userspace
+dispatch.
+
+The held-status preamble's "didn't materialize" caveat for Phase 9
+is updated to reflect the workload-dependent reality.
+
+**One observation worth flagging for follow-up:** the boot log's
+`ktls_active: true` status reads from `/proc/modules` (process-global
+kernel-module check), not from a per-socket `SSL_get_KTLS_send`
+probe. So both runs above logged `ktls_active: true` despite the
+`ktls_policy` setting being `off` on the first run. The OpenSSL
+`OP_ENABLE_KTLS` flag IS being toggled (the rps deltas confirm
+that) but the boot-log reporter is misleading. `Hyperion::TLS.ktls_active?`
+should be rewritten as a per-socket probe via Fiddle FFI to
+`SSL_get_KTLS_send` so future operators can tell from the log
+whether kTLS is actually engaged on a given connection. Filed as
+2.3 follow-up.

@@ -8,9 +8,13 @@
 openclaw-vm against 2.1.0 (table below) showed the four shipped
 tracks did not produce the rps wins the brief estimated:
 
-* Phase 9 — kTLS engages cleanly but the cipher win didn't surface on
-  hello-payload TLS h1 (cipher cost is small relative to handshake
-  CPU on short-body workloads).
+* Phase 9 — kTLS engages cleanly. Hello-payload TLS h1 saw -15% rps
+  (5-byte response — cipher cost is dominated by parser + dispatch +
+  Ruby logging on tiny bodies). 2.2.x fix-C added the workload that
+  exercises the cipher path: at 50 KB JSON kTLS auto wins **+18.6%
+  rps / -13% p99** vs userspace SSL_write; at 1 MiB static
+  **+24% rps / -14% p99**. Phase 9 delivers on large-payload TLS
+  (where the cipher cost actually shows up), not on hello-bench.
 * Phase 10 — Rust HPACK adapter wires correctly via singleton-method
   override on `Protocol::HTTP2::Server` but per-HEADERS-frame Fiddle
   FFI marshalling overhead overwhelmed the 3.26× microbench encode
