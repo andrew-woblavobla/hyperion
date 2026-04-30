@@ -54,10 +54,29 @@ the env var to A/B, flip the default to `:auto` only after 6 months
 of soak. io_uring code in production has too many sharp edges to
 default-on without field validation.
 
-**Bench delta on openclaw-vm:** to be re-measured by the maintainer
-on the bench host. Auto-mode bench attempt from the dev sandbox is
-documented in the 2.3-A commit body; the gem ships with the code +
-specs + CHANGELOG even where the bench harness was unreachable.
+**Bench delta on openclaw-vm — measured 2026-04-30 (post Linux build fix `599775a`):**
+
+| Row | epoll baseline | io_uring (HYPERION_IO_URING=on) | Δ |
+|---|---:|---:|---:|
+| hello `-w 16 -t 5` | 90,022 r/s | 91,228 r/s | +1.3% (noise) |
+| hello `-w 4 -t 5` | 21,184 r/s | 22,073 r/s | +4.2% |
+
+io_uring engages cleanly (boot log: `io_uring accept policy resolved
+policy=on active=true supported=true`) but the rps delta is inside
+the bench-noise envelope. The hello workload at 90k r/s on -w 16 is
+**Ruby-dispatch-bound, not accept-syscall-bound** — each accept is
+already one syscall on the epoll path (`accept_nonblock` + `IO.select`
+on EAGAIN); the kernel-side time difference between that and an
+io_uring accept SQE is small relative to the per-request env hash
+construction + body iteration + response writing. The expected win
+zone for io_uring is high-churn accept-bound workloads (e.g.,
+many short-lived connections, multi-connection accept batching with
+`IORING_OP_ACCEPT_MULTI`); on long-keepalive wrk benches like ours,
+the accept rate is just (connection count / wrk run duration) =
+200/20s = 10/sec, which neither path is paying for. Default stays
+`:off` — operators with high-accept-churn shapes (RPC ingress,
+short-lived workers behind a TCP load balancer that opens fresh
+connections per request) can flip it on for A/B.
 
 Spec count: 698 (2.2.0) → 714 (+ 16 io_uring specs).
 
