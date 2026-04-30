@@ -112,8 +112,21 @@ module Hyperion
           # and authoritative.
           return @splice_runtime_supported if defined?(@splice_runtime_supported)
 
-          @splice_runtime_supported =
-            respond_to?(:splice_supported?) && splice_supported?
+          # 2.2.0 — opt-in only.  Bench on openclaw-vm (Apr 2026) showed
+          # splice + pipe2-per-chunk is a -23% rps regression vs plain
+          # sendfile(2) on 1 MiB assets because each 64 KiB chunk eats
+          # 3 extra syscalls (pipe2 + 2× close) at the kernel boundary.
+          # The correctness fix (fresh-pipe-per-call closes the
+          # cross-conn bytes-leak window from 2.0.1) ships, but the
+          # path stays opt-in until the C ext hoists pipe creation
+          # out of the chunk loop.  Operators wanting to A/B test on
+          # other kernels can flip HYPERION_HTTP_SPLICE=1.
+          enabled =
+            ENV['HYPERION_HTTP_SPLICE'] == '1' &&
+            respond_to?(:splice_supported?) &&
+            splice_supported?
+
+          @splice_runtime_supported = enabled
         end
 
         # Called by native_copy_loop when copy_splice reports

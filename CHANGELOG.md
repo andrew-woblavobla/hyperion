@@ -1,8 +1,53 @@
 # Changelog
 
-## [Unreleased] - 2.2.0
+## [Unreleased] - 2.2.0 (HELD — see Bench sweep notes)
 
-### Static-file splice path re-enabled (fresh per-request pipe pair)
+### Status
+
+**2.2.0 is held pending a follow-up sprint.** A bench sweep on
+openclaw-vm against 2.1.0 (table below) showed the four shipped
+tracks did not produce the rps wins the brief estimated:
+
+* Phase 9 — kTLS engages cleanly but the cipher win didn't surface on
+  hello-payload TLS h1 (cipher cost is small relative to handshake
+  CPU on short-body workloads).
+* Phase 10 — Rust HPACK adapter wires correctly via singleton-method
+  override on `Protocol::HTTP2::Server` but per-HEADERS-frame Fiddle
+  FFI marshalling overhead overwhelmed the 3.26× microbench encode
+  win on real h2 traffic. Default OFF behind `HYPERION_H2_NATIVE_HPACK`.
+* Phase 11 — Allocation reductions are real (-53% per-request, -78%
+  on `build_env`) and locked by `yjit_alloc_audit_spec`, but rps
+  stayed flat on the bench rows we ran (workloads bound elsewhere).
+* Splice fix — Correctness fix lands (per-request fresh
+  `pipe2(O_CLOEXEC | O_NONBLOCK)` closes the cross-conn bytes-leak
+  window from 2.0.1) but per-chunk `pipe2 + 2× close` on 64 KiB
+  chunks regressed static 1 MiB by -23%. Gated to opt-in via
+  `HYPERION_HTTP_SPLICE=1`; default off preserves 2.1.0 plain-sendfile rps.
+
+The fixes that would unlock the perf wins (FFI-marshalling rewrite for
+Phase 10, pipe-hoist out of the chunk loop for splice, larger-payload
+TLS bench harness for Phase 9) are queued for the 2.2.x follow-up
+sprint. **No version tag.** Code is on master (commits b4ca6a0,
+4d8af74, 5c00b15, e105bc6); operators should continue running 2.1.0.
+
+### Bench sweep notes (openclaw-vm, 2026-04-30, vs 2.1.0 baseline)
+
+| Row | 2.1.0 | 2.2.0 default | Δ | Notes |
+|---|---:|---:|---:|---|
+| hello -w 4 -t 5 | 20,630 | 20,077 | -2.7% (noise) | Phase 11 allocation cuts don't show on this row |
+| work.ru -w 4 -t 5 | 15,585 | 14,415 | -7.5% | Within run-to-run variance |
+| static 1 MiB -w 1 -t 5 | 1,697 | 1,312 with splice on | -22.7% | Per-chunk pipe2 overhead surfaced — splice gated to opt-in |
+| static 8 KB -w 1 -t 5 | 1,483 | 1,359 | -8.4% | Within variance |
+| TLS h1 -w 1 -t 64 | 3,425 | 2,909 | -15.1% | kTLS confirmed engaged via boot log + `/proc/modules`, but cipher cost on hello-payload is small relative to handshake CPU |
+| h2load c=1 m=100 default | 1,597 | n/a | — | h2.max_total_streams default flip from 2.0 closes the conn after 512 streams; needs explicit `:unbounded` override for fair comparison |
+| h2load c=1 m=100 + Rust HPACK | n/a | n/a | — | Rust crate didn't load on bench host (no cargo); `Hyperion::H2Codec.available?` returned false. The adapter is shipped but unverified at the wire level on this host. |
+
+The +45% / +60% / +21% targets the 2.2.0 brief estimated did not
+materialize on the bench harness. The implementations are correct
+(unit specs cover them); the performance characterizations were
+optimistic on the workloads we benched.
+
+### Static-file splice path re-enabled (fresh per-request pipe pair) — opt-in
 
 The `splice(2)`-through-pipe primitive shipped in 2.0.1 (Phase 8b) was
 **disabled in the production hot path** in the same release because the
