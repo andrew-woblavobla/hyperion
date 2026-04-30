@@ -499,9 +499,12 @@ module Hyperion
       return if Hyperion::Http2Handler.instance_variable_get(:@codec_state_logged)
 
       Hyperion::Http2Handler.instance_variable_set(:@codec_state_logged, true)
+      cglue_active = @h2_native_hpack_enabled && Hyperion::H2Codec.cglue_available?
       mode =
-        if @h2_native_hpack_enabled
-          'native (Rust) — HPACK on hot path'
+        if @h2_native_hpack_enabled && cglue_active
+          'native (Rust v3 / CGlue) — HPACK on hot path, no Fiddle per call'
+        elsif @h2_native_hpack_enabled
+          'native (Rust v2 / Fiddle) — HPACK on hot path, Fiddle marshalling per call'
         elsif @h2_codec_available
           'fallback (protocol-http2 / pure Ruby HPACK) — native available, opt-in via HYPERION_H2_NATIVE_HPACK=1'
         else
@@ -513,7 +516,12 @@ module Hyperion
           mode: mode,
           native_available: @h2_codec_available,
           native_enabled: @h2_native_hpack_enabled,
-          hpack_path: @h2_native_hpack_enabled ? 'native' : 'pure-ruby'
+          cglue_active: cglue_active,
+          hpack_path: if @h2_native_hpack_enabled
+                        cglue_active ? 'native-v3' : 'native-v2'
+                      else
+                        'pure-ruby'
+                      end
         }
       end
       @metrics.increment(:h2_codec_native_selected) if @h2_native_hpack_enabled
