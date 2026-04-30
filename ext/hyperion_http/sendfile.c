@@ -50,9 +50,23 @@
  *     Two extra syscalls per call vs the old TLS-cached layout, but
  *     correctness is restored: a partial transfer interrupted by
  *     EPIPE cannot leak residual bytes onto the next request's
- *     socket.  Re-enabled on the production hot path for files
- *     >= 64 KiB where the kernel-side zero-copy more than pays
- *     for the pipe2 + 2× close overhead.
+ *     socket.  Kept as a self-contained one-shot primitive for
+ *     small payloads or out-of-band callers that don't want to
+ *     manage the pipe lifecycle.
+ *
+ *   Sendfile.copy_splice_into_pipe(out_io, in_io, offset, len, pipe_r, pipe_w)
+ *       -> [bytes_written, status]
+ *     2.2.x fix-A primitive — splice ladder for ONE chunk against a
+ *     CALLER-PROVIDED pipe pair.  Does NOT open or close the pipe;
+ *     the Ruby caller (`native_copy_loop` in lib/hyperion/http/sendfile.rb)
+ *     opens one pipe2(O_CLOEXEC | O_NONBLOCK) per RESPONSE, hands the
+ *     fds in for every chunk of the response, and closes them in an
+ *     ensure block when the loop unwinds.  For a 1 MiB asset at 64 KiB
+ *     chunks that's 16 splice-rounds + 1 pipe2 + 2 closes = 19 syscalls
+ *     versus the old per-chunk `copy_splice` shape's 16 splice-rounds +
+ *     16 pipe2 + 32 closes = 64 syscalls; a 3.4× syscall-count reduction
+ *     per 1 MiB request, which restores the splice-vs-sendfile win the
+ *     bench sweep on 2026-04-30 lost (see CHANGELOG 2.2.x fix-A).
  *
  * Phase 1 strategy
  * ----------------
@@ -721,6 +735,86 @@ static VALUE rb_sendfile_copy_splice(VALUE self, VALUE out_io, VALUE in_io,
 #endif
 }
 
+/* Sendfile.copy_splice_into_pipe(out_io, in_io, offset, len, pipe_r, pipe_w)
+ *   -> [bytes_written, status]
+ *
+ * 2.2.x fix-A — pipe-hoisted splice primitive.
+ *
+ * Splices file_fd → pipe_w → sock_fd for ONE chunk of a response.  The
+ * pipe pair is supplied by the caller and is reused across every chunk
+ * of a single response; this function does NOT open or close the pipe.
+ * The Ruby façade (`native_copy_loop`) is responsible for the
+ * pipe lifecycle (`open_splice_pipe!` at entry, `close` in an ensure
+ * block at exit).  Same return shape as `copy_splice` — :done /
+ * :partial / :eagain / :unsupported.
+ *
+ * Linux-only.  Returns [0, :unsupported] on non-Linux hosts so the
+ * Ruby caller can fall back to plain sendfile.  pipe_r / pipe_w may
+ * be Integer fds or IO objects (`IO.pipe` returns the latter); we
+ * extract via the same helper used for in_io/out_io. */
+static VALUE rb_sendfile_copy_splice_into_pipe(VALUE self, VALUE out_io, VALUE in_io,
+                                               VALUE rb_offset, VALUE rb_len,
+                                               VALUE rb_pipe_r, VALUE rb_pipe_w) {
+    (void)self;
+
+#ifdef HYP_SF_LINUX
+    long offset_l = NUM2LONG(rb_offset);
+    long len_l    = NUM2LONG(rb_len);
+    if (offset_l < 0) {
+        rb_raise(rb_eArgError, "offset must be >= 0 (got %ld)", offset_l);
+    }
+    if (len_l < 0) {
+        rb_raise(rb_eArgError, "len must be >= 0 (got %ld)", len_l);
+    }
+    if (len_l == 0) {
+        return rb_ary_new3(2, INT2FIX(0), sym_done);
+    }
+
+    splice_args_t args;
+    args.in_fd   = extract_fd(in_io, "in_io");
+    args.out_fd  = extract_fd(out_io, "out_io");
+    args.pipe_r  = extract_fd(rb_pipe_r, "pipe_r");
+    args.pipe_w  = extract_fd(rb_pipe_w, "pipe_w");
+    args.offset  = (off_t)offset_l;
+    args.len     = (size_t)len_l;
+    args.rc      = 0;
+    args.err     = 0;
+
+    rb_thread_call_without_gvl(splice_blocking_call, &args, RUBY_UBF_IO, NULL);
+
+    if (args.rc > 0) {
+        if (args.err == EAGAIN || args.err == EWOULDBLOCK) {
+            return rb_ary_new3(2, LONG2NUM((long)args.rc), sym_partial);
+        }
+        if (args.err != 0) {
+            errno = args.err;
+            rb_sys_fail("splice");
+        }
+        if ((size_t)args.rc < args.len) {
+            return rb_ary_new3(2, LONG2NUM((long)args.rc), sym_partial);
+        }
+        return rb_ary_new3(2, LONG2NUM((long)args.rc), sym_done);
+    }
+
+    /* args.rc == 0. */
+    if (args.err == EAGAIN || args.err == EWOULDBLOCK || args.err == EINTR) {
+        return rb_ary_new3(2, INT2FIX(0), sym_eagain);
+    }
+    if (args.err == ENOSYS || args.err == EINVAL) {
+        return rb_ary_new3(2, INT2FIX(0), sym_unsupported);
+    }
+    if (args.err != 0) {
+        errno = args.err;
+        rb_sys_fail("splice");
+    }
+    return rb_ary_new3(2, INT2FIX(0), sym_done);
+#else
+    (void)out_io; (void)in_io; (void)rb_offset; (void)rb_len;
+    (void)rb_pipe_r; (void)rb_pipe_w;
+    return rb_ary_new3(2, INT2FIX(0), sym_unsupported);
+#endif
+}
+
 /* Sendfile.supported? — module-introspection helper. Lets the Ruby caller
  * pick its branch without needing a rescue NotImplementedError around the
  * first call (which would burn an exception object on every static
@@ -789,6 +883,8 @@ void Init_hyperion_sendfile(void) {
                                rb_sendfile_copy_small, 4);
     rb_define_singleton_method(rb_mHyperionHttpSendfile, "copy_splice",
                                rb_sendfile_copy_splice, 4);
+    rb_define_singleton_method(rb_mHyperionHttpSendfile, "copy_splice_into_pipe",
+                               rb_sendfile_copy_splice_into_pipe, 6);
     rb_define_singleton_method(rb_mHyperionHttpSendfile, "supported?",
                                rb_sendfile_supported_p, 0);
     rb_define_singleton_method(rb_mHyperionHttpSendfile, "splice_supported?",

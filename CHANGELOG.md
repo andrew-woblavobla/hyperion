@@ -30,6 +30,81 @@ TLS bench harness for Phase 9) are queued for the 2.2.x follow-up
 sprint. **No version tag.** Code is on master (commits b4ca6a0,
 4d8af74, 5c00b15, e105bc6); operators should continue running 2.1.0.
 
+### fix-A — splice pipe-hoist (per-chunk → per-response)
+
+**The 2026-04-30 splice regression diagnosed and fixed.** The 2.2.0
+splice lifecycle opened a fresh `pipe2(O_CLOEXEC | O_NONBLOCK)` pair on
+every call to `Hyperion::Http::Sendfile.copy_splice`, and the Ruby caller
+(`native_copy_loop`) invoked that primitive **per chunk** in a
+`while remaining.positive?` loop. For a 1 MiB asset at 64 KiB chunks
+that's 16 calls × 3 syscalls of pipe overhead = **48 wasted syscalls per
+request** at the kernel boundary; the bench sweep on openclaw-vm
+attributed -23% of the -22.7% static-1-MiB regression to that overhead.
+
+* **New C primitive: `Hyperion::Http::Sendfile.copy_splice_into_pipe`.**
+  Same splice ladder as `copy_splice` (file → pipe → socket), but takes
+  a CALLER-PROVIDED pipe pair as the last two arguments and does NOT
+  open or close the pipe. Returns the same status shape — `:done` /
+  `:partial` / `:eagain` / `:unsupported`. Linux-only; non-Linux builds
+  return `[0, :unsupported]` so the Ruby caller can fall back to plain
+  `sendfile(2)`. Lives at `ext/hyperion_http/sendfile.c`.
+* **Existing `copy_splice` primitive kept intact.** The self-contained
+  per-call pipe lifecycle is still useful for one-shot small payloads
+  and out-of-band callers that don't want to manage the pipe directly;
+  it remains exposed and unchanged. fix-A only **adds** the new
+  primitive — it does not remove or repurpose the old one.
+* **Ruby façade hoists the pipe out of the chunk loop.**
+  `lib/hyperion/http/sendfile.rb` `native_copy_loop` is restructured
+  into two helpers: `splice_copy_loop` (Linux + splice runtime
+  supported) opens ONE pipe pair via `IO.pipe` (set non-blocking via
+  `Fcntl::F_SETFL`) at the top of the response, hands the same fds to
+  `copy_splice_into_pipe` for every chunk, and closes both fds in an
+  ensure block on every exit path (return, raise, `:unsupported`
+  fall-back). `plain_sendfile_loop` carries the rest of the response
+  if the runtime kernel rejects splice mid-loop, picking up from the
+  same cursor.
+* **Syscall delta (1 MiB request):**
+  | Layout | pipe2 | close | splice rounds | total |
+  |---|---:|---:|---:|---:|
+  | 2.2.0 (per-chunk) | 16 | 32 | 16 | 64 |
+  | 2.2.x fix-A (per-response) | 1 | 2 | 16 | **19** |
+
+  **3.4× fewer syscalls per 1 MiB request** at the kernel boundary.
+* **Correctness window unchanged.** A pipe pair still never outlives
+  one response — the ensure block closes both fds before the response
+  loop returns to `copy_to_socket`'s caller. The bytes-leak window the
+  cached-per-thread layout from 2.0.1 suffered cannot reopen here.
+  The fd-leak guard from 2.2.0 (`'closes both pipe fds on every
+  successful copy_splice call (no fd leak across 1000 requests)'`)
+  stays green; the open-fd delta now scales with **responses**, not
+  individual splice calls.
+* **New specs.** `spec/hyperion/http_sendfile_spec.rb` gains two
+  fix-A specs:
+  * `'reuses one pipe pair across all chunks of a single response (fix-A)'`
+    stubs `IO.pipe` to count invocations, serves a 1 MiB asset, and
+    asserts `IO.pipe` was called exactly once per response.
+  * `'closes both pipe fds even when the chunk loop raises mid-transfer (fix-A)'`
+    stubs `copy_splice_into_pipe` to raise on the second chunk and
+    asserts both pipe fds are `closed?` afterwards (the ensure
+    block fired even on the exception path).
+
+  Spec count **666 → 668**. Both new specs are Linux-pending on
+  macOS / BSD (splice is Linux-only); the existing 666 stay green.
+* **Env-var gate.** The `HYPERION_HTTP_SPLICE=1` opt-in gate added in
+  commit `2c8d9f3` is **left in place**. The syscall-count math
+  (64 → 19) makes the gate obsolete in principle, but the fix-A
+  landing session could not reach openclaw-vm to re-bench (SSH
+  publickey gap, same regression flagged in Phase 9 / 10 / 11). The
+  maintainer is expected to drop the env-var gate in a follow-up
+  commit once the bench is re-run from a session with working SSH
+  and the result confirms splice ≥ 2.1.0 plain-sendfile baseline
+  (1,697 r/s).
+* **macOS arm64 / Linux x86_64 portability.** The splice ladder stays
+  `#ifdef HYP_SF_LINUX`; non-Linux builds see
+  `copy_splice_into_pipe` return `[0, :unsupported]` and the
+  streaming loop drops to plain `sendfile(2)`. The C ext compiles
+  cleanly on macOS arm64 (verified on this branch).
+
 ### Bench sweep notes (openclaw-vm, 2026-04-30, vs 2.1.0 baseline)
 
 | Row | 2.1.0 | 2.2.0 default | Δ | Notes |

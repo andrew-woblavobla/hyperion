@@ -546,6 +546,96 @@ RSpec.describe Hyperion::Http::Sendfile do
       expect(via_splice).to eq(payload)
     end
 
+    it 'reuses one pipe pair across all chunks of a single response (fix-A)' do
+      skip 'splice path not compiled' unless described_class.respond_to?(:copy_splice_into_pipe)
+      skip 'splice path inert on this host' unless described_class.splice_supported?
+
+      # Force the runtime gate open so the production hot path is
+      # the splice loop on this host (some operators run with the
+      # cached runtime flag in a stale state from a previous
+      # spec; reset it explicitly).
+      if described_class.instance_variable_defined?(:@splice_runtime_supported)
+        described_class.remove_instance_variable(:@splice_runtime_supported)
+      end
+      allow(described_class).to receive(:splice_runtime_supported?).and_return(true)
+
+      pipe_call_count = 0
+      original_pipe = IO.method(:pipe)
+      allow(IO).to receive(:pipe) do |*args|
+        pipe_call_count += 1
+        original_pipe.call(*args)
+      end
+
+      with_socket_pair(payload.bytesize) do |client, reader|
+        written = described_class.copy_to_socket(client, tempfile, 0, payload.bytesize)
+        client.close
+        expect(written).to eq(payload.bytesize)
+        expect(reader.value).to eq(payload)
+      end
+
+      # 2.2.x fix-A — the entire 1 MiB response goes through ONE
+      # pipe pair, regardless of how many splice chunks the
+      # kernel cuts it into.  The 2.2.0 layout would have called
+      # `IO.pipe` (or `pipe2`) once per chunk; the new layout
+      # calls it exactly once per response.
+      expect(pipe_call_count).to eq(1)
+    ensure
+      if described_class.instance_variable_defined?(:@splice_runtime_supported)
+        described_class.remove_instance_variable(:@splice_runtime_supported)
+      end
+    end
+
+    it 'closes both pipe fds even when the chunk loop raises mid-transfer (fix-A)' do
+      skip 'splice path not compiled' unless described_class.respond_to?(:copy_splice_into_pipe)
+      skip 'splice path inert on this host' unless described_class.splice_supported?
+
+      if described_class.instance_variable_defined?(:@splice_runtime_supported)
+        described_class.remove_instance_variable(:@splice_runtime_supported)
+      end
+      allow(described_class).to receive(:splice_runtime_supported?).and_return(true)
+
+      # Capture the pipe pair the splice loop opens so we can
+      # assert it's closed by the ensure block on its way out.
+      pipes_opened = []
+      original_pipe = IO.method(:pipe)
+      allow(IO).to receive(:pipe) do |*args|
+        pair = original_pipe.call(*args)
+        pipes_opened << pair
+        pair
+      end
+
+      # Stub copy_splice_into_pipe to succeed once then raise on
+      # the second chunk — simulates a runtime crash mid-response.
+      call_count = 0
+      allow(described_class).to receive(:copy_splice_into_pipe) do |_out, _file, _offset, len, _pr, _pw|
+        call_count += 1
+        raise Errno::EIO, 'simulated mid-transfer kernel error' unless call_count == 1
+
+        # Move some bytes through to advance past the first chunk.
+        chunk = [len, 64 * 1024].min
+        [chunk, :partial]
+      end
+
+      with_socket_pair(payload.bytesize) do |client, reader|
+        expect do
+          described_class.copy_to_socket(client, tempfile, 0, payload.bytesize)
+        end.to raise_error(Errno::EIO)
+        client.close
+        # Drain whatever the reader pulled before we closed; we
+        # don't care about the bytes here, only the lifecycle.
+        reader.value
+      end
+
+      expect(pipes_opened.size).to eq(1)
+      pipe_r, pipe_w = pipes_opened.first
+      expect(pipe_r).to be_closed
+      expect(pipe_w).to be_closed
+    ensure
+      if described_class.instance_variable_defined?(:@splice_runtime_supported)
+        described_class.remove_instance_variable(:@splice_runtime_supported)
+      end
+    end
+
     it 'falls back to plain sendfile when splice_runtime_supported? is stubbed false' do
       skip 'native ext not loaded' unless described_class.respond_to?(:copy_splice)
 

@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'fcntl'
+
 module Hyperion
   module Http
     # Sendfile — Ruby-side façade over the C-extension Hyperion::Http::Sendfile
@@ -67,6 +69,23 @@ module Hyperion
     # extra syscalls per call vs the cached layout, but correctness is
     # unconditional: a pipe never carries bytes for more than one
     # transfer.
+    #
+    # 2.2.x fix-A — pipe-hoist out of the chunk loop
+    # ----------------------------------------------
+    # The 2026-04-30 bench sweep showed 2.2.0's per-call pipe2 cost a
+    # -23% rps regression on the static 1 MiB row (1,697 → 1,312 r/s)
+    # because `native_copy_loop` invokes the splice primitive ONCE PER
+    # CHUNK in a `while remaining.positive?` loop.  For a 1 MiB asset
+    # at 64 KiB chunks that's 16 calls × 3 syscalls of pipe overhead =
+    # 48 wasted syscalls per request.  Fix-A pushes the pipe lifecycle
+    # up one level: `native_copy_loop` now opens a single
+    # pipe2(O_CLOEXEC | O_NONBLOCK) pair per RESPONSE, hands it to the
+    # new `copy_splice_into_pipe` primitive for every chunk, and
+    # closes both fds in an ensure block when the response loop
+    # unwinds (success, EAGAIN-retry-loop exit, raised exception).
+    # Same correctness window as 2.2.0 — a pipe pair never outlives
+    # one response, so EPIPE mid-transfer cannot leak residual bytes
+    # onto the next request's socket — at 1/16th the syscall cost.
     module Sendfile
       # Maximum bytes per IO.copy_stream call on the userspace fallback. 64 KiB
       # matches the kernel TCP send buffer's typical sweet spot on Linux and
@@ -107,20 +126,24 @@ module Hyperion
         def splice_runtime_supported?
           # Memoize the boot-time C ext flag.  We deliberately don't
           # run a live pipe2+splice probe here — the production path
-          # is the runtime probe: copy_splice's :unsupported return is
-          # cheap (one pipe2 + one close pair on the first request)
-          # and authoritative.
+          # is the runtime probe: copy_splice_into_pipe's :unsupported
+          # return is cheap (one pipe2 + one close pair on the first
+          # request) and authoritative.
           return @splice_runtime_supported if defined?(@splice_runtime_supported)
 
-          # 2.2.0 — opt-in only.  Bench on openclaw-vm (Apr 2026) showed
-          # splice + pipe2-per-chunk is a -23% rps regression vs plain
-          # sendfile(2) on 1 MiB assets because each 64 KiB chunk eats
-          # 3 extra syscalls (pipe2 + 2× close) at the kernel boundary.
-          # The correctness fix (fresh-pipe-per-call closes the
-          # cross-conn bytes-leak window from 2.0.1) ships, but the
-          # path stays opt-in until the C ext hoists pipe creation
-          # out of the chunk loop.  Operators wanting to A/B test on
-          # other kernels can flip HYPERION_HTTP_SPLICE=1.
+          # 2.2.x fix-A — pipe2 has been hoisted out of the chunk
+          # loop (one pipe pair per response, reused across every
+          # chunk via `copy_splice_into_pipe`).  The syscall-count
+          # math (64 → 19 syscalls per 1 MiB request) makes the
+          # 2.2.0 env-var gate obsolete in principle, but we leave
+          # the gate in place until the openclaw-vm bench
+          # re-confirms splice ≥ plain sendfile baseline on Linux.
+          # The fix-A landing session couldn't reach openclaw-vm
+          # (SSH auth gap, see CHANGELOG); the maintainer is
+          # expected to drop the gate in a follow-up commit once
+          # the bench is re-run from a session with working SSH.
+          # Operators wanting to A/B test on other kernels can
+          # flip HYPERION_HTTP_SPLICE=1.
           enabled =
             ENV['HYPERION_HTTP_SPLICE'] == '1' &&
             respond_to?(:splice_supported?) &&
@@ -228,15 +251,18 @@ module Hyperion
 
         # Native streaming loop for files > SMALL_FILE_THRESHOLD.
         #
-        # 2.2.0 — on Linux, files above SPLICE_THRESHOLD are routed
-        # through `copy_splice` first.  That primitive opens a fresh
-        # pipe2(O_CLOEXEC | O_NONBLOCK) pair on every call, splices
-        # file -> pipe -> socket fully kernel-side, and closes both
-        # fds before returning.  The two extra syscalls per call buy
-        # us correctness against the bytes-leak window the cached
-        # per-thread pipe layout suffered in 2.0.1, and the splice
-        # copies stay zero-copy through the page cache so the net
-        # win on 1 MiB+ assets is 5-10% over plain sendfile.
+        # 2.2.x fix-A — on Linux, files above SPLICE_THRESHOLD route
+        # through `copy_splice_into_pipe`.  That primitive splices
+        # file -> pipe -> socket for ONE chunk against a pipe pair
+        # owned by THIS METHOD: one `IO.pipe` (binmode, non-blocking)
+        # at the top, both fds closed in the ensure block at the
+        # bottom.  For a 1 MiB asset at 64 KiB chunks that drops the
+        # pipe overhead from 16 × pipe2 + 32 × close (one set per
+        # chunk in the 2.2.0 layout) to 1 × pipe2 + 2 × close per
+        # response — a 3.4× syscall-count reduction.  The
+        # correctness window (no cross-request byte leak) stays
+        # closed: a pipe pair still never outlives a single
+        # response.
         #
         # On non-Linux hosts (`splice_supported?` == false) we go
         # straight to the plain sendfile(2) path via `copy`.  On
@@ -245,25 +271,88 @@ module Hyperion
         # unsupported for the rest of the process and fall through
         # to plain sendfile.
         def native_copy_loop(out_io, file_io, offset, len)
+          use_splice = splice_runtime_supported? && len > SPLICE_THRESHOLD &&
+                       respond_to?(:copy_splice_into_pipe)
+
+          if use_splice
+            splice_copy_loop(out_io, file_io, offset, len)
+          else
+            plain_sendfile_loop(out_io, file_io, offset, len)
+          end
+        end
+
+        # 2.2.x fix-A — splice path with one pipe pair per response.
+        # Opens the pipe at entry, hands the same fds to
+        # `copy_splice_into_pipe` for every chunk of the response,
+        # and closes both fds in the ensure block on every exit
+        # path (return, raise, throw).  If the runtime kernel
+        # rejects splice (:unsupported on the first chunk), we tear
+        # the pipe down immediately and recurse through
+        # `plain_sendfile_loop` for the remainder of the response.
+        def splice_copy_loop(out_io, file_io, offset, len)
           remaining = len
           cursor    = offset
           total     = 0
-          use_splice = splice_runtime_supported? && len > SPLICE_THRESHOLD &&
-                       respond_to?(:copy_splice)
+          pipe_r, pipe_w = open_splice_pipe!
 
-          while remaining.positive?
-            bytes, status =
-              if use_splice
+          begin
+            while remaining.positive?
+              bytes, status =
                 begin
-                  copy_splice(out_io, file_io, cursor, remaining)
+                  copy_splice_into_pipe(out_io, file_io, cursor, remaining, pipe_r, pipe_w)
                 rescue NotImplementedError
                   mark_splice_unsupported!
-                  use_splice = false
-                  next
+                  return total + plain_sendfile_loop(out_io, file_io, cursor, remaining)
                 end
+
+              case status
+              when :done
+                total += bytes
+                return total
+              when :partial
+                total     += bytes
+                cursor    += bytes
+                remaining -= bytes
+              when :eagain
+                # `copy_splice_into_pipe` only returns :eagain when
+                # zero bytes hit the wire (bytes>0 + EAGAIN maps to
+                # :partial in the C ext), so cursor / remaining
+                # don't move here — we just yield to the scheduler.
+                wait_writable(out_io)
+              when :unsupported
+                # Runtime kernel rejected splice but plain sendfile
+                # may still work.  Cache the negative answer and
+                # finish this response through plain sendfile from
+                # the same cursor.
+                mark_splice_unsupported!
+                return total + plain_sendfile_loop(out_io, file_io, cursor, remaining)
               else
-                copy(out_io, file_io, cursor, remaining)
+                raise "Hyperion::Http::Sendfile: unexpected status #{status.inspect}"
               end
+            end
+
+            total
+          ensure
+            # Close both fds on every exit path — success, EAGAIN
+            # retry-loop exit, raised exception, mid-transfer
+            # EPIPE.  This is the whole point of fix-A's per-
+            # response pipe lifecycle: the pipe never outlives the
+            # response, so residual bytes from a partial transfer
+            # cannot leak onto the next request's socket.
+            close_splice_pipe(pipe_r, pipe_w)
+          end
+        end
+
+        # Plain sendfile(2) loop — used on non-Linux hosts, on
+        # hosts where splice is unavailable at runtime, and as the
+        # tail of a splice run that hit :unsupported mid-response.
+        def plain_sendfile_loop(out_io, file_io, offset, len)
+          remaining = len
+          cursor    = offset
+          total     = 0
+
+          while remaining.positive?
+            bytes, status = copy(out_io, file_io, cursor, remaining)
 
             case status
             when :done
@@ -274,33 +363,55 @@ module Hyperion
               cursor    += bytes
               remaining -= bytes
             when :eagain
-              # Both `copy` and `copy_splice` return :eagain only
-              # when zero bytes left for the wire (the C ext maps
-              # bytes>0 + EAGAIN to :partial), so cursor / remaining
-              # don't move here — we just yield to the scheduler.
               wait_writable(out_io)
             when :unsupported
-              if use_splice
-                # Runtime kernel rejected splice but plain sendfile
-                # may still work.  Cache the negative answer and
-                # retry from the same cursor through plain sendfile.
-                mark_splice_unsupported!
-                use_splice = false
-              else
-                # Kernel said this fd pair doesn't support sendfile.
-                # Drop to userspace.  The file's read offset is still
-                # untouched (we've been passing absolute offsets
-                # through to the kernel), so rewind via offset arg
-                # into the userspace path.
-                file_io.seek(cursor) if file_io.respond_to?(:seek)
-                return total + userspace_copy_loop(out_io, file_io, cursor, remaining)
-              end
+              # Kernel said this fd pair doesn't support sendfile.
+              # Drop to userspace.  The file's read offset is still
+              # untouched (we've been passing absolute offsets
+              # through to the kernel), so rewind via offset arg
+              # into the userspace path.
+              file_io.seek(cursor) if file_io.respond_to?(:seek)
+              return total + userspace_copy_loop(out_io, file_io, cursor, remaining)
             else
               raise "Hyperion::Http::Sendfile: unexpected status #{status.inspect}"
             end
           end
 
           total
+        end
+
+        # Open a pipe pair sized for the splice response loop.
+        # Returns [pipe_r, pipe_w] as Ruby IO objects so the ensure
+        # block can `.close` them via the standard IO protocol — no
+        # stale-fd risk if the C ext closed the underlying fd
+        # during a runtime-:unsupported teardown.  Both ends are
+        # set non-blocking (matches the C ext's pipe2 fallback for
+        # `copy_splice`) so a wedged splice can't block a worker
+        # thread.
+        def open_splice_pipe!
+          pipe_r, pipe_w = IO.pipe
+          set_nonblock!(pipe_r)
+          set_nonblock!(pipe_w)
+          [pipe_r, pipe_w]
+        end
+
+        def set_nonblock!(io)
+          flags = io.fcntl(Fcntl::F_GETFL)
+          io.fcntl(Fcntl::F_SETFL, flags | Fcntl::O_NONBLOCK)
+        rescue StandardError
+          # F_SETFL is best-effort; the splice ladder copes with
+          # blocking pipe ends just fine, the non-blocking flag is
+          # a defense-in-depth knob.  Older Ruby builds without
+          # Fcntl loaded fall through silently.
+        end
+
+        def close_splice_pipe(pipe_r, pipe_w)
+          pipe_r.close unless pipe_r.nil? || pipe_r.closed?
+          pipe_w.close unless pipe_w.nil? || pipe_w.closed?
+        rescue StandardError
+          # We're typically in an ensure block; never let close
+          # bubble up over the original exception (or success
+          # return).
         end
 
         # Userspace fallback. Bypasses the per-chunk fiber-hop in
