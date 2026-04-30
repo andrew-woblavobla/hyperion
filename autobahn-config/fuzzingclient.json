@@ -1,6 +1,6 @@
 {
   "//": "Autobahn-testsuite fuzzingclient config for Hyperion's WS echo rackup.",
-  "//": "Boots an echo server on ws://127.0.0.1:9888/echo (bench/ws_echo.ru),",
+  "//": "Boots an echo server on ws://127.0.0.1:9888 (bench/ws_echo_autobahn.ru),",
   "//": "then drives the canonical RFC 6455 conformance fuzzer against it.",
   "//": "",
   "//": "Run via Docker (no local Python dep):",
@@ -12,17 +12,23 @@
   "//": "    crossbario/autobahn-testsuite \\",
   "//": "    wstest -m fuzzingclient -s /config/fuzzingclient.json",
   "//": "",
-  "//": "After the run open ./autobahn-reports/index.html for the HTML report.",
+  "//": "After the run open ./autobahn-reports/index.html for the HTML report",
+  "//": "or `ruby bench/parse_autobahn_index.rb autobahn-reports/index.json`",
+  "//": "for the per-section pass/fail breakdown.",
   "//": "",
-  "//": "Cases note: the full RFC 6455 case set is ~520 cases. We exclude",
-  "//": "very-large-message cases (9.*) to keep the run under ~5 minutes;",
-  "//": "include them in a soak run before publishing a fresh msg-size cap.",
+  "//": "Cases note: the full RFC 6455 case set is 463 cases (~17 minutes",
+  "//": "wall clock with deflate negotiated). Cases 9.* (very-large-message",
+  "//": "performance probes, 16+ MiB) are excluded because they require",
+  "//": "raising max_message_bytes well beyond Hyperion's 1 MiB default and",
+  "//": "are perf measurements rather than conformance checks. Uncomment by",
+  "//": "removing the entry from `exclude-cases` for a soak run.",
 
-  "outdir": "./autobahn-reports",
+  "outdir": "/reports",
   "servers": [
     {
-      "agent": "Hyperion-2.3.0",
-      "url": "ws://127.0.0.1:9888/echo"
+      "agent": "Hyperion-2.4.0",
+      "url": "ws://127.0.0.1:9888",
+      "options": { "version": 18 }
     }
   ],
   "cases": ["*"],

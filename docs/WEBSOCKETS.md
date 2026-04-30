@@ -355,7 +355,7 @@ brief is the Linux + 16-vCPU number to publish, queued behind the next
 openclaw window. See [`docs/BENCH_HYPERION_2_0.md`](BENCH_HYPERION_2_0.md#websocket-echo-210--22x-fix-e-bench-numbers)
 for the full table + reproduction recipe.
 
-**Multi-process bench — 2.3-D (2026-04-29):**
+**Multi-process bench — 2.3-D (2026-04-29, Apple Silicon dev):**
 
 | Workload | msg/s | p50 | p99 |
 |---|---:|---:|---:|
@@ -366,10 +366,22 @@ vs fix-E single-process baseline: **+176% msg/s on the 200-conn
 throughput row, p99 cut in half** (43.12 ms → 21.75 ms). The fix-E
 long tail at 200 conns was client-side GVL serialisation, not
 server-side latency — splitting the client into 4 OS processes via
-`bench/ws_bench_client_multi.rb` removes that bottleneck. Same
-Apple Silicon dev box as the fix-E numbers above; openclaw-vm
-rerun deferred (host SSH unavailable this session — recipe in
-`docs/BENCH_HYPERION_2_0.md`).
+`bench/ws_bench_client_multi.rb` removes that bottleneck.
+
+**Multi-process bench — 2.4-D (2026-04-30, openclaw-vm Linux 16-vCPU):**
+
+| Workload | msg/s | p50 | p99 |
+|---|---:|---:|---:|
+| 4 procs × 200 conns × 1000 msgs × 1 KiB (`-t 64 -w 4`, deflate on) | 6,880 | 28.60 ms | 33.86 ms |
+| 4 procs × 40 conns × 1000 msgs × 1 KiB (`-t 64 -w 4`, deflate on)  | 7,561 | 5.26 ms  | 6.22 ms  |
+
+vs fix-E single-process Linux baseline (1,962 / 1,766 msg/s, p99
+67 / 134 ms): **+285–289% msg/s, p99 down 75% on the 200-conn
+row** (134 ms → 33.86 ms). Confirms the fix-E Linux floor was
+client-side GVL, exactly the same shape as macOS — the proportional
+lift is even larger on Linux because the single-process baseline
+was lower. See [`docs/BENCH_HYPERION_2_0.md`](BENCH_HYPERION_2_0.md#openclaw-vm-bench-linux-16-vcpu-2-4-d--2026-04-30)
+for the within-host vs cross-platform breakdown.
 
 **Operator note — published msg/s requires the multi-process bench.**
 The single-process Ruby client tops out at ~5–6k msg/s on macOS and
@@ -441,30 +453,106 @@ On macOS dev boxes you'll need Docker Desktop running; on Linux
 bench hosts the `crossbario/autobahn-testsuite` image (~280 MB)
 ships pre-pulled if you've run autobahn before.
 
-### Expected pass matrix (for reproducibility checks)
+### 2.4-D run results (openclaw-vm, 2026-04-30)
 
-| Section | Coverage | Hyperion expectation |
-|---|---|---|
-| 1 — Framing | Basic frame layouts | 100% pass |
-| 2 — Pings | Ping/pong correctness | 100% pass |
-| 3 — Reserved bits | RSV1/2/3 validation | 100% pass *(2.3-C teaches RSV1=deflate; RSV2/3 still close 1002)* |
-| 4 — Opcodes | Reserved opcode rejection | 100% pass |
-| 5 — Fragmentation | Continuation frames, control frames mid-fragment | ≥ 95% pass |
-| 6 — UTF-8 | Strict UTF-8 validation on text frames | 100% pass *(2.1.0 spec)* |
-| 7 — Close handling | Close codes, payload validation | 100% pass |
-| 9 — Limits / perf | Multi-MB messages | Excluded from default config (very long runtime; uncomment in `fuzzingclient.json` for a soak run) |
-| 10 — Auto-fragmentation | Server-side fragmenting of large messages | 100% pass |
-| 12 — permessage-deflate | Compressed echo round-trips | 100% pass *(2.3-C — first run after 2.3-C ship)* |
-| 13 — permessage-deflate edge cases | Fragmented + compressed, sliding-window edges | ≥ 95% pass *(2.3-C)* |
+Full sweep against `bench/ws_echo_autobahn.ru` (a 1 MiB-cap variant
+of `bench/ws_echo.ru` that propagates the negotiated permessage-
+deflate extension into the 101 response — see "Configuring
+permessage-deflate echo" below). Server: `bundle exec hyperion -t 64
+-w 1 -p 9888 bench/ws_echo_autobahn.ru` with `HYPERION_WS_DEFLATE=on`.
+Run wall-clock: ~17 minutes (sections 12/13 dominate; 463 total
+cases).
 
-### 2.3-D run status
+**Headline: 453/463 OK (97.8%).**
 
-**Deferred — Docker daemon not running this session, openclaw-vm
-SSH unavailable.** The fuzzingclient config file is in place; a
-maintainer with Docker can produce the report in ~5 minutes. Any
-FAILED categories beyond the matrix above are 2.4 follow-ups —
-2.3-D was scoped to land the recipe and run it where possible, not
-to fix RFC violations the fuzzer might surface.
+| Section | Cases | OK | NON-STRICT | INFO | FAILED | Pass % |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 — Framing                          |  16 |  16 |  0 |  0 |  0 | 100.0% |
+| 2 — Pings / pongs                    |  11 |  11 |  0 |  0 |  0 | 100.0% |
+| 3 — Reserved bits / opcodes          |   7 |   7 |  0 |  0 |  0 | 100.0% |
+| 4 — Frame contents                   |  10 |  10 |  0 |  0 |  0 | 100.0% |
+| 5 — Fragmentation                    |  20 |  20 |  0 |  0 |  0 | 100.0% |
+| 6 — UTF-8 validation                 | 145 | 141 |  4 |  0 |  0 | 100.0% (4 NON-STRICT — fail-fast position) |
+| 7 — Close handling                   |  37 |  24 |  0 |  3 | 10 |  73.0% |
+| 9 — Limits / very large              |   — |   — |  — |  — |  — | excluded |
+| 10 — Auto-fragmentation              |   1 |   1 |  0 |  0 |  0 | 100.0% |
+| 12 — permessage-deflate (RFC 7692)   |  90 |  90 |  0 |  0 |  0 | 100.0% |
+| 13 — permessage-deflate fragmentation| 126 | 126 |  0 |  0 |  0 | 100.0% |
+| **TOTAL**                            | 463 | 446+7 = 453* |  4 |  3 | 10 | **97.8%** |
+
+*OK + NON-STRICT + INFORMATIONAL all count as "passes" per autobahn
+convention; only FAILED is a hard violation.
+
+**The 10 FAILED cases are all in 7.5.1 + 7.9.x** — server should
+respond to a peer-initiated close with an *invalid* close code
+(0, 999, 1004, 1005, 1006, 1012-reserved, 1016, 2000, 2999, etc.)
+by closing with 1002 (Protocol Error) and dropping the connection.
+The current `Connection#recv` close path echoes the peer's invalid
+code back instead of rejecting it. This is a real RFC 6455 §7.4
+violation. **Tracked as a 2.5 follow-up; out of scope for 2.4-D
+(bench + docs only).**
+
+**The 4 NON-STRICT cases (6.4.1–6.4.4)** are UTF-8 fail-fast position:
+the server eventually rejects invalid UTF-8 with close 1007, but
+not at the earliest possible byte. Acceptable per RFC 6455 §8.1
+("a server SHOULD fail the WebSocket Connection if it detects an
+illegal UTF-8 sequence").
+
+**Sections 12 + 13 (216 total cases, all OK)** validate 2.3-C
+permessage-deflate end-to-end on this run — first time these
+have been exercised against autobahn since the extension landed.
+
+### How to run
+
+```sh
+# Terminal 1 — boot Hyperion with permessage-deflate enabled
+HYPERION_WS_DEFLATE=on bundle exec hyperion -t 64 -w 1 -p 9888 \
+  bench/ws_echo_autobahn.ru
+
+# Terminal 2 — run the fuzzer (requires Docker daemon)
+docker run --rm \
+  -v $PWD/autobahn-config:/config \
+  -v $PWD/autobahn-reports:/reports \
+  --network host \
+  crossbario/autobahn-testsuite \
+  wstest -m fuzzingclient -s /config/fuzzingclient.json
+
+# Then open ./autobahn-reports/index.html in a browser, or
+# `ruby bench/parse_autobahn_index.rb autobahn-reports/index.json`
+# for the per-section breakdown the table above came from.
+```
+
+The pip-install path (`pip install autobahntestsuite`) is Python-2
+only and is no longer maintainable; Docker is the supported recipe.
+On macOS dev boxes you'll need Docker Desktop running; on Linux
+bench hosts the `crossbario/autobahn-testsuite` image (~280 MB)
+ships pre-pulled if you've run autobahn before.
+
+### Configuring permessage-deflate echo
+
+Plain `bench/ws_echo.ru` does NOT propagate the negotiated
+permessage-deflate extension into the 101 response — the autobahn
+fuzzer will then run sections 12/13 in plain mode and mark every
+case "UNIMPLEMENTED". `bench/ws_echo_autobahn.ru` is the variant
+used for the run above; the only difference is two extra lines:
+
+```ruby
+ext_value = Hyperion::WebSocket::Handshake.format_extensions_header(result[3])
+extras = ext_value ? { 'sec-websocket-extensions' => ext_value } : {}
+socket.write(Hyperion::WebSocket::Handshake.build_101_response(result[1], result[2], extras))
+
+ws = Hyperion::WebSocket::Connection.new(
+  socket,
+  buffered: env['hyperion.hijack_buffered'],
+  subprotocol: result[2],
+  extensions: result[3],         # ← propagate negotiated deflate to the wrapper
+  max_message_bytes: 1 * 1024 * 1024,
+  ping_interval: nil,
+  idle_timeout: nil
+)
+```
+
+If you build your own ws app, follow the same pattern.
 
 ---
 
