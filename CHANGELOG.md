@@ -37,6 +37,68 @@ fail-fast position, not MUST). Section 12+13 (permessage-deflate):
 Spec count: 823 (2.4.0) → 893 (+70 in `websocket_close_validation_spec.rb`).
 0 failures, 11 pending.
 
+### 2.5-B — Rails-shape h2 bench rackup (settle the HPACK default-flip question)
+
+**The question 2.4-A left open.** 2.4-A's HPACK FFI round-2 (CGlue / v3
+adapter, commits 67c52a4 + 98e9cf3 + 877f934) brought the per-call alloc
+from 12 → 4 objects and dropped Fiddle off the hot path. But it
+benched against `bench/hello.ru` — a Rack response with **2 response
+headers** (`content-type`, plus the auto-inserted `content-length`). On
+that workload HPACK encode is <1% of per-stream CPU, so native and the
+Ruby fallback both came in at parity (-0.05% noise). The default stayed
+opt-in via `HYPERION_H2_NATIVE_HPACK=1` because parity isn't a default
+flip.
+
+Real Rails 8.x apps ship 20–30 response headers (Rails defaults +
+ActionDispatch + ActionController + CSP/HSTS + per-request varying
+headers like X-Request-Id / Set-Cookie / ETag). On that shape HPACK
+encode CPU should climb into the single-digit percent of per-stream
+CPU and the FFI marshalling overhead vs the native byte-pump matters.
+2.5-B settles whether it matters enough to flip the default.
+
+**The bench artifacts.**
+- `bench/h2_rails_shape.ru` — Rails-shape rackup, 25 response headers
+  (content-type, x-frame-options, x-xss-protection, x-content-type-options,
+  x-permitted-cross-domain-policies, referrer-policy, x-download-options,
+  cache-control, pragma, expires, vary, content-language,
+  strict-transport-security, content-security-policy, x-request-id,
+  x-runtime, x-powered-by, set-cookie, etag, last-modified, date,
+  server, access-control-allow-origin, cross-origin-opener-policy,
+  cross-origin-resource-policy). Body is a ~200-byte JSON payload —
+  matches a typical Rails JSON response. Per-request variance: rid
+  rotates per call, set-cookie session id rotates, etag rotates.
+- `bench/h2_rails_shape.sh` — A/B harness. Boots hyperion twice
+  (Ruby fallback baseline + native v3 with HYPERION_H2_NATIVE_HPACK=1)
+  on port 9602, runs h2load `-c 1 -m 100 -n 5000` 3× per variant, takes
+  the median rps (3-5% bench noise), prints the delta, and selects a
+  decision (flip / keep / investigate) against the +15% threshold from
+  the 2.5-B controller.
+
+**Decision tree.**
+- native ≥ +15% rps → flip default to ON (auto = on if available, off
+  if not), update boot log, document in CHANGELOG as a
+  `[breaking-default-change]`.
+- native at parity / +5–10% (within noise) → keep opt-in, document the
+  result.
+- native NEGATIVE → don't ship a regression, file a 2.6 follow-up.
+
+**Bench result.** **DEFERRED — bench host (openclaw-vm) refused
+key-auth this session.** SSH to 192.168.31.14 returns
+`Permission denied (publickey)` on the agent's `id_ed25519_woblavobla`
+identity (host is reachable on ICMP, the auth gap is on the bench
+host's `~/.ssh/authorized_keys` being out-of-sync with the agent
+key, not a network outage). The rackup + harness are committed
+ready-to-run; the maintainer-side rerun is `./bench/h2_rails_shape.sh`
+from `~/hyperion-fresh` after `git pull`. Once numbers land, the
+default-flip commit (or a "kept opt-in" CHANGELOG amend) is a
+~10-line patch on top of this commit.
+
+**No production code changes in this commit.** Bench-only. Native
+HPACK default stays opt-in pending the empirical numbers from the
+controller-run 2.5-B harness.
+
+Spec count: 893 (unchanged — no production code touched).
+
 ## [2.4.0] - 2026-04-29
 
 ### Headline
