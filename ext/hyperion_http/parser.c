@@ -1229,4 +1229,10 @@ void Init_hyperion_http(void) {
      * full surface. */
     extern void Init_hyperion_sendfile(void);
     Init_hyperion_sendfile();
+
+    /* WS-3 (2.1.0) — sibling C unit owns Hyperion::WebSocket::CFrame.
+     * RFC 6455 frame parse/build + GVL-releasing unmask. Same single-.so
+     * link arrangement as sendfile. */
+    extern void Init_hyperion_websocket(void);
+    Init_hyperion_websocket();
 }

@@ -16,6 +16,7 @@ require 'mkmf'
 $srcs = %w[
   parser.c
   sendfile.c
+  websocket.c
   llhttp.c
   api.c
   http.c
