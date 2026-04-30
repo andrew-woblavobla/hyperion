@@ -124,6 +124,144 @@ canonical accept value (asserted in spec).
   (middleware, ActionCable bridges) that want to translate a
   failing `validate` tuple into an exception.
 
+### WS-3 — RFC 6455 frame ser/de in C ext
+
+`ext/hyperion_http/websocket.c` exposes three primitives bound onto
+`Hyperion::WebSocket::CFrame` at load time:
+
+* `parse(buf, offset = 0)` — non-copying scan of `buf[offset..]`,
+  returns either `:incomplete`, `:error`, or the 7-tuple
+  `[fin, opcode_int, payload_len, masked, mask_key, payload_offset,
+  frame_total_len]`.
+* `unmask(payload, key)` — XOR-unmask, GVL-released for payloads
+  large enough to amortise the release.
+* `build(opcode, payload, fin:, mask:, mask_key:)` — serialise a
+  single frame ready for `socket.write`.
+
+Idiomatic Ruby façades live in `lib/hyperion/websocket/frame.rb`:
+
+* `Hyperion::WebSocket::Parser.parse(buf, offset)` returns a
+  `Hyperion::WebSocket::Frame` (Struct) with Symbol opcodes and a
+  pre-unmasked binary payload, or raises
+  `Hyperion::WebSocket::ProtocolError` on malformed input.
+* `Hyperion::WebSocket::Parser.parse_with_cursor(buf, offset)` is
+  the same plus the `frame_total_len` advance, used by the
+  read-many-frames-per-buffer path.
+* `Hyperion::WebSocket::Builder.build(opcode:, payload:, fin:,
+  mask:, mask_key:)` symmetrically serialises with auto-generated
+  `mask_key` when omitted on `mask: true`.
+
+A pure-Ruby fallback (`RubyFrame`) is rebound onto `CFrame` if the
+C ext didn't load — same surface, ~5–10× slower XOR. JRuby /
+TruffleRuby keep working without the C build.
+
+### WS-4 — `Hyperion::WebSocket::Connection` + e2e smoke
+
+`lib/hyperion/websocket/connection.rb` is the per-connection wrapper
+that takes a hijacked socket from WS-1, the validated handshake
+tuple from WS-2, and the framing primitives from WS-3 and exposes a
+message-oriented API to the application:
+
+```ruby
+ws = Hyperion::WebSocket::Connection.new(
+  env['rack.hijack'].call,
+  buffered: env['hyperion.hijack_buffered'],
+  subprotocol: env['hyperion.websocket.handshake'][2]
+)
+
+while (type, payload = ws.recv) && type != :close
+  ws.send(payload, opcode: type)  # echo
+end
+
+ws.close(code: 1000)
+```
+
+#### What the wrapper does
+
+* **Continuation reassembly** — `recv` joins `text` / `binary` +
+  `continuation`* + final `FIN=1` into a single message before
+  returning. Control frames (ping / pong / close) interleaved
+  between fragments are handled inline per RFC 6455 §5.4.
+* **Auto-pong** — RFC 6455 §5.5.2: the wrapper writes a pong with
+  the ping's payload before returning to the caller. `on_ping`
+  hooks observe but do not replace the auto-response, so a server
+  using this wrapper stays compliant even if the app's hook is a
+  no-op.
+* **Close handshake** — peer-initiated close returns
+  `[:close, code, reason]` from `recv` and writes a close echo
+  (RFC §5.5.1). Locally-initiated `ws.close(code: 1000, reason:,
+  drain_timeout: 5)` writes our close, drains for the peer's
+  matching close (or times out), then closes the socket.
+* **Per-message size cap** — `max_message_bytes:` (default 1 MiB)
+  bounds the reassembly buffer; an over-cap continuation triggers
+  close 1009 (Message Too Big) and surfaces the close to the caller.
+* **UTF-8 validation** — text frames whose payload isn't valid
+  UTF-8 trip close 1007 (Invalid Frame Payload Data) per
+  RFC 6455 §8.1.
+* **Idle / keep-alive supervision** — `idle_timeout:` (default
+  60 s) sends close 1001 after no traffic; `ping_interval:`
+  (default 30 s) emits proactive pings to keep NAT mappings warm.
+  Both kwargs accept `nil` to disable. Implemented via
+  `IO.select`, so the recv loop cooperates with the fiber
+  scheduler under `--async-io`.
+
+Hooks: `on_ping(&block)`, `on_pong(&block)`, `on_close(&block)`
+fire for observation. They run AFTER the built-in protocol behaviour;
+they cannot suppress the auto-response or close echo.
+
+State predicates: `open?`, `closing?`, `closed?`. After a `:close`
+has been observed by the caller, subsequent `recv` raises
+`Hyperion::WebSocket::StateError`; `send` after close also raises.
+
+#### ActionCable / faye-websocket recipe
+
+The wrapper is intentionally protocol-agnostic — it doesn't know
+about ActionCable's JSON framing or faye-websocket's driver state
+machine. To bridge:
+
+```ruby
+# In your Rack app or a faye-websocket-style adapter:
+socket = env['rack.hijack'].call
+socket.write(
+  Hyperion::WebSocket::Handshake.build_101_response(
+    env['hyperion.websocket.handshake'][1],
+    env['hyperion.websocket.handshake'][2]
+  )
+)
+ws = Hyperion::WebSocket::Connection.new(
+  socket, buffered: env['hyperion.hijack_buffered']
+)
+# faye-websocket: feed ws.recv into your Driver#parse;
+# ActionCable: hand to a `Connection::ClientSocket`-style adapter.
+```
+
+A first-class `Hyperion::WebSocket::Adapter::ActionCable` is
+deferred to a follow-up — most ActionCable users speak the raw
+socket interface through `faye-websocket`'s driver mode, which
+`env['rack.hijack']` already feeds directly.
+
+#### Smoke test
+
+`spec/hyperion/websocket_e2e_spec.rb` boots a real Hyperion
+server, opens a raw TCP client, completes the handshake, exchanges
+100 text messages each direction (echoed by an app that uses
+`Hyperion::WebSocket::Connection` directly), and closes with code
+1000. p50 echo round-trip on developer hardware is sub-millisecond
+— logged to stderr from the spec for sanity, not asserted (CI runners
+vary too much).
+
+#### Scope notes
+
+Deferred to a follow-up:
+
+* `Hyperion::WebSocket::Adapter::ActionCable` — see recipe above.
+* permessage-deflate (RFC 7692) compression — handshake-time
+  negotiation in WS-2, per-frame compression here. Not in 2.1.0.
+* Send-side fragmentation — `send` writes a single FIN=1 frame
+  regardless of payload size. Browsers / well-behaved clients
+  handle multi-MB single frames; an opt-in `fragment_threshold:`
+  can be added later if a use case shows up.
+
 ## [2.0.1] - 2026-04-30
 
 Phase 8 — close the last two static-file rps gaps. Hyperion 2.0.0 still
