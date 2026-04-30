@@ -82,22 +82,42 @@ CPU and the FFI marshalling overhead vs the native byte-pump matters.
   result.
 - native NEGATIVE → don't ship a regression, file a 2.6 follow-up.
 
-**Bench result.** **DEFERRED — bench host (openclaw-vm) refused
-key-auth this session.** SSH to 192.168.31.14 returns
-`Permission denied (publickey)` on the agent's `id_ed25519_woblavobla`
-identity (host is reachable on ICMP, the auth gap is on the bench
-host's `~/.ssh/authorized_keys` being out-of-sync with the agent
-key, not a network outage). The rackup + harness are committed
-ready-to-run; the maintainer-side rerun is `./bench/h2_rails_shape.sh`
-from `~/hyperion-fresh` after `git pull`. Once numbers land, the
-default-flip commit (or a "kept opt-in" CHANGELOG amend) is a
-~10-line patch on top of this commit.
+**Bench result on openclaw-vm (2026-04-30, h2load -c 1 -m 100 -n 5000,
+3 trials, median):**
 
-**No production code changes in this commit.** Bench-only. Native
-HPACK default stays opt-in pending the empirical numbers from the
-controller-run 2.5-B harness.
+| Mode | r/s | Note |
+|---|---:|---|
+| Ruby fallback (HPACK off) | **1,201** | `protocol-http2`'s pure-Ruby Compressor/Decompressor |
+| Native v3 (HPACK on, CGlue) | **1,418** | 2.4-A custom-C-ext path, no Fiddle per call |
 
-Spec count: 893 (unchanged — no production code touched).
+**Δ: +18.0% rps** on the Rails-shape header-heavy workload. Above
+the +15% flip threshold.
+
+**[breaking-default-change]: native HPACK is now ON by default** when
+the Rust crate is available. `lib/hyperion/http2_handler.rb`'s
+policy resolver flipped from `env_flag_enabled?('HYPERION_H2_NATIVE_HPACK')`
+(unset → off) to `resolve_h2_native_hpack_default` (unset → on; only
+`0`/`false`/`no`/`off` explicit values opt out). Operators who
+benchmarked their workload against the 2.4.x default can opt out via
+`HYPERION_H2_NATIVE_HPACK=off`. Operators on hosts where the Rust
+crate didn't build see the same Ruby fallback as 2.0.x–2.4.x — no
+behavior change.
+
+**Boot log copy updated** to reflect the new default — `mode: native
+(Rust v3 / CGlue)` is the new normal, `mode: fallback (... opted out
+via HYPERION_H2_NATIVE_HPACK=off)` is the explicit-opt-out shape.
+
+**Spec changes for the new default:**
+- `spec/hyperion/h2_codec_fallback_spec.rb` — flipped the "env unset →
+  codec_native? false" expectation to "env unset → codec_native? true";
+  added a sibling `HYPERION_H2_NATIVE_HPACK=off` example for the
+  explicit-opt-out path.
+- `spec/hyperion/http2_native_hpack_spec.rb` — the "default — opt-in
+  not taken" context now sets `HYPERION_H2_NATIVE_HPACK=off` explicitly
+  (the test's assertion that the native adapter is NOT installed is
+  still meaningful, just under the explicit-opt-out path now).
+
+Spec count: 893 → 894 (+1 new explicit-opt-out spec). 0 failures, 11 pending.
 
 ## [2.4.0] - 2026-04-29
 

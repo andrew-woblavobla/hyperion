@@ -449,14 +449,18 @@ RSpec.describe 'Http2Handler — native HPACK installation' do
     end
   end
 
-  context 'when H2Codec.available? is true but HYPERION_H2_NATIVE_HPACK is unset (default — opt-in not taken)',
+  context 'when H2Codec.available? is true and HYPERION_H2_NATIVE_HPACK=off (explicit opt-out, 2.5-B)',
           if: Hyperion::H2Codec.available? do
     around do |ex|
       original = ENV.fetch('HYPERION_H2_NATIVE_HPACK', nil)
-      ENV.delete('HYPERION_H2_NATIVE_HPACK')
+      ENV['HYPERION_H2_NATIVE_HPACK'] = 'off'
       ex.run
     ensure
-      ENV['HYPERION_H2_NATIVE_HPACK'] = original unless original.nil?
+      if original.nil?
+        ENV.delete('HYPERION_H2_NATIVE_HPACK')
+      else
+        ENV['HYPERION_H2_NATIVE_HPACK'] = original
+      end
     end
 
     it 'reports the crate available but does NOT install the native adapter on new connections' do

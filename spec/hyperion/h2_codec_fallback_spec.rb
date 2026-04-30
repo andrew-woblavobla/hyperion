@@ -62,14 +62,27 @@ RSpec.describe 'H2Codec fallback (Ruby protocol-http2 path)' do
       Hyperion::H2Codec.reset!
     end
 
-    it 'reports codec_available? true / codec_native? false when H2Codec loaded but the env opt-in is unset (default)' do
+    it 'reports codec_native? true when H2Codec loaded and the env var is unset (default since 2.5-B flip)' do
       Hyperion::H2Codec.reset!
       allow(Hyperion::H2Codec).to receive(:available?).and_return(true)
       stub_const('ENV', ENV.to_h.merge('HYPERION_H2_NATIVE_HPACK' => nil))
       handler = Hyperion::Http2Handler.new(app: ->(_) { [200, {}, ['']] })
 
-      # Phase 10 (2.2.0): the wiring is opt-in. Crate available, but
-      # not on the hot path until HYPERION_H2_NATIVE_HPACK=1.
+      # 2.5-B (2.5.0): native HPACK is on the hot path BY DEFAULT when
+      # the Rust crate loaded. Operators who want the prior 2.4.x
+      # Ruby-fallback default must set HYPERION_H2_NATIVE_HPACK=off.
+      expect(handler.codec_available?).to be(true)
+      expect(handler.codec_native?).to be(true)
+    ensure
+      Hyperion::H2Codec.reset!
+    end
+
+    it 'reports codec_native? false when HYPERION_H2_NATIVE_HPACK=off (explicit opt-out, since 2.5-B)' do
+      Hyperion::H2Codec.reset!
+      allow(Hyperion::H2Codec).to receive(:available?).and_return(true)
+      stub_const('ENV', ENV.to_h.merge('HYPERION_H2_NATIVE_HPACK' => 'off'))
+      handler = Hyperion::Http2Handler.new(app: ->(_) { [200, {}, ['']] })
+
       expect(handler.codec_available?).to be(true)
       expect(handler.codec_native?).to be(false)
     ensure

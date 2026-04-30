@@ -461,23 +461,22 @@ module Hyperion
       end
       @h2_admission       = h2_admission
       @h2_codec_available = Hyperion::H2Codec.available?
-      # Phase 10 (Phase 6c, 2.2.0): wire the native HPACK adapter into
-      # the per-connection HPACK boundary, but ONLY when the operator
-      # opts in via `HYPERION_H2_NATIVE_HPACK=1`. The default is OFF
-      # because local benchmarking on macOS showed Fiddle FFI per-call
-      # marshalling overhead (Pointer[] allocation, pack('Q*'), output
-      # buffer pre-fill) outweighs the encode/decode CPU savings on
-      # the typical 3–8-header HEADERS frame. The infrastructure is
-      # in place; flip the env var when:
-      #   * The Ruby-side FFI marshalling layer in `H2Codec::Encoder#encode`
-      #     is rewritten to amortize allocation across calls (a follow-up
-      #     phase), or
-      #   * Your host is Linux with high-FFI-throughput cargo cult
-      #     (asdf-installed cargo or a glibc that aligns FFI calls
-      #     differently from macOS BSD libc).
-      # When OFF: `protocol-http2`'s pure-Ruby HPACK Compressor /
-      # Decompressor handles everything as in 2.0.0/2.1.0.
-      @h2_native_hpack_enabled = @h2_codec_available && env_flag_enabled?('HYPERION_H2_NATIVE_HPACK')
+      # 2.5-B [breaking-default-change]: native HPACK now defaults to ON
+      # when the Rust crate is available. The 2026-04-30 Rails-shape
+      # bench (`bench/h2_rails_shape.ru`, 25 response headers) measured
+      # native v3 at 1,418 r/s vs Ruby fallback 1,201 r/s — **+18.0%**
+      # on a header-heavy workload, comfortably above the +15% flip
+      # threshold. 2.4-A's hello-shape bench saw parity because HPACK
+      # is <1% of per-stream CPU on a 2-header response.
+      #
+      # Operators who want the prior 2.4.x default (Ruby fallback, env
+      # var unset) can now set `HYPERION_H2_NATIVE_HPACK=off` (or
+      # `0`/`false`/`no`/`off`) explicitly. `HYPERION_H2_NATIVE_HPACK=1`
+      # still works for explicit opt-in.
+      #
+      # When OFF (env-overridden): `protocol-http2`'s pure-Ruby HPACK
+      # Compressor / Decompressor handles everything as in 2.0.0–2.4.x.
+      @h2_native_hpack_enabled = @h2_codec_available && resolve_h2_native_hpack_default
       @h2_codec_native = @h2_native_hpack_enabled # back-compat ivar — preserved for codec_native? readers
       record_codec_boot_state
     end
@@ -489,6 +488,23 @@ module Hyperion
       return false if v.nil? || v.empty?
 
       %w[1 true yes on].include?(v.downcase)
+    end
+
+    # Read an env-var flag with explicit OFF support. Used by
+    # `HYPERION_H2_NATIVE_HPACK` since 2.5-B flipped the default to ON.
+    # Returns true if the env var is unset / empty / explicitly truthy;
+    # returns false only when the operator sets it to a truthy-OFF
+    # value (0/false/no/off, case-insensitive). Anything else falls
+    # back to the default-on behavior so we don't surprise operators
+    # who set typo'd values.
+    def resolve_h2_native_hpack_default
+      v = ENV['HYPERION_H2_NATIVE_HPACK']
+      return true if v.nil? || v.empty?
+
+      lc = v.downcase
+      return false if %w[0 false no off].include?(lc)
+
+      true
     end
 
     # 2.0.0 Phase 6b: emit a single-shot boot log line per process
@@ -506,7 +522,7 @@ module Hyperion
         elsif @h2_native_hpack_enabled
           'native (Rust v2 / Fiddle) — HPACK on hot path, Fiddle marshalling per call'
         elsif @h2_codec_available
-          'fallback (protocol-http2 / pure Ruby HPACK) — native available, opt-in via HYPERION_H2_NATIVE_HPACK=1'
+          'fallback (protocol-http2 / pure Ruby HPACK) — native available but opted out via HYPERION_H2_NATIVE_HPACK=off'
         else
           'fallback (protocol-http2 / pure Ruby HPACK) — native unavailable'
         end
