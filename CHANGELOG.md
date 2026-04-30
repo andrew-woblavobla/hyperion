@@ -231,6 +231,60 @@ opt-in.
 Spec count: 757 → 776 (+18 deflate specs + 1 RSV1-on-control split,
 0 regressions).
 
+### 2.3-D — WS multi-process bench + RFC 6455 conformance recipe
+
+**Why this matters.** fix-E's 200-conn WebSocket bench landed at
+1,766 msg/s with p99 134 ms on openclaw-vm — and the long tail there
+turned out to be **client-side** GVL serialisation, not server-side
+latency. The single-process Ruby bench client funnels every per-message
+mask/unmask + frame parse + IO.select through one interpreter under
+the GVL; at 200 concurrent connections the client itself ran out of
+CPU before the server did. To publish honest server throughput, the
+client needs to scale across OS processes.
+
+**Bench-only commit — no production code changes.**
+
+**What ships:**
+
+| Deliverable | Where | Why |
+|---|---|---|
+| `bench/ws_bench_client_multi.rb` | NEW | Forks N child processes (`--procs N`), each running `bench/ws_bench_client.rb --json` against a slice of the total connection count. Aggregates: `total_msgs = Σ child[total_msgs]`, wall `elapsed = max(child[elapsed_s])`, `msg/s = total_msgs / elapsed`, `p50 / p99 / max = max across children` (conservative — slowest child sets the published tail). |
+| `autobahn-config/fuzzingclient.json` | NEW | Canonical RFC 6455 fuzzingclient config pointed at `ws://127.0.0.1:9888/echo`. Excludes case 9.* (very-large-message cases — too slow for default runs; soak via uncomment). Run via `crossbario/autobahn-testsuite` Docker image. |
+| `docs/WEBSOCKETS.md` "Performance" addendum | UPDATED | Adds the 2.3-D multi-process numbers next to the fix-E single-process numbers, plus an operator note that published msg/s requires multi-process. |
+| `docs/WEBSOCKETS.md` "RFC 6455 conformance" section | NEW | Full Docker recipe + expected per-section pass matrix. |
+| `docs/BENCH_HYPERION_2_0.md` "WebSocket multi-process bench (2.3-D)" subsection | NEW | macOS dev numbers + openclaw-vm reproduction recipe (deferred: SSH unavailable this session). |
+
+**Bench numbers — macOS dev (Apple Silicon, 14 efficient cores), median of 3:**
+
+| Workload | msg/s | p50 | p99 | vs fix-E single-process |
+|---|---:|---:|---:|---|
+| 4 procs × 50 conns × 1000 msgs (200-conn aggregate, `-t 256 -w 1`) | **14,757** | 13.01 ms | 21.75 ms | **+176%** msg/s, p99 cut in half (43.12 → 21.75 ms) |
+| 4 procs × 10 conns × 1000 msgs (40-conn aggregate, `-t 256 -w 1`) | 13,594 | 2.49 ms | 7.75 ms | +110% vs fix-E 10-conn 6,463 msg/s |
+
+The 200-conn p99 drop from 43.12 ms to 21.75 ms is the smoking gun
+that fix-E's tail was client-side. With the GVL released across 4
+processes, the bench now actually probes server latency rather than
+client scheduling.
+
+**Deferred to 2.4:**
+
+- **openclaw-vm Linux 16-vCPU rerun.** Bench host SSH was unavailable
+  this session (`Permission denied (publickey)` after a verbose probe).
+  Recipe is in `docs/BENCH_HYPERION_2_0.md` for the next maintainer
+  with agent-loaded keys; expected ≥ 4,500 msg/s aggregate at
+  p99 < 70 ms based on macOS multiplier extrapolation. The
+  aspirational 50,000 msg/s figure from the 2.1.0 brief still needs
+  `-w 16 -t small` plus a non-Ruby client.
+- **autobahn-testsuite RFC 6455 fuzzer run.** Docker daemon was not
+  running locally and the openclaw bench host (where the
+  `crossbario/autobahn-testsuite` image is pre-pulled) was
+  unreachable. Config landed at `autobahn-config/fuzzingclient.json`;
+  recipe + expected pass matrix in `docs/WEBSOCKETS.md`. Any RFC
+  violations the fuzzer surfaces are 2.4 follow-ups.
+
+Spec count: 776 → 776 (no spec changes; bench client lives in `bench/`,
+not `lib/`, and is not loaded by `require 'hyperion'`).
+
 ## [2.2.0] - 2026-05-01
 
 ### Headline

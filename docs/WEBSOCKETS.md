@@ -355,6 +355,29 @@ brief is the Linux + 16-vCPU number to publish, queued behind the next
 openclaw window. See [`docs/BENCH_HYPERION_2_0.md`](BENCH_HYPERION_2_0.md#websocket-echo-210--22x-fix-e-bench-numbers)
 for the full table + reproduction recipe.
 
+**Multi-process bench — 2.3-D (2026-04-29):**
+
+| Workload | msg/s | p50 | p99 |
+|---|---:|---:|---:|
+| 4 procs × 50 conns × 1000 msgs × 1 KiB (`-t 256 -w 1`) | 14,757 | 13.01 ms | 21.75 ms |
+| 4 procs × 10 conns × 1000 msgs × 1 KiB (`-t 256 -w 1`) | 13,594 | 2.49 ms | 7.75 ms |
+
+vs fix-E single-process baseline: **+176% msg/s on the 200-conn
+throughput row, p99 cut in half** (43.12 ms → 21.75 ms). The fix-E
+long tail at 200 conns was client-side GVL serialisation, not
+server-side latency — splitting the client into 4 OS processes via
+`bench/ws_bench_client_multi.rb` removes that bottleneck. Same
+Apple Silicon dev box as the fix-E numbers above; openclaw-vm
+rerun deferred (host SSH unavailable this session — recipe in
+`docs/BENCH_HYPERION_2_0.md`).
+
+**Operator note — published msg/s requires the multi-process bench.**
+The single-process Ruby client tops out at ~5–6k msg/s on macOS and
+~1.7k msg/s on Linux 16-vCPU before becoming client-CPU-bound. To
+characterise Hyperion's *server* throughput, drive load with
+`bench/ws_bench_client_multi.rb --procs N` (N = 4 is sufficient on a
+laptop; size to vCPU count on a bench host).
+
 Two operator notes from the bench:
 
 - **`-t` is a hard cap on concurrent connections per worker.** Each
@@ -384,6 +407,64 @@ of its time in the C `parse` + `unmask` primitives with the GVL released,
 so YJIT and additional fiber concurrency both compound. The 2.3 follow-up
 will add the openclaw-vm rerun + autobahn-testsuite RFC 6455 conformance
 pass.
+
+---
+
+## RFC 6455 conformance — autobahn-testsuite
+
+Hyperion ships an autobahn-testsuite fuzzingclient config so any
+maintainer can run the canonical RFC 6455 conformance fuzzer against
+the WS echo rackup. The config lives at
+[`autobahn-config/fuzzingclient.json`](../autobahn-config/fuzzingclient.json);
+reports drop into `./autobahn-reports/` (gitignored).
+
+### How to run
+
+```sh
+# Terminal 1 — boot Hyperion's WS echo on :9888
+bundle exec hyperion -t 64 -w 1 -p 9888 bench/ws_echo.ru
+
+# Terminal 2 — run the fuzzer (requires Docker daemon)
+docker run --rm \
+  -v $PWD/autobahn-config:/config \
+  -v $PWD/autobahn-reports:/reports \
+  --network host \
+  crossbario/autobahn-testsuite \
+  wstest -m fuzzingclient -s /config/fuzzingclient.json
+
+# Then open ./autobahn-reports/index.html in a browser.
+```
+
+The pip-install path (`pip install autobahntestsuite`) is Python-2
+only and is no longer maintainable; Docker is the supported recipe.
+On macOS dev boxes you'll need Docker Desktop running; on Linux
+bench hosts the `crossbario/autobahn-testsuite` image (~280 MB)
+ships pre-pulled if you've run autobahn before.
+
+### Expected pass matrix (for reproducibility checks)
+
+| Section | Coverage | Hyperion expectation |
+|---|---|---|
+| 1 — Framing | Basic frame layouts | 100% pass |
+| 2 — Pings | Ping/pong correctness | 100% pass |
+| 3 — Reserved bits | RSV1/2/3 validation | 100% pass *(2.3-C teaches RSV1=deflate; RSV2/3 still close 1002)* |
+| 4 — Opcodes | Reserved opcode rejection | 100% pass |
+| 5 — Fragmentation | Continuation frames, control frames mid-fragment | ≥ 95% pass |
+| 6 — UTF-8 | Strict UTF-8 validation on text frames | 100% pass *(2.1.0 spec)* |
+| 7 — Close handling | Close codes, payload validation | 100% pass |
+| 9 — Limits / perf | Multi-MB messages | Excluded from default config (very long runtime; uncomment in `fuzzingclient.json` for a soak run) |
+| 10 — Auto-fragmentation | Server-side fragmenting of large messages | 100% pass |
+| 12 — permessage-deflate | Compressed echo round-trips | 100% pass *(2.3-C — first run after 2.3-C ship)* |
+| 13 — permessage-deflate edge cases | Fragmented + compressed, sliding-window edges | ≥ 95% pass *(2.3-C)* |
+
+### 2.3-D run status
+
+**Deferred — Docker daemon not running this session, openclaw-vm
+SSH unavailable.** The fuzzingclient config file is in place; a
+maintainer with Docker can produce the report in ~5 minutes. Any
+FAILED categories beyond the matrix above are 2.4 follow-ups —
+2.3-D was scoped to land the recipe and run it where possible, not
+to fix RFC violations the fuzzer might surface.
 
 ---
 

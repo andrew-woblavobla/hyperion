@@ -1,0 +1,33 @@
+{
+  "//": "Autobahn-testsuite fuzzingclient config for Hyperion's WS echo rackup.",
+  "//": "Boots an echo server on ws://127.0.0.1:9888/echo (bench/ws_echo.ru),",
+  "//": "then drives the canonical RFC 6455 conformance fuzzer against it.",
+  "//": "",
+  "//": "Run via Docker (no local Python dep):",
+  "//": "",
+  "//": "  docker run --rm \\",
+  "//": "    -v $PWD/autobahn-config:/config \\",
+  "//": "    -v $PWD/autobahn-reports:/reports \\",
+  "//": "    --network host \\",
+  "//": "    crossbario/autobahn-testsuite \\",
+  "//": "    wstest -m fuzzingclient -s /config/fuzzingclient.json",
+  "//": "",
+  "//": "After the run open ./autobahn-reports/index.html for the HTML report.",
+  "//": "",
+  "//": "Cases note: the full RFC 6455 case set is ~520 cases. We exclude",
+  "//": "very-large-message cases (9.*) to keep the run under ~5 minutes;",
+  "//": "include them in a soak run before publishing a fresh msg-size cap.",
+
+  "outdir": "./autobahn-reports",
+  "servers": [
+    {
+      "agent": "Hyperion-2.3.0",
+      "url": "ws://127.0.0.1:9888/echo"
+    }
+  ],
+  "cases": ["*"],
+  "exclude-cases": [
+    "9.*"
+  ],
+  "exclude-agent-cases": {}
+}

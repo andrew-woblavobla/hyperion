@@ -24,3 +24,6 @@ ext/hyperion_io_uring/target/
 # bench output
 bench/keepalive_memory_results/
 keepalive_memory_results/
+
+# autobahn-testsuite reports (generated; recipe in autobahn-config/)
+autobahn-reports/

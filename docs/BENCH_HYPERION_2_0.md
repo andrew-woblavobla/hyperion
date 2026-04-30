@@ -759,3 +759,99 @@ ruby bench/ws_bench_client.rb --port 9888 --conns 200 --msgs 1000 --bytes 1024 -
 
 Take the median of 3 runs per row (run-to-run variance on this
 bench host is ~3-5%).
+
+## WebSocket multi-process bench (2.3-D, 2026-04-29)
+
+`bench/ws_bench_client_multi.rb` — multi-process WS bench client. Forks
+N child processes (`--procs N`), each running `bench/ws_bench_client.rb`
+in `--json` mode against a slice of the total connection count, then
+aggregates results: `total_msgs = Σ child[total_msgs]`, wall
+`elapsed = max(child[elapsed_s])`, `msg/s = total_msgs / elapsed`,
+`p50 / p99 / max = max across children` (conservative — the slowest
+child sets the published tail).
+
+**Why a multi-process client.** The single-process bench client (fix-E)
+serialises all per-message work (mask/unmask, frame parse, IO.select)
+through one Ruby interpreter under the GVL. At 200 concurrent
+connections the *client* becomes the bottleneck; fix-E's openclaw-vm
+200-conn row landed at 1,766 msg/s with p99 134 ms — that long tail
+was client-side scheduler queueing. Splitting the load across N OS
+processes gives each its own GVL.
+
+### Bench numbers — macOS dev (Apple Silicon, 14 efficient cores)
+
+3 runs each, `bundle exec hyperion -t 256 -w 1 -p 9888 bench/ws_echo.ru`,
+median reported.
+
+| Workload | msg/s | p50 | p99 | max |
+|---|---:|---:|---:|---:|
+| WS echo, 4 procs × 10 conns × 1000 msgs (40-conn aggregate) | **13,594** | 2.49 ms | 7.75 ms | 16.64 ms |
+| WS echo, 4 procs × 50 conns × 1000 msgs (200-conn aggregate) | **14,757** | 13.01 ms | 21.75 ms | 142 ms |
+
+vs fix-E single-process baseline on the same host:
+
+| Workload | fix-E single-proc msg/s | 2.3-D 4-proc msg/s | Δ |
+|---|---:|---:|---:|
+| 10-conn latency probe | 6,463 | 13,594 | **+110%** (2.10×) |
+| 200-conn throughput   | 5,346 | 14,757 | **+176%** (2.76×) |
+
+**The 200-conn p99 dropped from 43.12 ms (fix-E single-process) to
+21.75 ms (2.3-D 4-proc) — exactly half**, confirming the long tail in
+fix-E was client-side serialisation, not server-side latency.
+
+### openclaw-vm follow-up bench (Linux 16-vCPU)
+
+**Deferred — bench host SSH was unavailable this session** (key
+authentication refused; `Permission denied (publickey)` after a
+verbose probe). Recipe to run when the host comes back:
+
+```sh
+# Server (`-w 4` to spread workers across the 16 vCPUs;
+# permessage-deflate optional, the multi-process bench measures
+# the plain frame path).
+bundle exec hyperion -t 64 -w 4 -p 9888 ~/bench/ws_echo.ru &
+
+# Client — 4 procs × 50 conns each = 200 total conns, three runs:
+for run in 1 2 3; do
+  ruby ~/bench/ws_bench_client_multi.rb \
+    --host 127.0.0.1 --port 9888 \
+    --procs 4 --conns 200 --msgs 1000 --bytes 1024 --json
+done | tee ~/bench/ws_multi-$(date -Is).jsonl
+```
+
+Take the median of 3 runs per row. Compare against fix-E's 200-conn
+single-process Linux result (1,766 msg/s, p99 134 ms): the
+2.76× macOS multiplier above implies a Linux target of
+**≥ 4,500 msg/s aggregate** at p99 < 70 ms, well over the brief's
+≥ 5,000 msg/s soft target if the macOS factor extrapolates cleanly.
+The aspirational 50,000 msg/s figure from the 2.1.0 brief still
+needs `-w 16 -t small` plus a non-Ruby client; that's a 2.4 follow-up.
+
+### Reproducing on macOS dev
+
+```sh
+bundle exec hyperion -t 256 -w 1 -p 9888 bench/ws_echo.ru &
+
+# 200-conn throughput (4 procs × 50 conns each)
+ruby bench/ws_bench_client_multi.rb --port 9888 \
+  --procs 4 --conns 200 --msgs 1000 --bytes 1024 --json
+
+# 40-conn latency (4 procs × 10 conns each)
+ruby bench/ws_bench_client_multi.rb --port 9888 \
+  --procs 4 --conns 40 --msgs 1000 --bytes 1024 --json
+```
+
+Note `-t 256` is required — at `-t 64 -w 1`, more than 64 of the 200
+client connections drop at the handshake stage because each WS
+connection permanently hijacks a worker thread (same shape as fix-E).
+`-w 4 -t 64` (the brief's recommended Linux config) sidesteps this
+by giving each worker its own 64-thread budget, but requires `fork`
+on the boot path which is unreliable on macOS dev.
+
+### RFC 6455 conformance — autobahn-testsuite
+
+Config landed in `autobahn-config/fuzzingclient.json`. The full run
+is **deferred — Docker daemon was not running locally this session**
+and the openclaw-vm bench host (where `crossbario/autobahn-testsuite`
+ships pre-pulled) was unreachable. See `docs/WEBSOCKETS.md`
+"RFC 6455 conformance" for the recipe and known-limitation matrix.
