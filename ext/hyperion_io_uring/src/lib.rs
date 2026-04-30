@@ -63,7 +63,7 @@ pub extern "C" fn hyperion_io_uring_abi_version() -> u32 {
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use super::*;
-    use io_uring::{opcode, types, IoUring};
+    use io_uring::{opcode, squeue, types, IoUring};
     use std::os::unix::io::RawFd;
 
     /// Owned per-fiber ring. Holds the IoUring + a tiny scratch
@@ -73,14 +73,20 @@ mod linux_impl {
     /// off `accept` if needed via getpeername), but the kernel
     /// requires the pointer to be non-NULL on the accept opcode.
     pub struct Ring {
-        ring: IoUring,
+        // Explicit Entry/Entry generics: io-uring 0.6's IoUring is
+        // generic over squeue::EntryMarker / cqueue::EntryMarker; the
+        // type-inference can't solve `IoUring::builder().build(_)`
+        // without help. Pinning to the default Entry pair (32-byte
+        // SQEs / 16-byte CQEs) here keeps the rest of the impl clean.
+        ring: IoUring<squeue::Entry, io_uring::cqueue::Entry>,
         addr_storage: libc::sockaddr_storage,
         addr_len: libc::socklen_t,
     }
 
     impl Ring {
         pub fn new(queue_depth: u32) -> std::io::Result<Self> {
-            let ring = IoUring::builder().build(queue_depth)?;
+            let ring: IoUring<squeue::Entry, io_uring::cqueue::Entry> =
+                IoUring::builder().build(queue_depth)?;
             let addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             Ok(Ring {
                 ring,
@@ -160,7 +166,9 @@ mod linux_impl {
     /// negative errno (e.g. -ENOSYS in a sandbox where io_uring_setup
     /// is blocked, or -EPERM in a seccomp-filtered container).
     pub fn probe() -> c_int {
-        match IoUring::builder().build(8) {
+        let result: std::io::Result<IoUring<squeue::Entry, io_uring::cqueue::Entry>> =
+            IoUring::builder().build(8);
+        match result {
             Ok(_) => 0,
             Err(e) => -(e.raw_os_error().unwrap_or(libc::ENOSYS)),
         }
