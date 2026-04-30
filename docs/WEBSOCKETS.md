@@ -50,8 +50,8 @@ These are intentionally out of scope for 2.1.0:
   the h2 stream multiplexer is its own work item; clients that need
   WebSockets get HTTP/1.1 today. ALPN auto-falls-back, so this is invisible
   to browsers.
-- **permessage-deflate compression (RFC 7692)** — handshake-time negotiation
-  + per-frame inflate/deflate. Deferred to a follow-up minor.
+- **permessage-deflate compression (RFC 7692)** — added in 2.3.0; see
+  ["permessage-deflate (2.3.0)"](#permessage-deflate-230) below.
 - **Send-side fragmentation** — `Connection#send` writes a single `FIN=1`
   frame regardless of payload size. Browsers and well-behaved clients
   handle multi-MB single frames; if a use case for opt-in
@@ -218,6 +218,117 @@ before the app sees it; in that case, call `validate` and write your own
 `HYPERION_WS_ORIGIN_ALLOW_LIST` (comma-separated) is a process-wide env-var
 fallback for the origin allow-list, intended as an operator escape hatch.
 Per-app config via the full `Hyperion::Config` DSL is on the 2.2.x roadmap.
+
+---
+
+## permessage-deflate (2.3.0)
+
+Hyperion 2.3.0 adds RFC 7692 [permessage-deflate](https://datatracker.ietf.org/doc/html/rfc7692):
+per-message DEFLATE compression for WebSocket payloads. Chat / pubsub /
+ActionCable workloads see **5–20× wire-bandwidth reduction** with a small
+CPU cost on each side; for nginx-fronted deployments the saving lands
+straight on the egress bill.
+
+### How to enable
+
+```ruby
+# config/hyperion.rb
+Hyperion::Config.load do
+  websocket do
+    permessage_deflate :auto   # default — accept if the client offers
+    # permessage_deflate :on   # require it; reject the handshake otherwise
+    # permessage_deflate :off  # never advertise; keep 2.2.x behaviour
+  end
+end
+```
+
+The default is `:auto`. Hyperion advertises permessage-deflate only when
+the client's request carries a usable
+`Sec-WebSocket-Extensions: permessage-deflate` offer; clients that don't
+offer it (older Safari, hand-rolled clients) keep getting plain frames.
+
+The Connection wrapper picks up the negotiated parameter set from the 4th
+slot of `env['hyperion.websocket.handshake']`:
+
+```ruby
+result = env['hyperion.websocket.handshake']  # [:ok, accept, sub, ext]
+ws = Hyperion::WebSocket::Connection.new(
+  socket,
+  buffered: env['hyperion.hijack_buffered'],
+  subprotocol: result[2],
+  extensions: result[3]   # {} when no extension was negotiated
+)
+```
+
+If you build the 101 response by hand, render the negotiated extension
+parameters with `Handshake.format_extensions_header`:
+
+```ruby
+ext_value = Hyperion::WebSocket::Handshake.format_extensions_header(result[3])
+extras = ext_value ? { 'sec-websocket-extensions' => ext_value } : {}
+socket.write(Hyperion::WebSocket::Handshake.build_101_response(result[1], result[2], extras))
+```
+
+### Negotiated parameters (RFC 7692 §7.1.1)
+
+| Parameter | Meaning | Default |
+|---|---|---|
+| `server_max_window_bits` | LZ77 window for server→client. Smaller = less memory, less compression. | 15 |
+| `client_max_window_bits` | LZ77 window for client→server. | 15 |
+| `server_no_context_takeover` | Reset the deflate dictionary between messages on the server side. Lower compression but bounded memory per connection. | false |
+| `client_no_context_takeover` | Same, for client→server messages. | false |
+
+Hyperion accepts any combination the client offers; with multiple
+parameter sets in the request, the first usable one wins per RFC 7692 §5.1.
+
+### Compression-bomb defense (RFC 7692 §8.1)
+
+A malicious client can ship a tiny compressed payload that decompresses
+to gigabytes. Hyperion applies the connection's `max_message_bytes` cap
+(default 1 MiB) **after** decompression — the decompressor streams output
+in 16 KiB chunks and short-circuits the moment the running total would
+exceed the cap. The connection then closes 1009 (Message Too Big) and
+the next `recv` raises `StateError`. The wire-side cap is a loose
+multiple of `max_message_bytes` (8×) so legitimate compressible messages
+still squeeze through.
+
+### Bandwidth savings (chat workload, local UNIXSocket bench)
+
+`bench/ws_deflate_bench.rb` sends 1000 chat-style JSON messages (typical
+shape: `{type:"message",user_id:…,body:"…"}`, ~400 B uncompressed each)
+through one Connection and measures wire bytes leaving the server:
+
+| Mode | Bytes per message | Wire reduction |
+|---:|---:|---:|
+| Plain (no deflate) | 400.8 B | — |
+| permessage-deflate | 19.7 B | **20.4× smaller** |
+
+The 20× number is upper-bound — chat-style JSON has very repetitive
+field names which the shared deflate dictionary picks up immediately.
+For random binary or already-compressed payloads (images, h.264) the
+saving is near-zero and you should leave the extension off (`:off` on
+those routes) so the CPU cycles aren't wasted.
+
+The msg/s drop on the bench (~40%) is the cost of deflate CPU on the
+encode side; in production with multiple workers and the GVL released
+on the surrounding C unmask path, the per-worker throughput drop is
+smaller. The bandwidth saving is the headline win — bandwidth costs
+move with bytes, not with dispatches.
+
+### Operator notes
+
+- Default `:auto` is backwards-compatible: clients that don't offer
+  permessage-deflate keep getting plain frames. Flipping `:auto → :on`
+  is a hardening lever for environments where you control the client
+  population (mobile app, internal service mesh).
+- Per-connection memory cost: ~256 KB for the deflate context (15-bit
+  window × 8 buffers × overhead). For a 10k-conn idle ActionCable
+  worker, that's ~2.5 GB resident — size your worker RSS cap accordingly,
+  or pass `client_no_context_takeover` / `server_no_context_takeover`
+  in the negotiated params to drop memory at the cost of compression.
+- Control frames (ping / pong / close) are NEVER compressed (RFC 7692
+  §6.1). Hyperion enforces this on both encode and decode paths; a
+  ping-with-RSV1 from the client closes the connection 1002.
 
 ---
 

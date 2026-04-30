@@ -28,8 +28,19 @@ module Hyperion
   module WebSocket
     # Per-message struct returned by `Parser.parse`.  `opcode` is a
     # Symbol (`:text`, `:binary`, …); `payload` is a freshly-allocated
-    # binary String already unmasked.
-    Frame = Struct.new(:fin, :opcode, :payload, keyword_init: true)
+    # binary String already unmasked. `rsv1` is the per-message-deflate
+    # marker (RFC 7692 §6); always false on parsed control frames (the
+    # parser would have errored out), only ever true on text/binary/
+    # continuation frames when the connection negotiated the extension.
+    Frame = Struct.new(:fin, :opcode, :payload, :rsv1, keyword_init: true) do
+      # Defaults — keep `Frame.new(fin:, opcode:, payload:)` working for
+      # the (overwhelming) majority of call sites that don't care about
+      # rsv1. New WS-2.3 callers pass `rsv1:` explicitly when building a
+      # compressed frame.
+      def initialize(fin:, opcode:, payload:, rsv1: false)
+        super(fin: fin, opcode: opcode, payload: payload, rsv1: rsv1)
+      end
+    end
 
     # Symbolic opcode table.  Reverse table built lazily for the
     # parse-side lookup. Frozen so accidental mutation can't corrupt
@@ -68,7 +79,7 @@ module Hyperion
 
         raise ProtocolError, 'malformed WebSocket frame' if result == :error
 
-        fin, opcode, payload_len, masked, mask_key, payload_offset, _frame_total_len = result
+        fin, opcode, payload_len, masked, mask_key, payload_offset, _frame_total_len, rsv1 = result
 
         opcode_sym = OPCODE_NAMES[opcode] ||
                      raise(ProtocolError, "unknown opcode 0x#{opcode.to_s(16)}")
@@ -81,7 +92,7 @@ module Hyperion
             masked ? ::Hyperion::WebSocket::CFrame.unmask(slice, mask_key) : slice.b
           end
 
-        Frame.new(fin: fin, opcode: opcode_sym, payload: payload)
+        Frame.new(fin: fin, opcode: opcode_sym, payload: payload, rsv1: rsv1 ? true : false)
       end
 
       # Lower-level variant exposing the raw 7-tuple from the C parser
@@ -98,7 +109,7 @@ module Hyperion
 
         raise ProtocolError, 'malformed WebSocket frame' if result == :error
 
-        fin, opcode, payload_len, masked, mask_key, payload_offset, frame_total_len = result
+        fin, opcode, payload_len, masked, mask_key, payload_offset, frame_total_len, rsv1 = result
 
         opcode_sym = OPCODE_NAMES[opcode] ||
                      raise(ProtocolError, "unknown opcode 0x#{opcode.to_s(16)}")
@@ -111,7 +122,10 @@ module Hyperion
             masked ? ::Hyperion::WebSocket::CFrame.unmask(slice, mask_key) : slice.b
           end
 
-        [Frame.new(fin: fin, opcode: opcode_sym, payload: payload), frame_total_len]
+        [
+          Frame.new(fin: fin, opcode: opcode_sym, payload: payload, rsv1: rsv1 ? true : false),
+          frame_total_len
+        ]
       end
     end
 
@@ -130,7 +144,7 @@ module Hyperion
       # Control frames (close/ping/pong) MUST have payload <= 125 bytes
       # and MUST have fin: true; the C builder raises ArgumentError if
       # those invariants are violated, which we re-raise as-is.
-      def self.build(opcode:, payload: '', fin: true, mask: false, mask_key: nil)
+      def self.build(opcode:, payload: '', fin: true, mask: false, mask_key: nil, rsv1: false)
         opcode_int = opcode.is_a?(Symbol) ? OPCODES.fetch(opcode) : Integer(opcode)
         bin_payload = payload.is_a?(String) ? payload.b : payload.to_s.b
 
@@ -146,7 +160,8 @@ module Hyperion
           bin_payload,
           fin: fin,
           mask: mask,
-          mask_key: mask_key
+          mask_key: mask_key,
+          rsv1: rsv1
         )
       end
     end
@@ -188,13 +203,19 @@ module Hyperion
         masked = (b1 & 0x80) != 0
         len7   = b1 & 0x7F
 
-        return :error if rsv1 || rsv2 || rsv3
+        # RFC 7692 §6: RSV1 is the permessage-deflate marker. Allow it
+        # through in the parse tuple; the Connection wrapper rejects
+        # RSV1 when no extension was negotiated. RSV2/RSV3 are reserved
+        # with no defined semantics → reject.
+        return :error if rsv2 || rsv3
 
         return :error unless [0x0, 0x1, 0x2, 0x8, 0x9, 0xA].include?(opcode)
 
         if opcode >= 0x8
           return :error unless fin
           return :error if len7 > 125
+          # RFC 7692 §6.1 — control frames MUST NOT be compressed.
+          return :error if rsv1
         end
 
         header_len = 2
@@ -231,10 +252,10 @@ module Hyperion
         frame_total_len = header_len + payload_len
         return :incomplete if avail < frame_total_len
 
-        [fin, opcode, payload_len, masked, mask_key, payload_offset, frame_total_len]
+        [fin, opcode, payload_len, masked, mask_key, payload_offset, frame_total_len, rsv1]
       end
 
-      def build(opcode, payload, fin: true, mask: false, mask_key: nil)
+      def build(opcode, payload, fin: true, mask: false, mask_key: nil, rsv1: false)
         raise ArgumentError, "unknown opcode 0x#{opcode.to_s(16)}" unless [0x0, 0x1, 0x2, 0x8, 0x9,
                                                                            0xA].include?(opcode)
 
@@ -243,6 +264,7 @@ module Hyperion
         if opcode >= 0x8
           raise ArgumentError, 'control frame must have fin=true' unless fin
           raise ArgumentError, 'control frame payload exceeds 125 bytes' if payload_len > 125
+          raise ArgumentError, 'control frame must not have rsv1=true' if rsv1
         end
 
         if mask
@@ -251,7 +273,7 @@ module Hyperion
         end
 
         out = String.new(encoding: Encoding::BINARY)
-        out << ((fin ? 0x80 : 0x00) | (opcode & 0x0F)).chr
+        out << ((fin ? 0x80 : 0x00) | (rsv1 ? 0x40 : 0x00) | (opcode & 0x0F)).chr
         mask_bit = mask ? 0x80 : 0x00
 
         if payload_len < 126

@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'zlib'
 require_relative 'frame'
 
 module Hyperion
@@ -74,6 +75,13 @@ module Hyperion
     # arrives in ~64 syscalls.
     READ_CHUNK_BYTES = 16 * 1024
 
+    # 2.3-C — RFC 7692 §7.2.1 sync trailer. The 4-byte deflate-block
+    # terminator that the deflater emits between messages and the
+    # inflater needs prepended back. Frozen so the per-frame strip /
+    # append paths share one constant rather than allocating a fresh
+    # Array of bytes each time.
+    DEFLATE_SYNC_TRAILER = "\x00\x00\xff\xff".b.freeze
+
     # RFC 6455 §7.4.1 close codes we emit. The peer is free to send any
     # registered code; we surface their integer verbatim in `recv`.
     CLOSE_NORMAL          = 1000
@@ -99,18 +107,31 @@ module Hyperion
       # subprotocol      — the negotiated subprotocol from the handshake
       #                    (slot 2 of the [:ok, accept, sub] tuple) or nil.
       # max_message_bytes — cap on a single reassembled message. Default 1 MiB.
+      #                     For permessage-deflate the cap is applied to the
+      #                     DECOMPRESSED size — a tiny compressed payload that
+      #                     inflates beyond the cap closes 1009 (compression
+      #                     bomb defense, RFC 7692 §8.1).
       # ping_interval    — seconds between proactive server pings. nil = off.
       # idle_timeout     — seconds of no traffic before we send a close.
       #                    nil = off. Defaults to 60s; set higher for
       #                    long-lived idle clients (chat presence, etc.).
+      # extensions       — Hash from `Handshake.validate`'s 4th slot. When
+      #                    `permessage_deflate:` is present the connection
+      #                    instantiates a per-conn Zlib::Deflate / Inflate
+      #                    pair sized to the negotiated window bits, and
+      #                    sets RSV1 on outbound text/binary frames. `{}`
+      #                    (default) means no compression.
       def initialize(socket, buffered: '', subprotocol: nil,
                      max_message_bytes: 1_048_576,
-                     ping_interval: 30, idle_timeout: 60)
+                     ping_interval: 30, idle_timeout: 60,
+                     extensions: {})
         @socket = socket
         @subprotocol = subprotocol
         @max_message_bytes = max_message_bytes
         @ping_interval = ping_interval
         @idle_timeout = idle_timeout
+
+        configure_permessage_deflate(extensions[:permessage_deflate])
 
         @inbuf = String.new(capacity: READ_CHUNK_BYTES, encoding: Encoding::ASCII_8BIT)
         @inbuf << buffered.to_s.b unless buffered.nil? || buffered.empty?
@@ -158,6 +179,22 @@ module Hyperion
             return nil
           end
 
+          # RFC 7692 §6.1: control frames MUST NOT have RSV1 set. The
+          # parser already errored on this case, but defense-in-depth
+          # — keeps us safe if someone hands us a custom frame source.
+          if frame.rsv1 && %i[ping pong close].include?(frame.opcode)
+            fail_close(CLOSE_PROTOCOL_ERROR, 'RSV1 set on control frame')
+            raise StateError, 'RSV1 set on control frame'
+          end
+
+          # RFC 7692 §6: RSV1 only allowed on data frames when the
+          # extension was negotiated. Without negotiation, any RSV1 is
+          # a protocol error — close 1002 and bail.
+          if frame.rsv1 && @inflater.nil?
+            fail_close(CLOSE_PROTOCOL_ERROR, 'RSV1 set without negotiated extension')
+            raise StateError, 'RSV1 set without negotiated extension'
+          end
+
           case frame.opcode
           when :ping
             handle_ping(frame)
@@ -176,7 +213,11 @@ module Hyperion
       end
 
       # Send an application message. opcode: :text (default) or :binary.
-      # Single-frame, FIN=1, server-side (unmasked).
+      # Single-frame, FIN=1, server-side (unmasked). When permessage-
+      # deflate is active the payload is DEFLATE-compressed inline and
+      # the RSV1 bit is set on the frame; control frames (close/ping/
+      # pong) are NEVER compressed per RFC 7692 §6.1, even when the
+      # extension is active.
       def send(payload, opcode: :text)
         raise StateError, 'connection is closed' if @state == :closed
         raise StateError, "cannot send while #{@state}" if @state != :open
@@ -185,7 +226,12 @@ module Hyperion
         end
 
         bin = opcode == :text ? payload.to_s.encode(Encoding::UTF_8).b : payload.to_s.b
-        wire = Hyperion::WebSocket::Builder.build(opcode: opcode, payload: bin)
+        rsv1 = false
+        if @deflater
+          bin = deflate_message(bin)
+          rsv1 = true
+        end
+        wire = Hyperion::WebSocket::Builder.build(opcode: opcode, payload: bin, rsv1: rsv1)
         write_wire(wire)
         @last_traffic_at = monotonic_now
         true
@@ -405,21 +451,31 @@ module Hyperion
             fail_close(CLOSE_PROTOCOL_ERROR, 'continuation without start')
             raise StateError, 'continuation without start'
           end
+          # RFC 7692 §6: RSV1 must be 0 on continuation frames; the
+          # compressed marker only sits on the first fragment.
+          if frame.rsv1
+            fail_close(CLOSE_PROTOCOL_ERROR, 'RSV1 set on continuation frame')
+            raise StateError, 'RSV1 set on continuation frame'
+          end
         else
           if @msg_opcode
             fail_close(CLOSE_PROTOCOL_ERROR, 'new data frame mid-message')
             raise StateError, 'new data frame mid-message'
           end
           @msg_opcode = frame.opcode
+          @msg_compressed = frame.rsv1
           @msg_buffer = String.new(capacity: frame.payload.bytesize, encoding: Encoding::ASCII_8BIT)
         end
 
+        # Wire-side cap. For uncompressed messages the wire size IS the
+        # message size; the same cap applies. For compressed messages we
+        # apply a generous separate cap (8× max_message_bytes) so a
+        # legitimate compressible message still squeezes through; the
+        # post-decompress cap below is the real defense.
+        wire_cap = @msg_compressed ? @max_message_bytes * 8 : @max_message_bytes
         new_total = @msg_buffer.bytesize + frame.payload.bytesize
-        if new_total > @max_message_bytes
+        if new_total > wire_cap
           fail_close(CLOSE_MESSAGE_TOO_BIG, "message exceeds #{@max_message_bytes} bytes")
-          # Synthesize the close return tuple right away rather than
-          # waiting for the peer's reaction — the caller asked for a
-          # message, the right answer is "this connection is dead".
           @close_code = CLOSE_MESSAGE_TOO_BIG
           @close_reason = 'message too big'
           @close_observed_by_caller = true
@@ -432,8 +488,34 @@ module Hyperion
 
         type = @msg_opcode
         payload = @msg_buffer
+        compressed = @msg_compressed
         @msg_opcode = nil
+        @msg_compressed = false
         @msg_buffer = nil
+
+        if compressed
+          payload = inflate_message(payload)
+          # Compression-bomb defense: the inflated size is the actual
+          # application payload size, and that's what `max_message_bytes`
+          # bounds. RFC 7692 §8.1 — implementations MUST defend against
+          # malicious senders that compress to a tiny wire payload that
+          # explodes on decompression.
+          if payload.is_a?(Symbol) && payload == :too_big
+            fail_close(CLOSE_MESSAGE_TOO_BIG,
+                       "decompressed message exceeds #{@max_message_bytes} bytes")
+            @close_code = CLOSE_MESSAGE_TOO_BIG
+            @close_reason = 'compressed bomb'
+            @close_observed_by_caller = true
+            return [:close, CLOSE_MESSAGE_TOO_BIG, 'compressed bomb']
+          end
+          if payload.is_a?(Symbol) && payload == :inflate_error
+            fail_close(CLOSE_INVALID_PAYLOAD, 'invalid deflate payload')
+            @close_code = CLOSE_INVALID_PAYLOAD
+            @close_reason = 'inflate error'
+            @close_observed_by_caller = true
+            return [:close, CLOSE_INVALID_PAYLOAD, 'inflate error']
+          end
+        end
 
         if type == :text
           payload.force_encoding(Encoding::UTF_8)
@@ -539,6 +621,108 @@ module Hyperion
           # Already closed; that's fine.
         end
         @state = :closed
+      end
+
+      # ---- 2.3-C permessage-deflate helpers ---------------------------
+
+      # Set up the per-connection deflater + inflater pair when the
+      # handshake negotiated permessage-deflate. With no params hash
+      # (extension not negotiated) this is a no-op and the connection
+      # behaves identically to 2.2.0.
+      def configure_permessage_deflate(params)
+        @deflater = nil
+        @inflater = nil
+        @server_no_takeover = false
+        @client_no_takeover = false
+        return if params.nil?
+
+        # RFC 7692 §7.1.2 — server-side deflater uses
+        # server_max_window_bits; inflater (decompressing client→server)
+        # uses client_max_window_bits.
+        server_bits = params[:server_max_window_bits] || 15
+        client_bits = params[:client_max_window_bits] || 15
+        @server_no_takeover = !!params[:server_no_context_takeover]
+        @client_no_takeover = !!params[:client_no_context_takeover]
+
+        # Negative window_bits → raw deflate (no zlib header). RFC 7692
+        # is built on raw DEFLATE per §7.2.1.
+        @deflater = Zlib::Deflate.new(Zlib::DEFAULT_COMPRESSION, -server_bits)
+        @inflater = Zlib::Inflate.new(-client_bits)
+      end
+
+      # Compress one message with SYNC_FLUSH and strip the trailing
+      # `\x00\x00\xff\xff` per RFC 7692 §7.2.1. Resets the deflater
+      # context if `server_no_context_takeover` was negotiated.
+      def deflate_message(bin)
+        compressed = @deflater.deflate(bin, Zlib::SYNC_FLUSH)
+        # The 4-byte trailer is the last 4 bytes of every SYNC_FLUSH
+        # output; strip exactly once. If the deflater somehow produced
+        # output shorter than 4 bytes (degenerate empty-message case),
+        # leave it alone — the inflater appends the trailer back so a
+        # missing one would just be re-added.
+        if compressed.bytesize >= 4 && compressed.byteslice(-4, 4) == DEFLATE_SYNC_TRAILER
+          compressed = compressed.byteslice(0, compressed.bytesize - 4)
+        end
+        @deflater.reset if @server_no_takeover
+        compressed
+      end
+
+      # Inflate a compressed message. Appends the 4-byte sync trailer
+      # back per RFC 7692 §7.2.1 then runs `Zlib::Inflate#inflate`.
+      # Streams output in chunks bounded by `@max_message_bytes` so a
+      # 1 KB compressed payload that decompresses to 100 MB stops at
+      # the cap and returns `:too_big`. On Zlib::DataError returns
+      # `:inflate_error`.
+      def inflate_message(payload)
+        framed = String.new(capacity: payload.bytesize + 4, encoding: Encoding::ASCII_8BIT)
+        framed << payload.b
+        framed << DEFLATE_SYNC_TRAILER
+
+        out = String.new(encoding: Encoding::ASCII_8BIT)
+        cap = @max_message_bytes
+        too_big = false
+
+        begin
+          # Stream in 16 KB chunks so we can short-circuit a compression
+          # bomb without materializing the full inflated buffer first.
+          # Zlib::Inflate#inflate accepts a single full input; we feed
+          # the input in slices and read back after each — same effect.
+          offset = 0
+          chunk_size = 16 * 1024
+          while offset < framed.bytesize
+            slice = framed.byteslice(offset, chunk_size)
+            offset += slice.bytesize
+            piece = @inflater.inflate(slice)
+            next if piece.empty?
+
+            if out.bytesize + piece.bytesize > cap
+              too_big = true
+              break
+            end
+            out << piece
+          end
+
+          # Drain any remaining output Zlib has buffered.
+          unless too_big
+            tail = @inflater.flush_next_out
+            unless tail.nil? || tail.empty?
+              if out.bytesize + tail.bytesize > cap
+                too_big = true
+              else
+                out << tail
+              end
+            end
+          end
+        rescue Zlib::DataError, Zlib::BufError
+          @inflater.reset if @client_no_takeover
+          return :inflate_error
+        end
+
+        @inflater.reset if @client_no_takeover
+
+        return :too_big if too_big
+
+        out
       end
     end
   end

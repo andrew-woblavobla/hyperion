@@ -26,22 +26,37 @@
 require 'hyperion'
 require 'hyperion/websocket/connection'
 
+# 2.3-C: when HYPERION_WS_DEFLATE=on, the bench app advertises
+# permessage-deflate in its 101 response (via the negotiated extensions
+# slot from `Hyperion::WebSocket::Handshake.validate`) and instructs the
+# Connection to deflate outbound frames. The bench client must also
+# negotiate the extension (Sec-WebSocket-Extensions request header) for
+# the wire-bytes saving to materialize.
+DEFLATE_BENCH = ENV.fetch('HYPERION_WS_DEFLATE', 'off') != 'off'
+
 run lambda { |env|
   result = env['hyperion.websocket.handshake']
   return [400, { 'content-type' => 'text/plain' }, ['expected ws upgrade']] unless result && result.first == :ok
 
+  accept_value = result[1]
+  subprotocol = result[2]
+  extensions = result[3] || {}
+  ext_header = Hyperion::WebSocket::Handshake.format_extensions_header(extensions)
+  extra_headers = ext_header ? { 'sec-websocket-extensions' => ext_header } : {}
+
   socket = env['rack.hijack'].call
   socket.write(
-    Hyperion::WebSocket::Handshake.build_101_response(result[1], result[2])
+    Hyperion::WebSocket::Handshake.build_101_response(accept_value, subprotocol, extra_headers)
   )
 
   ws = Hyperion::WebSocket::Connection.new(
     socket,
     buffered: env['hyperion.hijack_buffered'],
-    subprotocol: result[2],
+    subprotocol: subprotocol,
     max_message_bytes: 16 * 1024,
     ping_interval: nil,
-    idle_timeout: nil
+    idle_timeout: nil,
+    extensions: DEFLATE_BENCH ? extensions : {}
   )
 
   loop do

@@ -72,11 +72,13 @@ RSpec.describe Hyperion::WebSocket::Handshake do
   it 'returns :not_websocket when Upgrade header is missing' do
     env = base_env
     env.delete('HTTP_UPGRADE')
-    expect(described_class.validate(env)).to eq([:not_websocket, nil, nil])
+    # 2.3-C: tuple gained a 4th slot for negotiated extensions; the
+    # `:not_websocket` sentinel keeps the shape (`{}`).
+    expect(described_class.validate(env)).to eq([:not_websocket, nil, nil, {}])
   end
 
   it 'returns :not_websocket when Upgrade is something other than websocket (e.g. h2c)' do
-    expect(described_class.validate(base_env('HTTP_UPGRADE' => 'h2c'))).to eq([:not_websocket, nil, nil])
+    expect(described_class.validate(base_env('HTTP_UPGRADE' => 'h2c'))).to eq([:not_websocket, nil, nil, {}])
   end
 
   # ---------------------------------------------------------------

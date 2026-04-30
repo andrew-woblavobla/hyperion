@@ -70,7 +70,7 @@ module Hyperion
     # Nested subconfig readers. The DSL exposes them as block forms
     # (`h2 do |h| ... end`) and the legacy flat forms (`h2_max_concurrent_streams 256`)
     # both write into the same backing object.
-    attr_reader :h2, :admin, :worker_health, :logging, :tls
+    attr_reader :h2, :admin, :worker_health, :logging, :tls, :websocket
 
     # H2 settings subconfig. RFC 7540 §6.5.2 settings + the new-in-1.7
     # per-process `max_total_streams` admission cap (RFC A7).
@@ -137,6 +137,25 @@ module Hyperion
         @level    = nil
         @format   = nil
         @requests = nil
+      end
+    end
+
+    # 2.3-C: WebSocket subconfig. The headline knob is
+    # `permessage_deflate` — RFC 7692 per-message DEFLATE compression
+    # for the WS payload. Tri-state, mirrors `tls.ktls`:
+    #   :off  — never advertise the extension.
+    #   :auto — accept if the client offers it (default; backwards
+    #           compatible with clients that don't offer it).
+    #   :on   — require it; reject the handshake (400) if the client
+    #           doesn't offer a usable variant.
+    class WebSocketConfig
+      ATTRS = %i[permessage_deflate].freeze
+      attr_accessor(*ATTRS)
+
+      DEFAULT_PERMESSAGE_DEFLATE = :auto
+
+      def initialize
+        @permessage_deflate = DEFAULT_PERMESSAGE_DEFLATE
       end
     end
 
@@ -219,6 +238,7 @@ module Hyperion
       @worker_health = WorkerHealthConfig.new
       @logging       = LoggingConfig.new
       @tls           = TlsConfig.new
+      @websocket     = WebSocketConfig.new
     end
 
     HOOKS.each do |hook|
@@ -360,7 +380,7 @@ module Hyperion
       # eval'd against a BlockProxy that proxies bareword method calls
       # into the subconfig's accessors; explicit-arg form (`|h|`) gives
       # callers the proxy directly so they can pass it around.
-      %i[h2 admin worker_health logging tls].each do |group|
+      %i[h2 admin worker_health logging tls websocket].each do |group|
         define_method(group) do |&block|
           subconfig = @config.public_send(group)
           if block.nil?

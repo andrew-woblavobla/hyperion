@@ -162,9 +162,21 @@ RSpec.describe Hyperion::WebSocket do
   # 6. Malformed frames return :error
   # ---------------------------------------------------------------
   describe 'malformed frames return :error' do
-    it 'rejects RSV1 set' do
+    # 2.3-C: RSV1 is the permessage-deflate marker (RFC 7692 §6); the
+    # parser preserves it in the tuple. The Connection wrapper rejects
+    # RSV1 when no extension was negotiated; the parser itself only
+    # errors when RSV1 is set on a control frame (RFC 7692 §6.1).
+    it 'preserves RSV1 in the parsed tuple for data frames' do
       # 0xC1 = FIN=1, RSV1=1, opcode=text
       buf = [0xC1, 0x00].pack('C*')
+      result = cframe.parse(buf)
+      expect(result).to be_a(Array)
+      expect(result[7]).to eq(true)
+    end
+
+    it 'rejects RSV1 set on a control frame (RFC 7692 §6.1)' do
+      # 0xC9 = FIN=1, RSV1=1, opcode=ping
+      buf = [0xC9, 0x00].pack('C*')
       expect(cframe.parse(buf)).to eq(:error)
     end
 
@@ -202,8 +214,9 @@ RSpec.describe Hyperion::WebSocket do
       expect(cframe.parse(buf)).to eq(:error)
     end
 
-    it 'raises ProtocolError from the Ruby façade on RSV bits' do
-      buf = [0xC1, 0x00].pack('C*')
+    it 'raises ProtocolError from the Ruby façade on RSV2/RSV3 bits' do
+      # RSV2 = 0xA1
+      buf = [0xA1, 0x00].pack('C*')
       expect { Hyperion::WebSocket::Parser.parse(buf) }
         .to raise_error(Hyperion::WebSocket::ProtocolError)
     end
@@ -250,7 +263,8 @@ RSpec.describe Hyperion::WebSocket do
     it 'completes parsing once the full buffer arrives' do
       result = cframe.parse(wire)
       expect(result).to be_a(Array)
-      expect(result.length).to eq(7)
+      # 2.3-C: tuple now has 8 slots (last = rsv1 boolean).
+      expect(result.length).to eq(8)
     end
   end
 

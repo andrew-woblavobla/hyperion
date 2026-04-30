@@ -56,15 +56,16 @@ module Hyperion
       # Common-case header keys looked up in env. All UPPER_SNAKE; values
       # come from the Rack adapter's HTTP_KEY_CACHE (frozen) so straight
       # `env[KEY]` is cheaper than building the key per call.
-      UPGRADE_KEY    = 'HTTP_UPGRADE'
-      CONNECTION_KEY = 'HTTP_CONNECTION'
-      WS_KEY_KEY     = 'HTTP_SEC_WEBSOCKET_KEY'
-      WS_VERSION_KEY = 'HTTP_SEC_WEBSOCKET_VERSION'
-      WS_PROTO_KEY   = 'HTTP_SEC_WEBSOCKET_PROTOCOL'
-      ORIGIN_KEY     = 'HTTP_ORIGIN'
-      HOST_KEY       = 'HTTP_HOST'
-      METHOD_KEY     = 'REQUEST_METHOD'
-      PROTO_KEY      = 'SERVER_PROTOCOL'
+      UPGRADE_KEY     = 'HTTP_UPGRADE'
+      CONNECTION_KEY  = 'HTTP_CONNECTION'
+      WS_KEY_KEY      = 'HTTP_SEC_WEBSOCKET_KEY'
+      WS_VERSION_KEY  = 'HTTP_SEC_WEBSOCKET_VERSION'
+      WS_PROTO_KEY    = 'HTTP_SEC_WEBSOCKET_PROTOCOL'
+      WS_EXT_KEY      = 'HTTP_SEC_WEBSOCKET_EXTENSIONS'
+      ORIGIN_KEY      = 'HTTP_ORIGIN'
+      HOST_KEY        = 'HTTP_HOST'
+      METHOD_KEY      = 'REQUEST_METHOD'
+      PROTO_KEY       = 'SERVER_PROTOCOL'
 
       # Phase 11 — frozen sentinel returned by `validate` for plain HTTP
       # requests (the overwhelmingly common branch). Pre-Phase-11 the
@@ -72,16 +73,52 @@ module Hyperion
       # every non-WS request — one Array per HTTP request. The caller
       # only reads `.first` and `case` on the tag, never mutates the
       # tuple, so a frozen shared instance is safe.
-      NOT_WEBSOCKET_RESULT = [:not_websocket, nil, nil].freeze
+      #
+      # 2.3-C: the handshake result tuple now has a 4th slot (`extensions`)
+      # for permessage-deflate parameters. Existing destructuring of
+      # `[:ok, accept, sub]` is unchanged; the 4th slot is appended and
+      # ignored by 3-arg callers. The `:not_websocket` sentinel keeps the
+      # 4-slot shape with a frozen empty hash so `.frozen?` invariants on
+      # the slot stay stable.
+      NOT_WEBSOCKET_RESULT = [:not_websocket, nil, nil, {}].freeze
+      EMPTY_EXTENSIONS = {}.freeze
+
+      # RFC 7692 §7.1 — permessage-deflate extension token + parameter
+      # names. We accept these spellings only (case-sensitive per RFC).
+      PERMESSAGE_DEFLATE = 'permessage-deflate'
+      PARAM_SERVER_NO_TAKEOVER = 'server_no_context_takeover'
+      PARAM_CLIENT_NO_TAKEOVER = 'client_no_context_takeover'
+      PARAM_SERVER_MAX_WINDOW  = 'server_max_window_bits'
+      PARAM_CLIENT_MAX_WINDOW  = 'client_max_window_bits'
+
+      # RFC 7692 §7.1.2.2 — window_bits range. RFC says 8..15, but
+      # zlib's raw deflate rejects window_bits=8 in some versions; we
+      # clamp to 9..15 in practice, the lower bound matches what
+      # browsers actually use.
+      MIN_WINDOW_BITS = 9
+      MAX_WINDOW_BITS = 15
+      DEFAULT_WINDOW_BITS = 15
 
       # Validate WS-upgrade preconditions on a Rack env.
       #
-      # Returns a 3-tuple. The first slot is a Symbol tag the caller
+      # Returns a 4-tuple. The first slot is a Symbol tag the caller
       # branches on:
       #
-      #   [:ok, accept_header_value, selected_subprotocol_or_nil]
+      #   [:ok, accept_header_value, selected_subprotocol_or_nil,
+      #    negotiated_extensions]
       #     — request is a valid RFC 6455 §4.2.1 handshake. Caller should
       #     stash the tuple in env and let the app handle the 101.
+      #     `negotiated_extensions` is a Hash keyed by extension symbol;
+      #     `{}` when no extension was negotiated. For permessage-deflate
+      #     (RFC 7692) the value carries the resolved parameter set:
+      #       {
+      #         permessage_deflate: {
+      #           server_no_context_takeover: false,
+      #           client_no_context_takeover: false,
+      #           server_max_window_bits: 15,
+      #           client_max_window_bits: 15
+      #         }
+      #       }
       #
       #   [:bad_request, body, extra_headers]
       #     — request is a WS upgrade attempt with a protocol error
@@ -117,7 +154,8 @@ module Hyperion
       #   — browsers enforce CORS-style restrictions on the WS upgrade
       #   independently. Pass [] to reject all browser-originated WS,
       #   pass ['https://example.com'] to allow only that origin.
-      def self.validate(env, subprotocol_selector: nil, origin_allow_list: default_origin_allow_list)
+      def self.validate(env, subprotocol_selector: nil, origin_allow_list: default_origin_allow_list,
+                        permessage_deflate: :auto)
         return NOT_WEBSOCKET_RESULT unless websocket_upgrade?(env)
 
         # Once we've decided this IS a WS attempt, every subsequent
@@ -160,7 +198,14 @@ module Hyperion
         accept = accept_value(client_key)
         subprotocol = pick_subprotocol(env[WS_PROTO_KEY], subprotocol_selector)
 
-        [:ok, accept, subprotocol]
+        # RFC 7692 negotiation. Returns either a {permessage_deflate: {...}}
+        # hash or `EMPTY_EXTENSIONS`. With `permessage_deflate: :on` and
+        # no client offer, returns the bad_request tuple itself — the
+        # operator opted into "compression-required" semantics.
+        extensions = negotiate_extensions(env[WS_EXT_KEY], permessage_deflate)
+        return extensions if extensions.is_a?(Array) && extensions.first == :bad_request
+
+        [:ok, accept, subprotocol, extensions]
       end
 
       # Compute the Sec-WebSocket-Accept value per RFC 6455 §4.2.2:
@@ -196,6 +241,38 @@ module Hyperion
         end
         lines << "\r\n"
         lines
+      end
+
+      # Render the negotiated `extensions` hash from `validate` as the
+      # `sec-websocket-extensions` header value the server should echo
+      # back in the 101 response. Returns nil when nothing was
+      # negotiated (caller should omit the header). Operators can pass
+      # the result straight into the `extra_headers` slot of
+      # `build_101_response`:
+      #
+      #   ext_value = Handshake.format_extensions_header(extensions)
+      #   extras = ext_value ? { 'sec-websocket-extensions' => ext_value } : {}
+      #   socket.write(Handshake.build_101_response(accept, sub, extras))
+      def self.format_extensions_header(extensions)
+        return nil if extensions.nil? || extensions.empty?
+
+        params = extensions[:permessage_deflate]
+        return nil if params.nil?
+
+        parts = [PERMESSAGE_DEFLATE]
+        parts << PARAM_SERVER_NO_TAKEOVER if params[:server_no_context_takeover]
+        parts << PARAM_CLIENT_NO_TAKEOVER if params[:client_no_context_takeover]
+        # Only echo window-bits parameters if the negotiated value
+        # differs from the RFC default of 15. RFC 7692 §7.1.2.1 says
+        # the absence of the parameter means 15 bits; including it
+        # redundantly is allowed but adds wire bytes for no win.
+        if (server_max = params[:server_max_window_bits]) && server_max != DEFAULT_WINDOW_BITS
+          parts << "#{PARAM_SERVER_MAX_WINDOW}=#{server_max}"
+        end
+        if (client_max = params[:client_max_window_bits]) && client_max != DEFAULT_WINDOW_BITS
+          parts << "#{PARAM_CLIENT_MAX_WINDOW}=#{client_max}"
+        end
+        parts.join('; ')
       end
 
       # Default origin allow-list. nil = accept any origin (the safe
@@ -294,6 +371,155 @@ module Hyperion
         [:bad_request, message, {}]
       end
       private_class_method :bad_request
+
+      # RFC 7692 negotiation. `header_value` is the raw request-side
+      # `Sec-WebSocket-Extensions` header (may be nil / empty / multi-
+      # offer). `policy` is one of:
+      #
+      #   :off  — server never advertises permessage-deflate; returns
+      #           EMPTY_EXTENSIONS regardless of client offers.
+      #   :auto — accept if the client offered any usable variant of
+      #           permessage-deflate; otherwise return EMPTY_EXTENSIONS.
+      #           This is the safe default — backwards compatible with
+      #           clients that don't offer the extension.
+      #   :on   — require permessage-deflate. If the client didn't offer
+      #           a usable variant, return a bad_request tuple so the
+      #           caller short-circuits a 400. Operators only flip this
+      #           on when they've measured savings on their workload AND
+      #           controlled the client population.
+      #
+      # Per RFC 7692 §5.1 the request header may carry multiple offers
+      # separated by commas (e.g. `permessage-deflate; server_no_context_takeover,
+      # permessage-deflate`). We pick the FIRST offer we can satisfy —
+      # this matches the RFC's "the first acceptable extension" guidance
+      # and gives clients a deterministic ordering.
+      def self.negotiate_extensions(header_value, policy)
+        return EMPTY_EXTENSIONS if policy == :off
+
+        offers = parse_extension_offers(header_value)
+        deflate_offers = offers.select { |o| o[:name] == PERMESSAGE_DEFLATE }
+
+        if deflate_offers.empty?
+          return bad_request('permessage-deflate required but not offered') if policy == :on
+
+          return EMPTY_EXTENSIONS
+        end
+
+        # Try offers in order; first one we can satisfy wins.
+        deflate_offers.each do |offer|
+          accepted = accept_deflate_offer(offer)
+          return { permessage_deflate: accepted } if accepted
+        end
+
+        # All offers had params we can't satisfy.
+        return bad_request('no acceptable permessage-deflate parameter set') if policy == :on
+
+        EMPTY_EXTENSIONS
+      end
+      private_class_method :negotiate_extensions
+
+      # RFC 7692 §5.1 — parse `Sec-WebSocket-Extensions` header into
+      # an Array of `{ name: String, params: { String => String|true } }`
+      # hashes. The parser is forgiving: garbage parameter values are
+      # logged-and-skipped (we set the param to a sentinel marker the
+      # acceptor rejects), not raised. Multiple offers are
+      # comma-separated; each offer's params are semicolon-separated;
+      # each param is `name` (boolean) or `name=value` (string).
+      def self.parse_extension_offers(header_value)
+        return [] if header_value.nil? || header_value.empty?
+
+        offers = []
+        header_value.split(',').each do |raw_offer|
+          tokens = raw_offer.split(';').map(&:strip).reject(&:empty?)
+          next if tokens.empty?
+
+          name = tokens.shift
+          params = {}
+          tokens.each do |token|
+            k, v = token.split('=', 2).map(&:strip)
+            next if k.nil? || k.empty?
+
+            params[k] = if v.nil?
+                          true
+                        else
+                          # Trim optional quoted-string per RFC 7692 §5.1.
+                          v.start_with?('"') && v.end_with?('"') && v.length >= 2 ? v[1..-2] : v
+                        end
+          end
+          offers << { name: name, params: params }
+        end
+        offers
+      end
+      private_class_method :parse_extension_offers
+
+      # Try to accept one parsed permessage-deflate offer. Returns the
+      # resolved param hash on success, or nil if any param is
+      # unrecognized / out of range (we silently skip — the next offer
+      # may be acceptable, or the policy may downgrade to no-extension).
+      def self.accept_deflate_offer(offer)
+        accepted = {
+          server_no_context_takeover: false,
+          client_no_context_takeover: false,
+          server_max_window_bits: DEFAULT_WINDOW_BITS,
+          client_max_window_bits: DEFAULT_WINDOW_BITS
+        }
+
+        offer[:params].each do |key, value|
+          case key
+          when PARAM_SERVER_NO_TAKEOVER
+            return nil unless value == true
+
+            accepted[:server_no_context_takeover] = true
+          when PARAM_CLIENT_NO_TAKEOVER
+            return nil unless value == true
+
+            accepted[:client_no_context_takeover] = true
+          when PARAM_SERVER_MAX_WINDOW
+            # Server-side window bits — the client requesting an upper
+            # bound on what we use. Accept if in range; we never set a
+            # value larger than the client asked for.
+            bits = window_bits_or_nil(value)
+            return nil if bits.nil?
+
+            accepted[:server_max_window_bits] = bits
+          when PARAM_CLIENT_MAX_WINDOW
+            # Client-side window bits — RFC 7692 §7.1.2.2: this
+            # parameter MAY appear without a value (just the token,
+            # meaning "client supports any bit size; pick one"). When
+            # it has a value, accept up to that value.
+            if value == true
+              # Client advertises support; we don't request a smaller
+              # window because there's no operational reason to (memory
+              # is on the client side).
+              accepted[:client_max_window_bits] = DEFAULT_WINDOW_BITS
+            else
+              bits = window_bits_or_nil(value)
+              return nil if bits.nil?
+
+              accepted[:client_max_window_bits] = bits
+            end
+          else
+            # Unknown parameter — RFC 7692 §5.1 says reject the offer
+            # entirely. Skip; the caller will try the next offer.
+            return nil
+          end
+        end
+
+        accepted
+      end
+      private_class_method :accept_deflate_offer
+
+      # Validate a window_bits value String. Returns the Integer when
+      # in [MIN_WINDOW_BITS..MAX_WINDOW_BITS], nil otherwise.
+      def self.window_bits_or_nil(value)
+        return nil unless value.is_a?(String) && value.match?(/\A\d+\z/)
+
+        bits = value.to_i
+        return nil if bits < MIN_WINDOW_BITS || bits > MAX_WINDOW_BITS
+
+        bits
+      end
+      private_class_method :window_bits_or_nil
     end
   end
 end

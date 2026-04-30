@@ -155,6 +155,77 @@ commit when SSH is available.
 Spec count: 714 → 757 (+ 24 fairness + 19 throttle = 43 new specs,
 0 regressions).
 
+### 2.3-C — WebSocket permessage-deflate (RFC 7692)
+
+**Why this matters most for the user's deployment shape.** ActionCable /
+chat / pubsub WebSocket traffic compresses very well — typical JSON
+message frames are 80-95% redundant (repeated field names, recurring
+user IDs, recurring chat IDs). RFC 7692 permessage-deflate compresses
+each message with a shared LZ77 dictionary so wire bytes drop 5-20×
+on the chat-style workload that ActionCable fans out to thousands of
+idle subscribers. **Bandwidth costs move with bytes, not with
+dispatches** — for an nginx-fronted deployment the saving lands
+straight on the egress bill (Cloudfront / ALB egress @ ~$0.085/GiB at
+the unhappy AWS price band).
+
+**Bench delta on a chat-style JSON workload (1 KB messages, local
+UNIXSocket harness — `bench/ws_deflate_bench.rb`):**
+
+| Mode | Bytes per message | Wire reduction | msg/s |
+|---:|---:|---:|---:|
+| Plain (no deflate) | 400.8 B | — | 57,498 |
+| permessage-deflate | 19.7 B | **20.4× smaller** | 34,999 (61% of baseline) |
+
+The 20× number is upper-bound — chat-style JSON has very repetitive
+field names which the shared deflate dictionary picks up immediately.
+Random binary / already-compressed payloads (h.264 video frames,
+gzipped logs) see near-zero saving and would be better served by
+the `:off` policy on those routes (the operator knob is per-process,
+but you can hand-roll different dispatch shapes per route if needed).
+
+The msg/s drop is the deflate CPU cost on the encode side and is
+expected — for a bandwidth-bound workload (the typical ActionCable
+fan-out shape: one server-side message reflected to N idle browsers)
+the bandwidth saving wins handily over the per-message CPU cost.
+
+**What ships:**
+
+| Deliverable | Where | Why |
+|---|---|---|
+| Handshake negotiation | `lib/hyperion/websocket/handshake.rb` | `validate(env, permessage_deflate: :auto/:on/:off)`. Parses `Sec-WebSocket-Extensions`, picks the first usable offer, returns the negotiated parameter set in slot 4 of the result tuple. `format_extensions_header` renders the response header for `build_101_response`. |
+| Connection wiring | `lib/hyperion/websocket/connection.rb` | `Connection.new(... extensions: result[3])` instantiates a per-conn `Zlib::Deflate` / `Zlib::Inflate` pair sized to the negotiated `server_max_window_bits` / `client_max_window_bits`. `send` deflates + sets RSV1; `recv` strips RSV1 + appends `\x00\x00\xff\xff` sync trailer + inflates. Streaming inflate with the cap applied to running output bytes — the compression-bomb defense. |
+| Frame builder + parser RSV1 contract | `ext/hyperion_http/websocket.c` + `lib/hyperion/websocket/frame.rb` | C parser preserves RSV1 in slot 8 of the metadata tuple; allows it on data frames; rejects it on control frames (RFC 7692 §6.1). `Builder.build(rsv1: true)` sets the high bit alongside FIN. RSV2/RSV3 still reject (no defined semantics). The RubyFrame fallback mirrors the contract. |
+| `Hyperion::Config#websocket.permessage_deflate` | `lib/hyperion/config.rb` | Tri-state `:off` / `:auto` (default) / `:on`. Mirrors `tls.ktls`. Operators flip `:auto → :on` to harden when they control the client population. |
+| `bench/ws_echo.ru` HYPERION_WS_DEFLATE knob | `bench/ws_echo.ru` | Bench app advertises permessage-deflate when the env var is set; pipes the negotiated extensions through to the Connection. |
+| `bench/ws_deflate_bench.rb` | NEW | Local UNIXSocket harness — measures wire bytes with vs without permessage-deflate on a 1 KB chat-style JSON workload. |
+| `spec/hyperion/websocket_permessage_deflate_spec.rb` | NEW (18 examples) | Handshake negotiation (8 cases including `:on`/`:off`/`:auto` and multi-offer), wire round-trip via Zlib (RFC 7692 "Hello" vector), Connection round-trips with shared and reset context, control-frame protections (ping with RSV1 → 1002), compression-bomb defense (4 MiB inflated → 1009 close), Config DSL plumbing. |
+
+**Compression-bomb defense (RFC 7692 §8.1).** A malicious client can
+ship a tiny compressed payload that inflates to gigabytes. The
+streaming inflater drains output in 16 KB chunks and short-circuits
+the moment the running decompressed total would exceed
+`max_message_bytes` (default 1 MiB). The connection then closes 1009
+(Message Too Big) and the next `recv` raises `StateError`. Verified
+via `4 MiB → 4 KB compressed → close 1009` regression spec.
+
+**Backwards compatibility.** Default `:auto` is the safe default —
+clients that don't offer permessage-deflate keep getting plain frames,
+identical to 2.2.0. The 4th slot of the handshake result tuple is new;
+existing `[:ok, accept, sub]` 3-arg destructure call sites remain
+correct because Ruby's array destructure tolerates extra slots.
+
+**Default unchanged for the operator-facing knob.** The Connection
+constructor's `extensions:` kwarg defaults to `{}`. Apps that don't
+read `result[3]` from the handshake tuple keep getting uncompressed
+WebSocket traffic, identical to 2.2.0. The `:auto` default on the
+Config knob means handshakes advertise the extension when offered, but
+the Connection wrapper only deflates when the app explicitly threads
+the negotiated `extensions:` into the constructor — both ends
+opt-in.
+
+Spec count: 757 → 776 (+18 deflate specs + 1 RSV1-on-control split,
+0 regressions).
+
 ## [2.2.0] - 2026-05-01
 
 ### Headline

@@ -13,23 +13,30 @@
  *
  *   CFrame.parse(buf, offset = 0) ->
  *       [fin, opcode, payload_len, masked, mask_key, payload_offset,
- *        frame_total_len]
+ *        frame_total_len, rsv1]
  *     OR :incomplete OR :error
  *     Non-copying parser. Returns metadata only; the caller still owns
  *     `buf` and uses `payload_offset` + `frame_total_len` to slice or to
  *     advance to the next frame. `mask_key` is `nil` when `masked == false`.
  *     Returns `:incomplete` if `buf[offset..]` does not yet hold a full
- *     header. Returns `:error` for malformed frames (RSV bits without a
- *     negotiated extension, unknown opcode, control frame > 125 bytes,
- *     fragmented control frame, 64-bit length with high bit set).
+ *     header. Returns `:error` for malformed frames (RSV2/RSV3 bits set,
+ *     unknown opcode, control frame > 125 bytes, fragmented control
+ *     frame, 64-bit length with high bit set, or RSV1 set on a control
+ *     frame). RSV1 is preserved as the 8th tuple slot; the Ruby façade
+ *     decides whether to treat it as a permessage-deflate marker (when
+ *     the extension was negotiated) or as a protocol error (when it was
+ *     not).
  *
- *   CFrame.build(opcode, payload, fin: true, mask: false, mask_key: nil)
+ *   CFrame.build(opcode, payload, fin: true, mask: false, mask_key: nil,
+ *                rsv1: false)
  *       -> String
  *     Builds a serialized frame ready for `socket.write`. Server frames are
  *     unmasked (`mask: false`, the default) per §5.1. Client frames must
  *     pass `mask: true` and a 4-byte `mask_key`. Control frames (close 0x8,
  *     ping 0x9, pong 0xA) MUST have `payload.bytesize <= 125` and MUST have
- *     `fin: true` — this helper raises ArgumentError otherwise.
+ *     `fin: true` and `rsv1: false` — this helper raises ArgumentError
+ *     otherwise. Pass `rsv1: true` only on a text/binary frame whose
+ *     payload is permessage-deflate compressed.
  *
  * Why C?
  *   The dominant CPU cost on the receive path is XOR-unmasking the
@@ -205,10 +212,15 @@ static VALUE rb_cframe_parse(int argc, VALUE *argv, VALUE self) {
     int     masked    = (b1 & 0x80) != 0;
     uint8_t len7      = b1 & 0x7F;
 
-    /* RSV bits MUST be 0 unless an extension was negotiated.  WS-3 has
-     * no extension support (permessage-deflate is post-1.0).  Mark it
-     * malformed so the layer above can close with 1002. */
-    if (rsv1 || rsv2 || rsv3) {
+    /* RSV2/RSV3 are still reserved with no negotiated semantics; reject.
+     * RSV1 is the permessage-deflate marker (RFC 7692 §6) — allow it to
+     * pass through here so the Ruby façade can decide what to do based
+     * on whether the extension was negotiated for this connection. The
+     * Connection wrapper closes 1002 if it sees RSV1 without a
+     * negotiated extension. RSV1 on a control frame is always a
+     * protocol error per RFC 7692 §6.1 ("control frames MUST NOT be
+     * compressed"); we trap that one case below. */
+    if (rsv2 || rsv3) {
         return sym_error;
     }
 
@@ -216,12 +228,16 @@ static VALUE rb_cframe_parse(int argc, VALUE *argv, VALUE self) {
         return sym_error;
     }
 
-    /* §5.5 — control frames MUST have FIN=1 and len <= 125. */
+    /* §5.5 — control frames MUST have FIN=1 and len <= 125. RFC 7692
+     * §6.1 — control frames MUST NOT have RSV1 set. */
     if (hyp_ws_is_control(opcode)) {
         if (!fin) {
             return sym_error;
         }
         if (len7 > HYP_WS_CONTROL_MAX_PAYLOAD) {
+            return sym_error;
+        }
+        if (rsv1) {
             return sym_error;
         }
     }
@@ -274,7 +290,7 @@ static VALUE rb_cframe_parse(int argc, VALUE *argv, VALUE self) {
         return sym_incomplete;
     }
 
-    VALUE result = rb_ary_new_capa(7);
+    VALUE result = rb_ary_new_capa(8);
     rb_ary_push(result, fin ? Qtrue : Qfalse);
     rb_ary_push(result, INT2FIX(opcode));
     rb_ary_push(result, ULL2NUM(payload_len64));
@@ -282,6 +298,7 @@ static VALUE rb_cframe_parse(int argc, VALUE *argv, VALUE self) {
     rb_ary_push(result, rb_mask_key);
     rb_ary_push(result, LONG2NUM(payload_offset_abs));
     rb_ary_push(result, LONG2NUM(frame_total_len));
+    rb_ary_push(result, rsv1 ? Qtrue : Qfalse);
 
     RB_GC_GUARD(rb_buf);
     return result;
@@ -294,6 +311,7 @@ static VALUE rb_cframe_parse(int argc, VALUE *argv, VALUE self) {
 static ID id_kw_fin;
 static ID id_kw_mask;
 static ID id_kw_mask_key;
+static ID id_kw_rsv1;
 
 static VALUE rb_cframe_build(int argc, VALUE *argv, VALUE self) {
     (void)self;
@@ -315,12 +333,13 @@ static VALUE rb_cframe_build(int argc, VALUE *argv, VALUE self) {
 
     int fin  = 1;
     int mask = 0;
+    int rsv1 = 0;
     VALUE rb_mask_key = Qnil;
 
     if (!NIL_P(rb_kwargs)) {
-        VALUE kw_vals[3] = { Qundef, Qundef, Qundef };
-        ID    kw_ids[3]  = { id_kw_fin, id_kw_mask, id_kw_mask_key };
-        rb_get_kwargs(rb_kwargs, kw_ids, 0, 3, kw_vals);
+        VALUE kw_vals[4] = { Qundef, Qundef, Qundef, Qundef };
+        ID    kw_ids[4]  = { id_kw_fin, id_kw_mask, id_kw_mask_key, id_kw_rsv1 };
+        rb_get_kwargs(rb_kwargs, kw_ids, 0, 4, kw_vals);
         if (kw_vals[0] != Qundef) {
             fin = RTEST(kw_vals[0]) ? 1 : 0;
         }
@@ -330,9 +349,13 @@ static VALUE rb_cframe_build(int argc, VALUE *argv, VALUE self) {
         if (kw_vals[2] != Qundef) {
             rb_mask_key = kw_vals[2];
         }
+        if (kw_vals[3] != Qundef) {
+            rsv1 = RTEST(kw_vals[3]) ? 1 : 0;
+        }
     }
 
-    /* §5.5 control-frame validation. */
+    /* §5.5 control-frame validation. RFC 7692 §6.1 — control frames
+     * MUST NOT have RSV1 set. */
     if (hyp_ws_is_control(opcode)) {
         if (!fin) {
             rb_raise(rb_eArgError,
@@ -343,6 +366,11 @@ static VALUE rb_cframe_build(int argc, VALUE *argv, VALUE self) {
             rb_raise(rb_eArgError,
                      "control frame (opcode 0x%x) payload %ld exceeds 125-byte cap",
                      (unsigned)opcode, payload_len);
+        }
+        if (rsv1) {
+            rb_raise(rb_eArgError,
+                     "control frame (opcode 0x%x) MUST NOT have rsv1=true",
+                     (unsigned)opcode);
         }
     }
 
@@ -373,7 +401,7 @@ static VALUE rb_cframe_build(int argc, VALUE *argv, VALUE self) {
     rb_enc_associate(out, rb_ascii8bit_encoding());
     uint8_t *q = (uint8_t *)RSTRING_PTR(out);
 
-    q[0] = (uint8_t)((fin ? 0x80 : 0x00) | (opcode & 0x0F));
+    q[0] = (uint8_t)((fin ? 0x80 : 0x00) | (rsv1 ? 0x40 : 0x00) | (opcode & 0x0F));
     uint8_t mask_bit = mask ? 0x80 : 0x00;
 
     long body_offset;
@@ -455,6 +483,7 @@ void Init_hyperion_websocket(void) {
     id_kw_fin      = rb_intern("fin");
     id_kw_mask     = rb_intern("mask");
     id_kw_mask_key = rb_intern("mask_key");
+    id_kw_rsv1     = rb_intern("rsv1");
 
     /* Expose constants for the Ruby façade & specs. */
     rb_define_const(rb_cCFrame, "GVL_RELEASE_THRESHOLD",
