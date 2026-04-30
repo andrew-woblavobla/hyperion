@@ -144,6 +144,43 @@ tls_key_path  'config/certs/privkey.pem'
 port          9443
 ```
 
+#### Operating Hyperion's HTTP/2 path — `h2.max_total_streams`
+
+Hyperion 2.0.0 ships a per-process HTTP/2 admission cap that defaults to
+`max_concurrent_streams × workers × 4` (= 512 streams on a single-worker
+default config). The cap is sized for normal browser traffic — each browser
+connection rarely opens more than ~50–100 multiplexed streams, and the 4×
+headroom factor leaves room for legitimate fan-out.
+
+Operators running **h2load benchmarks** (`h2load -c 1 -m 100 -n 5000` opens
+5,000 streams on a single connection — well past the 512 default) or
+**services with very heavy h2 fan-out** (e.g., gRPC servers with thousands
+of long-lived RPCs over a small pool of connections) should set the knob
+explicitly. Three knobs ship, in increasing precedence:
+
+```ruby
+# config/hyperion.rb — innermost, baked into the deploy
+h2 do
+  max_total_streams 8192        # explicit cap
+  # max_total_streams :unbounded  # disable entirely (matches 1.x behaviour)
+end
+```
+
+```sh
+# CLI flag — per-invocation override (introduced in 2.2.x fix-D)
+hyperion --h2-max-total-streams 8192 config.ru
+hyperion --h2-max-total-streams unbounded config.ru   # restore 1.x behaviour
+
+# Env var — outermost knob, useful for CI / bench harnesses
+HYPERION_H2_MAX_TOTAL_STREAMS=unbounded hyperion config.ru
+HYPERION_H2_MAX_TOTAL_STREAMS=10000 bundle exec hyperion config.ru
+```
+
+Precedence: env var > CLI flag > config file > built-in default. Use
+`:unbounded` (DSL) / `unbounded` (CLI / env) to fully disable the cap;
+typos in the env var warn and leave the resolved setting untouched (it
+is a convenience knob, not a security boundary).
+
 ## Rolling out — recommended sequence
 
 1. **Add hyperion-rb to your Gemfile alongside puma**, both versions present:

@@ -26,6 +26,17 @@ module Hyperion
       # (`bench/tls_static_1m.ru`, `bench/tls_json_50k.ru`).
       apply_ktls_env_override!(config)
 
+      # 2.2.x fix-D: env-var override for the `h2.max_total_streams`
+      # admission cap. Mirrors `HYPERION_TLS_KTLS` from fix-C — operators
+      # running h2load or long-fan-out workloads can lift the 2.0.0
+      # default (`max_concurrent_streams × workers × 4`) without
+      # rewriting a config file. `HYPERION_H2_MAX_TOTAL_STREAMS=unbounded`
+      # restores pre-2.0 behaviour. Applied AFTER `merge_cli!` so it
+      # takes precedence over the CLI flag too — the env var is the
+      # outermost knob (CI/bench harness), the flag is the inner knob
+      # (per-invocation), and the config file is innermost.
+      apply_h2_max_total_streams_env_override!(config)
+
       # Install logger early so every subsequent log call honours the operator's
       # chosen format/level (config file or CLI) before anything else logs.
       # 1.8.0: write directly to the default Runtime — `Hyperion.logger=` now
@@ -182,6 +193,19 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
         o.on('--graceful-timeout SECONDS', Integer,
              'Graceful shutdown deadline in seconds before SIGKILL (default 30)') do |n|
           cli_opts[:graceful_timeout] = n
+        end
+        # 2.2.x fix-D: expose the existing `h2.max_total_streams` admission
+        # cap (1.7.0+ DSL knob) at the CLI surface. The 2.0.0 default flip
+        # to `max_concurrent_streams × workers × 4` (= 512 streams per
+        # process at -w 1) is sized for normal browser traffic but cuts
+        # off h2load benches and gRPC/long-fan-out workloads mid-test —
+        # this flag lets operators raise or disable the cap without
+        # writing a config file. `unbounded` (or `:unbounded`) writes
+        # `nil` to Config, which restores the pre-2.0 unbounded behaviour.
+        o.on('--h2-max-total-streams VALUE',
+             'HTTP/2 per-connection total stream cap. Use `unbounded` to disable. ' \
+             'Default: max_concurrent_streams × workers × 4 (2.0.0 flip).') do |v|
+          cli_opts[:h2_max_total_streams] = parse_h2_max_total_streams!(v)
         end
         o.on('-h', '--help', 'show help') do
           puts o
@@ -340,6 +364,51 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
       end
     end
     private_class_method :apply_ktls_env_override!
+
+    # 2.2.x fix-D: shared parser for `--h2-max-total-streams VALUE` and
+    # `HYPERION_H2_MAX_TOTAL_STREAMS=VALUE`. Returns either a positive
+    # Integer (explicit cap) or the `H2Settings::UNBOUNDED` sentinel,
+    # which `Config#finalize!` later resolves to `nil` (no cap).
+    # Anything else raises `OptionParser::InvalidArgument` — same shape
+    # as the built-in `OptionParser` integer-parse failures, so the CLI
+    # branch's caller treats it identically.
+    def self.parse_h2_max_total_streams!(raw)
+      case raw
+      when 'unbounded', ':unbounded'
+        Hyperion::Config::H2Settings::UNBOUNDED
+      when /\A\d+\z/
+        n = raw.to_i
+        unless n.positive?
+          raise OptionParser::InvalidArgument,
+                "--h2-max-total-streams: expected a positive integer or 'unbounded', got #{raw.inspect}"
+        end
+        n
+      else
+        raise OptionParser::InvalidArgument,
+              "--h2-max-total-streams: expected a positive integer or 'unbounded', got #{raw.inspect}"
+      end
+    end
+    private_class_method :parse_h2_max_total_streams!
+
+    # 2.2.x fix-D: env-var bridge for the h2 admission cap. Same value
+    # grammar as the CLI flag (`unbounded` or a positive integer).
+    # Unknown values warn and leave the config untouched — the env var
+    # is a convenience knob for benches and operator overrides, not a
+    # security boundary, and a typo shouldn't crash boot.
+    def self.apply_h2_max_total_streams_env_override!(config)
+      raw = ENV['HYPERION_H2_MAX_TOTAL_STREAMS']
+      return if raw.nil? || raw.empty?
+
+      begin
+        config.h2.max_total_streams = parse_h2_max_total_streams!(raw)
+      rescue OptionParser::InvalidArgument
+        Hyperion.logger.warn do
+          { message: 'HYPERION_H2_MAX_TOTAL_STREAMS ignored (must be a positive integer or `unbounded`)',
+            value: raw }
+        end
+      end
+    end
+    private_class_method :apply_h2_max_total_streams_env_override!
 
     # Probe table for fiber-cooperative I/O libraries. If `async_io: true` is
     # set but none of these are loaded, the operator has likely flipped the

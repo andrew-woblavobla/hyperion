@@ -367,6 +367,25 @@ either in config (`h2 do; max_total_streams 8192; end`) or to
 `:unbounded` to restore pre-2.0 behaviour. Documented in the 2.0.0
 CHANGELOG migration table.
 
+**2.2.x fix-D follow-up (CLI / env-var escape hatch)**: writing a
+config file just to lift the cap for a one-off bench was awkward. The
+2.2.x follow-up sprint adds two operator knobs that ride the existing
+1.7.0 DSL field:
+
+```sh
+# CLI flag — per-invocation
+hyperion --h2-max-total-streams unbounded ...
+hyperion --h2-max-total-streams 8192 ...
+
+# Env-var — outermost knob (CI / bench harness)
+HYPERION_H2_MAX_TOTAL_STREAMS=unbounded hyperion ...
+```
+
+The bench rerun on openclaw-vm with `--h2-max-total-streams unbounded`
+is PENDING the maintainer running the command from a session with SSH
+access (see CHANGELOG fix-D section); when it lands the row should
+read 5,000 / 5,000 succeeded with rps near the published 1,597 baseline.
+
 ## HTTP/2 POST — encode hot path
 
 `h2load -c 1 -m 100 -n 5000 -d /tmp/h2_post_data.txt

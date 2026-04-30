@@ -41,13 +41,83 @@ tracks did not produce the rps wins the brief estimated:
 The fixes that would unlock the perf wins (FFI-marshalling rewrite for
 Phase 10, pipe-hoist out of the chunk loop for splice, larger-payload
 TLS bench harness for Phase 9) are queued for the 2.2.x follow-up
-sprint. fix-A (splice pipe-hoist), fix-B (HPACK FFI rewrite), and
-fix-C (large-payload TLS bench harness) have landed on master in that
-order; the rps deltas the held-status table below carries reflect
-fix-A + fix-B measurements; the kTLS large-payload row is still
-PENDING the maintainer running the new bench rackups (see fix-C
-section). **No version tag.** Code is on master (commits b4ca6a0,
-4d8af74, 5c00b15, e105bc6); operators should continue running 2.1.0.
+sprint. fix-A (splice pipe-hoist), fix-B (HPACK FFI rewrite), fix-C
+(large-payload TLS bench harness), and fix-D (h2 max_total_streams
+CLI flag + env-var) have landed on master in that order; the rps
+deltas the held-status table below carries reflect fix-A + fix-B
+measurements; the kTLS large-payload row is still PENDING the
+maintainer running the new bench rackups (see fix-C section), and the
+h2 row needs a rerun against the new flag (see fix-D section).
+**No version tag.** Code is on master (commits b4ca6a0, 4d8af74,
+5c00b15, e105bc6); operators should continue running 2.1.0.
+
+### fix-D — `h2.max_total_streams` CLI flag + env-var (h2load comparability)
+
+**The 2.0.0 default flip needed an operator escape hatch.** 2.0.0 made the
+1.7.0 admission cap mandatory by default at
+`max_concurrent_streams × workers × 4` (= 512 streams per process at -w 1).
+That is a sensible browser-traffic ceiling — each browser connection
+rarely opens more than ~50–100 multiplexed streams, and 4× headroom
+covers legitimate fan-out. But two operator workflows trip on the cap:
+
+* **h2load benches.** `h2load -c 1 -m 100 -n 5000 https://host/` opens
+  5,000 streams on a single connection. The 2026-04-30 sweep
+  (BENCH_HYPERION_2_0.md row 10) hit the cap mid-test: **4,489 of 5,000
+  streams errored** with the connection closed for "max-total-streams
+  exceeded". The published 1,597 r/s row only landed because the
+  bench script flipped `h2 do; max_total_streams :unbounded; end` in
+  config — operators couldn't reproduce it without writing a config file.
+* **gRPC / long-fan-out services.** Servers holding thousands of long-lived
+  RPCs over a small connection pool routinely exceed the 512 default
+  even at modest traffic.
+
+The knob has existed since 1.7.0 (nested DSL: `c.h2.max_total_streams = X`)
+but was never exposed at the CLI surface, and Phase 9-era operators on
+the 2.0.0 bench-comparability path had to choose between editing config
+files per row or accepting the errored-stream noise.
+
+**fix-D ships two operator knobs:**
+
+| Knob | Where | Notes |
+|---|---|---|
+| `--h2-max-total-streams VALUE` | `lib/hyperion/cli.rb` OptionParser branch | Per-invocation override. `VALUE` is a positive integer or `unbounded` (or `:unbounded`). |
+| `HYPERION_H2_MAX_TOTAL_STREAMS=VALUE` | `apply_h2_max_total_streams_env_override!` | Outermost knob (env > CLI > config > default). Same value grammar; typos warn + ignore (matches the fix-C `HYPERION_TLS_KTLS` shape — convenience knob, not a security boundary). |
+
+Both ride the existing `H2Settings::UNBOUNDED` sentinel: `unbounded`
+parses to that symbol on the way in, `Config#finalize!` later resolves
+it to `nil` (no cap, matches 1.x behaviour). The integer branch lands
+directly on `config.h2.max_total_streams` and finalize! leaves it
+untouched.
+
+**Specs.** `spec/hyperion/cli_h2_flag_spec.rb` (new file) adds 11 examples:
+
+* CLI flag parses an integer, parses `unbounded` to the sentinel,
+  accepts `:unbounded` as an alias, raises `OptionParser::InvalidArgument`
+  on non-numeric / non-positive values.
+* Env-var override is unset-noop, integer-pass, `unbounded`-to-sentinel,
+  empty-string noop, unknown-value warn-and-preserve, and
+  env-var-overrides-CLI-flag (proves env-var wins the precedence chain).
+
+Spec count **682 → 693** (+11). All 682 prior examples still green
+(spec sweep on macOS, 11 pending Linux-only splice tests unchanged).
+
+**Bench measurement on openclaw-vm: PENDING.** Same SSH gap as Phase 9
+/ 10 / 11 / fix-A / fix-C: the fix-D landing session could not reach
+openclaw-vm (publickey rejection from this workstation). The h2load
+rerun command for the maintainer:
+
+```sh
+hyperion --tls-cert /tmp/cert.pem --tls-key /tmp/key.pem -t 64 -w 1 \
+         --h2-max-total-streams unbounded -p 9602 ~/bench/hello.ru
+h2load -c 1 -m 100 -n 5000 https://127.0.0.1:9602/
+```
+
+Expected outcome: 5,000 / 5,000 succeeded, 0 errored, ~1,597 r/s
+(matches the 2.0.0 baseline row in BENCH_HYPERION_2_0.md — the goal is
+**not** to chase rps, only to prove the connection no longer refuses
+new streams mid-test on a default-shape command line). When that bench
+runs, update BENCH_HYPERION_2_0.md row 10 with the actual rerun
+numbers and replace this PENDING marker.
 
 ### fix-C — large-payload TLS bench harness (rackups + `HYPERION_TLS_KTLS` env-var)
 
