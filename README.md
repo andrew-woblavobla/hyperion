@@ -11,6 +11,18 @@ gem install hyperion-rb
 bundle exec hyperion config.ru
 ```
 
+## What's new in 2.4.0
+
+**Production observability.** The `/-/metrics` endpoint now exposes
+per-route latency histograms, per-conn fairness rejections, WebSocket
+permessage-deflate compression ratio, kTLS active connections,
+io_uring-active workers, and ThreadPool queue depth — operators can
+finally see whether the 2.x knobs are firing and how effective they
+are. A pre-built Grafana dashboard ships at
+[`docs/grafana/hyperion-2.4-dashboard.json`](docs/grafana/hyperion-2.4-dashboard.json).
+Full metric reference + operator playbook in
+[`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md).
+
 ## What's new in 2.1.0
 
 **WebSockets.** RFC 6455 over Rack 3 full hijack, native frame codec,

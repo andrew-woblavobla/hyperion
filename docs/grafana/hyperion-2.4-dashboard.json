@@ -1,0 +1,151 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "title": "Hyperion 2.4 — operator dashboard",
+  "uid": "hyperion-2-4",
+  "schemaVersion": 38,
+  "version": 1,
+  "editable": true,
+  "timezone": "browser",
+  "refresh": "30s",
+  "tags": ["hyperion", "ruby", "http"],
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "job",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(hyperion_requests_total, job)",
+        "current": {
+          "text": "hyperion",
+          "value": "hyperion"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request duration p99 by route + method",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, method, path) (rate(hyperion_request_duration_seconds_bucket{job=\"$job\"}[5m])))",
+          "legendFormat": "{{method}} {{path}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Request duration p50 by route + method",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, method, path) (rate(hyperion_request_duration_seconds_bucket{job=\"$job\"}[5m])))",
+          "legendFormat": "{{method}} {{path}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Request duration heatmap",
+      "type": "heatmap",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum by (le) (rate(hyperion_request_duration_seconds_bucket{job=\"$job\"}[5m]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Per-conn fairness rejections by worker",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum by (worker_id) (rate(hyperion_per_conn_rejections_total{job=\"$job\"}[5m]))",
+          "legendFormat": "worker {{worker_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" }
+      }
+    },
+    {
+      "id": 5,
+      "title": "WebSocket permessage-deflate ratio (p50)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(hyperion_websocket_deflate_ratio_bucket{job=\"$job\"}[5m])))",
+          "legendFormat": "p50 ratio"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(hyperion_websocket_deflate_ratio_bucket{job=\"$job\"}[5m])))",
+          "legendFormat": "p99 ratio"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "kTLS active connections",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "expr": "sum(hyperion_tls_ktls_active_connections{job=\"$job\"})",
+          "legendFormat": "active"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "io_uring active workers",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 24 },
+      "targets": [
+        {
+          "expr": "sum(hyperion_io_uring_workers_active{job=\"$job\"})",
+          "legendFormat": "workers on io_uring"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "ThreadPool queue depth (per worker)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 24 },
+      "targets": [
+        {
+          "expr": "hyperion_threadpool_queue_depth{job=\"$job\"}",
+          "legendFormat": "worker {{worker_id}}"
+        }
+      ]
+    }
+  ]
+}

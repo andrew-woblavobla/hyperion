@@ -190,6 +190,75 @@ Sites considered + deferred (with rationale in `bench/gc_audit_2_4_b.md`):
 Spec count: 788 → 796 default-run + 1 (`:perf`-tagged) = 797 total.
 No version bump (release task is 2.4-fix-F).
 
+### 2.4-C — `/-/metrics` enrichment (operator observability)
+
+**The story.** The 2.x sprints added many operator knobs
+(`permessage_deflate`, `max_in_flight_per_conn`, `tls.ktls`,
+`io_uring`, h2 native HPACK), but `/-/metrics` exposed only the
+1.x counter set. Operators who turned the knobs on had no production
+visibility into whether they were firing — "is permessage-deflate
+compressing my chat traffic?", "is fairness rejecting any
+clients?", "did kTLS engage on this worker?" all lacked a
+metric-backed answer.
+
+2.4-C closes the gap. Operators can now see permessage-deflate
+effectiveness, per-conn fairness rejections, kTLS engagement,
+io_uring policy state, and ThreadPool queue depth directly in the
+`/-/metrics` body, plus per-route latency histograms with
+configurable path templating to keep cardinality bounded.
+
+**What ships:**
+
+| Metric | Type | What it tells the operator |
+|---|---|---|
+| `hyperion_request_duration_seconds` | histogram | Per-route p50/p99 by `method` + templated `path` + `status` class. Buckets `0.001…10`s. |
+| `hyperion_per_conn_rejections_total` | counter | Per-worker rate of 503 + Retry-After rejections from the 2.3-B fairness cap. |
+| `hyperion_websocket_deflate_ratio` | histogram | `original_bytes / compressed_bytes` for every WS message that goes through 2.3-C permessage-deflate. Buckets 1.5×…50×. |
+| `hyperion_tls_ktls_active_connections` | gauge | Per-worker count of TLS connections currently driven by the kernel TLS_TX module. |
+| `hyperion_io_uring_workers_active` | gauge | 1 = io_uring policy active on this worker, 0 = epoll. |
+| `hyperion_threadpool_queue_depth` | gauge | Snapshot of the worker's ThreadPool inbox at scrape time. |
+
+**Path templating.** `Hyperion::Metrics::PathTemplater` collapses
+`/users/123` → `/users/:id` and `/orders/<uuid>` → `/orders/:uuid`
+by default, with an LRU-cached lookup so repeated paths on
+keep-alive connections pay one Hash hit, not the regex chain.
+Operators with Rails-style routes plug in custom rules via
+`metrics do; path_templater MyTemplater.new; end` in `config.rb`.
+
+**Allocation impact on the request hot path.** The new histogram
+observation runs in `Connection#serve` (not in `Adapter::Rack#call`,
+which `yjit_alloc_audit_spec` locks at 9 obj/req post-Phase-11).
+Per-observation steady-state allocation: 1 fresh 3-element label
+Array (the `method`/`path`/`status` tuple); the templater + the
+HistogramAccumulator both reuse pre-allocated structures past first
+sight of a given route. `yjit_alloc_audit_spec` stays green at
+9 obj/req.
+
+**Files / sites:**
+
+| Where | What |
+|---|---|
+| `lib/hyperion/metrics.rb` | Histogram + gauge + labeled-counter API on `Hyperion::Metrics`. Snapshot helpers for the exporter. |
+| `lib/hyperion/metrics/path_templater.rb` | NEW — LRU-cached templater with default integer/UUID rules. |
+| `lib/hyperion/prometheus_exporter.rb` | `render_full(metrics_sink)` emits histograms / gauges / labeled counters in addition to the legacy counter render. |
+| `lib/hyperion/admin_middleware.rb` | `/-/metrics` switches to `render_full` when the sink supports it (defensive fallback otherwise). |
+| `lib/hyperion/connection.rb` | Per-route duration histogram observation; labeled per-worker rejection counter; kTLS untrack on close. |
+| `lib/hyperion/websocket/connection.rb` | WS deflate ratio histogram observation in `deflate_message`. |
+| `lib/hyperion/tls.rb` | `track_ktls_handshake!` / `untrack_ktls_handshake!` helpers. |
+| `lib/hyperion/server.rb` | Calls `track_ktls_handshake!` after every TLS accept. |
+| `lib/hyperion/worker.rb` | Sets the `hyperion_io_uring_workers_active` gauge at boot/shutdown. |
+| `lib/hyperion/thread_pool.rb` | Block-form gauge for `hyperion_threadpool_queue_depth` (read live at scrape time). |
+| `lib/hyperion/config.rb` | `MetricsConfig` subconfig with `path_templater` + `enabled` knobs. |
+| `spec/hyperion/metrics_enrichment_spec.rb` | NEW — 27 examples covering templater, histogram/gauge/counter API, exporter rendering, and per-domain integration (Connection, WS deflate, kTLS, fairness). |
+| `docs/OBSERVABILITY.md` | NEW — operator playbook: every metric, its query, what action a non-zero value should trigger. |
+| `docs/grafana/hyperion-2.4-dashboard.json` | NEW — pre-built dashboard with 8 panels (heatmap + p50/p99 + rejection rate + deflate ratio + kTLS + io_uring + queue depth). |
+
+**No new gem deps.** The exporter extends the existing in-tree
+emission path; no `prometheus-client` (or any other) gem was added.
+
+Spec count: 796 → 823 default-run.
+No version bump (release task is 2.4-fix-F).
+
 ## [2.3.0] - 2026-05-01
 
 ### Headline
