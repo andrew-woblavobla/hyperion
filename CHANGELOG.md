@@ -101,23 +101,24 @@ untouched.
 Spec count **682 → 693** (+11). All 682 prior examples still green
 (spec sweep on macOS, 11 pending Linux-only splice tests unchanged).
 
-**Bench measurement on openclaw-vm: PENDING.** Same SSH gap as Phase 9
-/ 10 / 11 / fix-A / fix-C: the fix-D landing session could not reach
-openclaw-vm (publickey rejection from this workstation). The h2load
-rerun command for the maintainer:
+**Bench measurement on openclaw-vm — VERIFIED 2026-04-30:**
 
-```sh
+```
 hyperion --tls-cert /tmp/cert.pem --tls-key /tmp/key.pem -t 64 -w 1 \
          --h2-max-total-streams unbounded -p 9602 ~/bench/hello.ru
 h2load -c 1 -m 100 -n 5000 https://127.0.0.1:9602/
+finished in 3.19s, 1567.67 req/s, 38.29KB/s
+requests: 5000 total, 5000 started, 5000 done,
+          5000 succeeded, 0 failed, 0 errored, 0 timeout
+time for request:  41.05ms / 83.08ms / 62.46ms (mean / max / sd)
 ```
 
-Expected outcome: 5,000 / 5,000 succeeded, 0 errored, ~1,597 r/s
-(matches the 2.0.0 baseline row in BENCH_HYPERION_2_0.md — the goal is
-**not** to chase rps, only to prove the connection no longer refuses
-new streams mid-test on a default-shape command line). When that bench
-runs, update BENCH_HYPERION_2_0.md row 10 with the actual rerun
-numbers and replace this PENDING marker.
+**5,000 / 5,000 succeeded, 0 errored, 1,567 r/s** (matches the 2.0.0
+baseline 1,597 r/s within 2% noise). Confirms the flag fixes the
+2026-04-30 regression where 4,489 of 5,000 streams errored on a
+default-shape command line. The rps baseline isn't moved by fix-D —
+the goal was only to make h2load `-n 5000` runnable without a config
+file.
 
 ### fix-C — large-payload TLS bench harness (rackups + `HYPERION_TLS_KTLS` env-var)
 
