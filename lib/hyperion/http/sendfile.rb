@@ -232,6 +232,43 @@ module Hyperion
           end
         end
 
+        # 2.6-C — Puma-style serial-per-thread sendfile loop.  Same
+        # zero-copy mechanics as `copy_to_socket` but with EAGAIN
+        # handled by `IO.select(nil, [out], nil, 5.0)` instead of
+        # `wait_writable` (fiber yield).  Under the GVL the OS thread
+        # parks on the select; no per-chunk fiber-scheduler hop.
+        #
+        # Engaged from `ResponseWriter#write_sendfile` when the
+        # per-response `dispatch_mode` is `:inline_blocking` — auto-
+        # detected for `body.respond_to?(:to_path)` static-file routes
+        # in `Adapter::Rack#call`, or set explicitly by the app via
+        # `env['hyperion.dispatch_mode'] = :inline_blocking`.
+        #
+        # Userspace + TLS-userspace branches reuse `userspace_copy_loop`
+        # — `IO.copy_stream` is already blocking on the calling thread,
+        # no fiber-yield refactor needed there.  Small-file (<= 64 KiB)
+        # native path also stays through `copy_small`: that primitive
+        # already handles EAGAIN with a short select() under the GVL,
+        # so the small-file fast path is "blocking" in the relevant
+        # sense regardless of `:inline_blocking` opt-in.
+        def copy_to_socket_blocking(out_io, file_io, offset, len)
+          return 0 if len.zero?
+
+          kind = fast_path_kind(out_io)
+
+          if kind == :native && len <= SMALL_FILE_THRESHOLD &&
+             respond_to?(:copy_small) && real_fd?(file_io)
+            return copy_small(out_io, file_io, offset, len)
+          end
+
+          case kind
+          when :native
+            native_copy_loop_blocking(out_io, file_io, offset, len)
+          when :userspace, :tls_userspace
+            userspace_copy_loop(out_io, file_io, offset, len)
+          end
+        end
+
         private
 
         def tls_socket?(io)
@@ -485,6 +522,81 @@ module Hyperion
             out_io.wait_writable
           elsif out_io.respond_to?(:to_io)
             IO.select(nil, [out_io.to_io], nil, 1.0)
+          else
+            Thread.pass
+          end
+        end
+
+        # 2.6-C — Plain-sendfile loop variant with `IO.select` instead
+        # of fiber yield.  Same body as `plain_sendfile_loop` plus the
+        # 2.6-A USERSPACE_CHUNK cap, but EAGAIN parks the OS thread on
+        # a 5 s select() rather than calling out to the fiber scheduler.
+        # Under the GVL this is the Puma-style "serial-per-thread"
+        # response shape — sendfile, syscall returns EAGAIN, thread
+        # blocks on select, kernel wakes us when the socket drains, we
+        # retry from the same cursor.  No per-chunk fiber-scheduler hop.
+        #
+        # We deliberately don't reuse the splice path here: splice's
+        # per-response pipe lifecycle pairs cleanly with fiber dispatch
+        # (where wait_writable is cheap), and the splice win is
+        # marginal vs sendfile on warm-cache static.  For
+        # `:inline_blocking` we keep the loop deliberately straight-line
+        # — sendfile only, no userspace pipe ladder.
+        def native_copy_loop_blocking(out_io, file_io, offset, len)
+          remaining = len
+          cursor    = offset
+          total     = 0
+
+          while remaining.positive?
+            chunk = remaining < USERSPACE_CHUNK ? remaining : USERSPACE_CHUNK
+            bytes, status = copy(out_io, file_io, cursor, chunk)
+
+            case status
+            when :done
+              total     += bytes
+              cursor    += bytes
+              remaining -= bytes
+            when :partial
+              total     += bytes
+              cursor    += bytes
+              remaining -= bytes
+            when :eagain
+              select_writable_blocking(out_io)
+            when :unsupported
+              # Kernel said this fd pair doesn't support sendfile.  Drop
+              # to userspace.  The userspace path is already blocking on
+              # the calling thread (IO.copy_stream loops on write).
+              file_io.seek(cursor) if file_io.respond_to?(:seek)
+              return total + userspace_copy_loop(out_io, file_io, cursor, remaining)
+            else
+              raise "Hyperion::Http::Sendfile: unexpected status #{status.inspect}"
+            end
+          end
+
+          total
+        end
+
+        # 2.6-C — block the OS thread on a writable-readiness select
+        # rather than yield to the fiber scheduler.  5 s timeout is a
+        # belt-and-suspenders bound: Connection's per-request deadline
+        # (default 60 s) fires first on a stuck peer, but we still want
+        # IO.select to wake periodically so a misbehaving peer can't
+        # park a worker thread forever.  Tolerate IOs that don't expose
+        # `to_io` (StringIO in specs, mock objects) by short-circuiting
+        # via `Thread.pass` — same fallback shape as `wait_writable`.
+        def select_writable_blocking(out_io)
+          target =
+            if out_io.is_a?(::IO)
+              out_io
+            elsif out_io.respond_to?(:to_io)
+              begin
+                out_io.to_io
+              rescue StandardError
+                nil
+              end
+            end
+          if target
+            ::IO.select(nil, [target], nil, 5.0)
           else
             Thread.pass
           end

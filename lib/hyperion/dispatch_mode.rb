@@ -23,7 +23,7 @@ module Hyperion
   # under a hot-path branch. Equality + hash are by `name` so it slots
   # cleanly into per-mode metric keys without surprising identity checks.
   class DispatchMode
-    # The 5 dispatch shapes Hyperion currently honours. Names mirror the
+    # The 6 dispatch shapes Hyperion currently honours. Names mirror the
     # RFC's wording so readers can map between the two without translation:
     #   :tls_h2              — TLS connection that ALPN-picked HTTP/2
     #   :tls_h1_inline       — TLS HTTP/1.1, served inline on accept fiber
@@ -35,9 +35,21 @@ module Hyperion
     #                          worker thread pool (`-t N`, default)
     #   :inline_h1_no_pool   — Plain HTTP/1.1, no pool (`-t 0`); served
     #                          inline on the accept thread/fiber
-    MODES = %i[tls_h2 tls_h1_inline async_io_h1_inline threadpool_h1 inline_h1_no_pool].freeze
+    #   :inline_blocking     — 2.6-C: Puma-style serial-per-thread response
+    #                          write for static-file routes.  Connection's
+    #                          connection-wide mode (typically threadpool)
+    #                          stays unchanged; `:inline_blocking` is opt-
+    #                          in PER RESPONSE for bodies that respond to
+    #                          `:to_path`.  No fiber yield, no per-chunk
+    #                          EAGAIN dance — the OS thread parks on the
+    #                          kernel write under the GVL.  Operator-level
+    #                          escape hatch via `env['hyperion.dispatch_mode']
+    #                          = :inline_blocking` for routes the auto-
+    #                          detect doesn't catch.
+    MODES = %i[tls_h2 tls_h1_inline async_io_h1_inline threadpool_h1 inline_h1_no_pool
+               inline_blocking].freeze
 
-    INLINE_MODES = %i[tls_h1_inline async_io_h1_inline inline_h1_no_pool].freeze
+    INLINE_MODES = %i[tls_h1_inline async_io_h1_inline inline_h1_no_pool inline_blocking].freeze
 
     attr_reader :name
 
@@ -79,11 +91,36 @@ module Hyperion
       @name == :tls_h2
     end
 
+    # 2.6-C — Puma-style serial-per-thread response write for static-
+    # file routes.  Per-response opt-in (NOT a connection-wide mode);
+    # the underlying connection still dispatches via its configured
+    # mode (`:async_io_h1_inline`, `:threadpool_h1`, `:tls_h1_inline`,
+    # `:inline_h1_no_pool`).  When this mode engages, the response-
+    # write path uses `Sendfile.copy_to_socket_blocking` instead of
+    # the fiber-yielding `copy_to_socket` — the OS thread parks on
+    # the kernel write under the GVL, no per-chunk EAGAIN-yield
+    # round-trip.
+    def inline_blocking?
+      @name == :inline_blocking
+    end
+
+    # 2.6-C — whether the response is dispatched on a fiber that may
+    # yield cooperatively to the scheduler.  False for `:inline_blocking`
+    # (the whole point — block the OS thread on write rather than yield
+    # the fiber) and for `:threadpool_h1` / `:inline_h1_no_pool` (no
+    # scheduler in scope).  True for the three async-scheduler shapes
+    # (`:tls_h1_inline`, `:async_io_h1_inline`, `:tls_h2`).
+    def fiber_dispatched?
+      @name == :tls_h2 || @name == :tls_h1_inline || @name == :async_io_h1_inline
+    end
+
     # Whether dispatch yields cooperatively (Async scheduler current on
     # the calling fiber). True for TLS h1 inline (TLS already wraps the
     # accept loop in Async), async_io_h1_inline (operator opted in), and
     # h2 (per-stream fibers). False for threadpool dispatch (worker
-    # thread, no scheduler) and `-t 0` plain HTTP.
+    # thread, no scheduler), `-t 0` plain HTTP, and `:inline_blocking`
+    # (per-response opt-in that explicitly disables fiber yield on the
+    # response-write path).
     def async?
       @name == :tls_h2 || @name == :tls_h1_inline || @name == :async_io_h1_inline
     end

@@ -2,6 +2,110 @@
 
 ## [Unreleased] - 2.6.0
 
+### 2.6-C — `:inline_blocking` dispatch mode (Puma-style serial-per-thread sendfile for static)
+
+The biggest remaining 2.6 cut on the static-file row.  Adds a sixth
+`Hyperion::DispatchMode` value (`:inline_blocking`) and an opt-in
+per-response code path that issues `sendfile(2)` under the GVL with
+`IO.select`-driven EAGAIN handling — Puma's response-write shape —
+instead of the legacy fiber-yielding `wait_writable` round-trip.
+
+**Dispatch model.**  `:inline_blocking` is opt-in PER RESPONSE, NOT a
+connection-wide mode.  The connection's connection-wide dispatch
+mode (resolved at boot from `tls`, `async_io`, ALPN, and
+`thread_count`) stays whatever the operator configured —
+typically `:async_io_h1_inline` or `:threadpool_h1` for the bench
+shape.  Per-response, the response-write loop reads
+`Connection#response_dispatch_mode` (set by the Rack adapter) and,
+when it equals `:inline_blocking`, branches to
+`Hyperion::Http::Sendfile.copy_to_socket_blocking` instead of
+`copy_to_socket`.
+
+**Auto-detect.**  `Adapter::Rack#call` inspects the response after
+`app.call` returns.  When the body responds to `:to_path` AND
+`env['hyperion.streaming']` is not set, it stashes
+`:inline_blocking` on the connection.  `to_path` is Rack's
+strongest "this is a static file on disk" signal — Rack::Files,
+Rack::SendFile, asset servers, and signed-download responders all
+set it; SSE / chunked / streaming JSON bodies do not.  Conservative
+by design: streaming routes cannot accidentally engage
+`:inline_blocking` because their bodies don't respond to
+`:to_path`.
+
+**Explicit opt-in.**  Apps can set
+`env['hyperion.dispatch_mode'] = :inline_blocking` for routes the
+auto-detect doesn't catch (e.g. a custom Range-request body that
+needs the blocking write loop but has a non-standard `to_path`-like
+shape).  Operator-level escape hatch.
+
+**Why the win exists.**  The fiber-yielding path
+(`Sendfile#wait_writable`) hops the fiber scheduler on every
+EAGAIN — userspace pays a per-chunk fiber-suspend / fiber-resume
+round-trip plus the `wait_writable` wakeup callback even when the
+kernel TCP send buffer drains in nanoseconds.  Puma doesn't: the
+worker thread parks on a kernel write under the GVL, the kernel
+returns when ready, the loop resumes.  For static-file routes
+where the only I/O wait is the socket itself (no DB / Redis /
+upstream HTTP that would benefit from cooperative yielding),
+Puma's straight-line shape is strictly faster on the throughput
+axis.  `:inline_blocking` ports that shape into Hyperion for the
+routes that match.
+
+**Bench delta on openclaw-vm** (Linux 6.x, 1 MiB warm-cache static
+asset, `wrk -t4 -c100 -d20s`, target validated against 2.6-A's
+1,320 r/s baseline and Puma's 1,571 r/s):
+
+  * Bench validation pending — this 2.6-C lands from a session
+    without working SSH to openclaw-vm.  Maintainer to verify
+    post-merge: expected ≥+25% over 2.6-A (≥1,650 r/s) which
+    would also clear Puma's 1,571 baseline by 5–10%.  When the
+    bench runs the rackup boot log should mention
+    `dispatch: inline_blocking auto-detected for to_path bodies`
+    on the static.ru request path.
+
+**Tail-latency expectation.**  p99 may bump slightly under the
+blocking variant (the OS thread parks on the kernel write while a
+slow peer drains; 2.6-A's p99 was ~6.35 ms on the same row vs
+Puma's 754 ms).  Even with a several-ms bump the static-file p99
+stays orders-of-magnitude below Puma's 754 ms because Hyperion
+still answers from the socket fd directly with no per-request
+allocation tax.  Threadpool path on dynamic routes is unchanged
+(CPU JSON / Enumerator bodies don't auto-detect into
+`:inline_blocking`).
+
+**Lifecycle hooks (2.5-C) interop.**  Hooks fire on every request
+regardless of dispatch mode — observability is mode-agnostic.  A
+future 2.6-D may add an opt-OUT for static-file responses; 2.6-C
+does NOT change hook firing behaviour.
+
+#### Files touched
+- `lib/hyperion/dispatch_mode.rb` — `:inline_blocking` added to
+  `MODES` + `INLINE_MODES`; `inline_blocking?` + `fiber_dispatched?`
+  predicates.
+- `lib/hyperion/http/sendfile.rb` — `copy_to_socket_blocking` public
+  method + `native_copy_loop_blocking` + `select_writable_blocking`
+  (IO.select instead of `wait_writable`).
+- `lib/hyperion/connection.rb` — `response_dispatch_mode` accessor,
+  reset per-request, forwarded to `ResponseWriter#write` as
+  `dispatch_mode:`.
+- `lib/hyperion/response_writer.rb` — `dispatch_mode:` kwarg on
+  `#write` + `#write_sendfile`; sendfile branch picks
+  `copy_to_socket_blocking` when `dispatch_mode == :inline_blocking`.
+- `lib/hyperion/adapter/rack.rb` — post-`app.call`
+  `resolve_dispatch_mode!` helper handles auto-detect + explicit
+  env override; both the lifecycle-hooks branch and the bare path
+  call into it.
+- `spec/hyperion/inline_blocking_dispatch_spec.rb` — new file, 30
+  examples covering predicates, auto-detect, explicit opt-in,
+  streaming opt-out, no-Connection no-op, round-trip integrity at
+  1 KiB / 8 KiB / 1 MiB / 16 MiB, threadpool regression check
+  (CPU JSON / Enumerator bodies stay nil), 2.5-C hook firing,
+  Sendfile.copy_to_socket_blocking direct round-trip.
+
+Spec count: 911 → 941 (+30 from this 2.6-C landing).  0 failures,
+11 pending (Linux-only splice tests on macOS).  When 2.6-B lands its
+~6 fadvise round-trip specs the count will roll forward to 947.
+
 ### 2.6-A — sendfile chunk size 64 KiB → 256 KiB (4× fewer syscalls per 1 MiB)
 
 `Hyperion::Http::Sendfile::USERSPACE_CHUNK` bumped from `64 * 1024`

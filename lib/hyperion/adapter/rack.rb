@@ -208,6 +208,7 @@ module Hyperion
               raise
             end
             rt.fire_request_end(request, env, response, nil)
+            resolve_dispatch_mode!(env, response, connection)
             return response
           end
 
@@ -216,7 +217,9 @@ module Hyperion
           # body] Array (one Array allocation per request). Apps already
           # return a [status, headers, body] triple per Rack spec, so the
           # rebuild is pure overhead.
-          app.call(env)
+          response = app.call(env)
+          resolve_dispatch_mode!(env, response, connection)
+          response
         rescue StandardError => e
           Hyperion.metrics.increment(:app_errors)
           Hyperion.logger.error do
@@ -264,6 +267,67 @@ module Hyperion
           response_headers = { 'content-type' => 'text/plain' }
           extra_headers.each { |k, v| response_headers[k.to_s] = v.to_s }
           [status, response_headers, [body.to_s]]
+        end
+
+        # 2.6-C — resolve the per-response dispatch-mode override and
+        # stash it on the connection so `Connection#serve` can forward
+        # it to `ResponseWriter#write`.  Two opt-in mechanisms, in
+        # priority order:
+        #
+        #   1. Explicit: the Rack app set
+        #      `env['hyperion.dispatch_mode'] = :inline_blocking` (or
+        #      another future symbol).  Operator-level escape hatch
+        #      for routes the auto-detect doesn't catch (e.g. a custom
+        #      lazy-streaming body that responds to `:to_path` for
+        #      Range-request reasons but is logically a streaming
+        #      response).  We honour any explicit non-nil value
+        #      verbatim; the writer's branch is keyed on the symbol
+        #      so unknown symbols fall through to the default fiber-
+        #      yielding path.
+        #
+        #   2. Auto-detect: response body responds to `:to_path` AND
+        #      `env['hyperion.streaming']` is not set.  `to_path` is
+        #      Rack's strongest "this is a static file on disk"
+        #      signal — Rack::Files, Rack::SendFile, asset servers,
+        #      and signed-download responders all set it; streaming
+        #      bodies (SSE, JSON streams, chunked Enumerators) do not.
+        #      The `hyperion.streaming` env key is the operator's
+        #      escape valve to opt OUT of the auto-detect (e.g. a
+        #      custom Range-request body that responds to `:to_path`
+        #      but should still take the fiber-yielding path because
+        #      the body itself does I/O wait between chunks).
+        #
+        # Conservative-by-design: if `connection` is nil (no socket-
+        # owning Connection in scope — h2 streams, ad-hoc adapter
+        # callers in specs), we skip the override entirely.  The
+        # h2 path has its own per-stream fiber dispatch and doesn't
+        # benefit from `:inline_blocking`.
+        #
+        # Skips a bad response shape (anything that's not a 3-element
+        # Array) gracefully — the caller's main rescue clause owns
+        # malformed-response handling.
+        def resolve_dispatch_mode!(env, response, connection)
+          return unless connection
+          return unless connection.respond_to?(:response_dispatch_mode=)
+          return unless response.is_a?(Array) && response.length == 3
+
+          # 1. Explicit opt-in via env wins.
+          explicit = env && env['hyperion.dispatch_mode']
+          if explicit
+            connection.response_dispatch_mode = explicit
+            return
+          end
+
+          # 2. Auto-detect on `to_path` static-file responses.  Skip
+          # when the app set `hyperion.streaming` — that's the
+          # operator's "this body responds to to_path but is
+          # logically a streaming response" escape valve.
+          return if env && env['hyperion.streaming']
+
+          body = response[2]
+          return unless body.respond_to?(:to_path)
+
+          connection.response_dispatch_mode = :inline_blocking
         end
 
         def build_env(request, connection: nil)

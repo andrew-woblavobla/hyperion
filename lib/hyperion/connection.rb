@@ -163,6 +163,21 @@ module Hyperion
     # and a hijack on request N+1 should not be observed during request N.
     attr_reader :socket
 
+    # 2.6-C — per-response dispatch-mode override.  Reset to `nil` at
+    # the top of each request iteration; the Rack adapter sets this to
+    # `:inline_blocking` when it auto-detects a static-file body
+    # (`body.respond_to?(:to_path)`) or when the app explicitly opts in
+    # via `env['hyperion.dispatch_mode'] = :inline_blocking`.  The
+    # response-write path reads it back here in `serve` and forwards
+    # the symbol to `ResponseWriter#write` so the writer can pick the
+    # blocking-sendfile variant.
+    #
+    # The override is per-RESPONSE, NOT per-connection: the connection's
+    # connection-wide dispatch mode (resolved at boot from `tls`,
+    # `async_io`, `thread_count`, ALPN) stays whatever the operator
+    # configured.  Only the response-write loop downgrades.
+    attr_accessor :response_dispatch_mode
+
     def hijacked?
       @hijacked == true
     end
@@ -214,6 +229,15 @@ module Hyperion
         # long-lived keep-alive sessions with many small requests don't
         # falsely trip after the cumulative budget elapses.
         request_started_clock = Process.clock_gettime(Process::CLOCK_MONOTONIC) if max_request_read_seconds
+        # 2.6-C — clear the per-response dispatch-mode override at the
+        # top of every request iteration.  The Rack adapter sets it
+        # *during* `app.call` (auto-detect on `to_path` body or
+        # explicit `env['hyperion.dispatch_mode']` override) and the
+        # writer reads it back; a keep-alive client whose request N
+        # was static must NOT have request N+1 inherit the
+        # `:inline_blocking` flag if request N+1's body is a streaming
+        # response.
+        @response_dispatch_mode = nil
         buffer = read_request(socket, @inbuf, deadline_started_at: request_started_clock,
                                               max_request_read_seconds: max_request_read_seconds,
                                               peer_addr: peer_addr)
@@ -309,7 +333,16 @@ module Hyperion
         end
 
         keep_alive = should_keep_alive?(request, status, headers)
-        @writer.write(socket, status, headers, body, keep_alive: keep_alive)
+        # 2.6-C — pass the per-response dispatch-mode override to the
+        # writer.  Default `nil` means "use the writer's default
+        # (fiber-yielding sendfile / userspace copy)".  Only
+        # `:inline_blocking` currently flips the writer onto a
+        # different code path (the Puma-style serial-per-thread
+        # blocking-sendfile loop).  Forward-compatible — future per-
+        # response dispatch modes plug in here without changing the
+        # call-site shape.
+        @writer.write(socket, status, headers, body, keep_alive: keep_alive,
+                                                     dispatch_mode: @response_dispatch_mode)
         @metrics.increment_status(status)
         log_request(request, status, request_started_at) if @log_requests
         # 2.4-C: per-route duration histogram observation. Templating the

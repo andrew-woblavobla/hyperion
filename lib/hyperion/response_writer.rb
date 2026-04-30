@@ -48,7 +48,15 @@ module Hyperion
 
     CRLF_HEADER_VALUE = /[\r\n]/
 
-    def write(io, status, headers, body, keep_alive: false)
+    # 2.6-C — `dispatch_mode:` is the per-response opt-in dispatch shape
+    # (typically `:inline_blocking` for static-file routes auto-detected
+    # by `Adapter::Rack#call`, or `nil` for the default fiber-yielding
+    # path).  Only the sendfile branch consumes it today; the chunked
+    # and buffered branches ignore it (no fiber-yield in their hot
+    # loop to begin with).  Forward-compatible — future per-response
+    # dispatch shapes plug in here without changing the call-site
+    # arity for non-sendfile branches.
+    def write(io, status, headers, body, keep_alive: false, dispatch_mode: nil)
       # Zero-copy fast path: bodies that point at an on-disk file (Rack::Files,
       # asset servers, signed-download responders) get streamed via
       # IO.copy_stream which delegates to sendfile(2) on Linux for plain TCP
@@ -58,7 +66,10 @@ module Hyperion
       # we count that path separately. Phase 5 leaves this branch untouched —
       # sendfile bypasses the chunked coalescer entirely (the file IS the body
       # buffer, no userspace chunks to coalesce).
-      return write_sendfile(io, status, headers, body, keep_alive: keep_alive) if body.respond_to?(:to_path)
+      if body.respond_to?(:to_path)
+        return write_sendfile(io, status, headers, body, keep_alive: keep_alive,
+                                                         dispatch_mode: dispatch_mode)
+      end
 
       # Phase 5 — opt-in chunked streaming path. The app sets
       # `Transfer-Encoding: chunked` to signal "this body is a stream; do not
@@ -131,7 +142,7 @@ module Hyperion
     # and the client ACKs immediately. No setsockopt churn required.
     SENDFILE_COALESCE_THRESHOLD = 64 * 1024
 
-    def write_sendfile(io, status, headers, body, keep_alive:)
+    def write_sendfile(io, status, headers, body, keep_alive:, dispatch_mode: nil)
       path = body.to_path
       file = File.open(path, 'rb')
       file_size = file.size
@@ -171,10 +182,23 @@ module Hyperion
           #     per-chunk fiber-hop).
           #   * Hosts where the C ext didn't compile → IO.copy_stream
           #     fallback.
-          # The helper loops on partial writes and yields to the fiber
-          # scheduler on EAGAIN.
+          #
+          # 2.6-C — when `dispatch_mode == :inline_blocking` the loop
+          # uses `IO.select` + GVL-blocking sendfile instead of
+          # fiber-yielding `wait_writable`.  Auto-detected by
+          # `Adapter::Rack#call` for `to_path` bodies that don't carry
+          # a streaming marker; opt-in via
+          # `env['hyperion.dispatch_mode'] = :inline_blocking` for
+          # routes the auto-detect doesn't catch.  Default `nil` /
+          # any other symbol stays on the fiber-yielding path so
+          # existing callers (TLS h1 / async-io / threadpool dispatch)
+          # are unaffected.
           io.write(head)
-          ::Hyperion::Http::Sendfile.copy_to_socket(io, file, 0, file_size)
+          if dispatch_mode == :inline_blocking
+            ::Hyperion::Http::Sendfile.copy_to_socket_blocking(io, file, 0, file_size)
+          else
+            ::Hyperion::Http::Sendfile.copy_to_socket(io, file, 0, file_size)
+          end
         end
 
       record_zero_copy_metric(io)
