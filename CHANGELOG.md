@@ -64,14 +64,47 @@ warmed encodes; spec asserts `total_allocated_objects/call < 6`
 (includes Fixnums + transient Array iterators that GC.stat conflates
 with String allocations).
 
-**Bench delta on openclaw-vm.** See `.notes/2.4-a-bench-openclaw-vm.txt`
-for raw h2load output. Subsection below populated after on-host run.
+**Bench delta on openclaw-vm (Linux 6.8 / 16 vCPU).** Three runs each
+of `h2load -c 1 -m 100 -n 5000 https://127.0.0.1:9602/` against
+`bin/hyperion -t 64 -w 1 --h2-max-total-streams unbounded ~/bench/hello.ru`
+(rack lambda returning `[200, {'content-type' => 'text/plain'}, ['hello']]`):
 
-**Default flip rationale.** Recorded after bench validation —
-`HYPERION_H2_NATIVE_HPACK` policy resolution updated when the C-glue
-path shows ≥+15% rps over Ruby fallback. Otherwise the env var stays
-opt-in and the v3 implementation ships as a perf-positive code path
-for tests + future tuning.
+| Mode                    | median r/s | delta vs Ruby |
+|---|---:|---:|
+| Ruby HPACK (baseline)   | 1,627.46 | — |
+| native v2 (Fiddle path) | 1,628.7 (fix-B / 2.2.x baseline) | -0.05% |
+| **native v3 (CGlue)**   | 1,607.19 | -1.2% (noise) |
+
+Raw h2load output: `.notes/2.4-a-bench-openclaw-vm.txt`.
+
+**Default flip — declined for now.** The +15% target wasn't met on
+the hello workload. v3 is at parity with Ruby HPACK and v2 Fiddle —
+the per-call alloc savings (7.5 → ~1 string) don't translate to
+end-to-end rps because hello.ru sends a 2-header response, and at
+~1,600 r/s the dominant CPU sits in TLS, fiber scheduling, and h2
+framing (which v3 does NOT replace — it only swaps HPACK encode at
+the protocol-http2 boundary). HPACK CPU on a 2-header block is
+already <1% of the per-stream cost.
+
+`HYPERION_H2_NATIVE_HPACK` stays default-OFF. Operators who opt in
+via `HYPERION_H2_NATIVE_HPACK=1` get the v3 (CGlue) path
+automatically when the C glue installs successfully, and v2 (Fiddle)
+when it doesn't (older glibc / sandboxed dlopen). The v3
+implementation ships because:
+
+  1. It's the foundation for any future end-to-end win — the FFI
+     marshalling layer cannot get cheaper than v3 without rewriting
+     the entire h2 framer in Rust.
+  2. Per-call alloc reduction (7.5 → ~1 string) is real and lowers
+     GC pressure on h2-heavy workloads even when rps is flat.
+  3. Specs lock in v3 as the default code path inside the
+     `H2Codec::Encoder#encode` method body — the v3-specific 12
+     spec examples plus the existing 24 H2Codec/Http2 spec
+     examples all execute through the v3 path on hosts where
+     CGlue installs (which is every modern Linux + macOS).
+
+The next gate for the default flip is a Rails-shape bench (~30
+response headers per stream). Tracked as a 2.4-B follow-up.
 
 ## [2.3.0] - 2026-05-01
 
