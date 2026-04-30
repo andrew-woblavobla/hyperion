@@ -11,6 +11,13 @@ RSpec.configure do |config|
   config.disable_monkey_patching!
   config.order = :random
 
+  # 2.4-B: long-run perf-style specs (e.g. `long_run_stability_spec`) carry
+  # the `:perf` tag and are excluded from the default run. Operators opt
+  # in via `bundle exec rspec --tag perf` (or `HYPERION_RUN_PERF_SPECS=1
+  # bundle exec rspec`) after allocation-pressure changes to re-baseline
+  # the long-run GC frequency.
+  config.filter_run_excluding(:perf) unless ENV['HYPERION_RUN_PERF_SPECS']
+
   # 1.8.0: the broad spec suite intentionally exercises deprecated DSL keys
   # (`h2_max_concurrent_streams`, `admin_token`, `Hyperion.metrics =`, …)
   # because those are still the canonical 1.x test seams. Keep the suite
