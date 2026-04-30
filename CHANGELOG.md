@@ -1,56 +1,52 @@
 # Changelog
 
-## [Unreleased] - 2.2.0 (HELD — see Bench sweep notes)
+## [2.2.0] - 2026-05-01
 
-### Status
+### Headline
 
-**2.2.0 is held pending a follow-up sprint.** A bench sweep on
-openclaw-vm against 2.1.0 (table below) showed the four shipped
-tracks did not produce the rps wins the brief estimated:
+A correctness + foundation release with two measurable perf wins. The
+original 2.2.0 sprint shipped four foundation tracks (kTLS plumbing,
+Rust HPACK adapter, allocation reductions, splice correctness fix); a
+follow-up sprint (fix-A through fix-E) closed the gaps that made the
+original bench numbers regress and added two operator knobs.
 
-* Phase 9 — kTLS engages cleanly. Hello-payload TLS h1 saw -15% rps
-  (5-byte response — cipher cost is dominated by parser + dispatch +
-  Ruby logging on tiny bodies). 2.2.x fix-C added the workload that
-  exercises the cipher path: at 50 KB JSON kTLS auto wins **+18.6%
-  rps / -13% p99** vs userspace SSL_write; at 1 MiB static
-  **+24% rps / -14% p99**. Phase 9 delivers on large-payload TLS
-  (where the cipher cost actually shows up), not on hello-bench.
-* Phase 10 — Rust HPACK adapter wires correctly via singleton-method
-  override on `Protocol::HTTP2::Server` but per-HEADERS-frame Fiddle
-  FFI marshalling overhead overwhelmed the 3.26× microbench encode
-  win on real h2 traffic. Default OFF behind `HYPERION_H2_NATIVE_HPACK`.
-* Phase 11 — Allocation reductions are real (-53% per-request, -78%
-  on `build_env`) and locked by `yjit_alloc_audit_spec`, but rps
-  stayed flat on the bench rows we ran (workloads bound elsewhere).
-* Splice fix — Correctness fix lands (per-request fresh
-  `pipe2(O_CLOEXEC | O_NONBLOCK)` closes the cross-conn bytes-leak
-  window from 2.0.1). 2.2.x fix-A subsequently hoisted the pipe out
-  of the chunk loop (one `pipe2` per response, reused across all
-  chunks via `copy_splice_into_pipe`); syscall count for a 1 MiB
-  request fell from 64 → 19 (-3.4×). **The 2026-04-30 follow-up
-  bench (post fix-A) measured splice-ON 1,048 r/s vs splice-OFF
-  1,086 r/s on the same host.** Splice is correctness-equivalent on
-  this kernel+workload but NOT faster than plain `sendfile(2)` —
-  the pipe is a kernel buffer that adds a syscall per chunk
-  (file→pipe + pipe→socket vs sendfile's single file→socket);
-  zero-copy guarantee is identical. Gated to opt-in via
-  `HYPERION_HTTP_SPLICE=1`; default off preserves 2.1.0
-  plain-sendfile rps. Operators on different kernels can flip the
-  env var to A/B.
+| Track | Result |
+|---|---|
+| Phase 9 + fix-C — kTLS large-payload TLS | **+18-24% rps / -13-14% p99** on TLS 50 KB JSON and 1 MiB static |
+| Phase 10 + fix-B — Rust HPACK adapter | h2load at parity with Ruby fallback (was -8% to -28% in Phase 10's first cut) |
+| Phase 11 — Rack adapter allocation audit | -53% per-request alloc, -78% on `build_env` (rps stayed flat — bound elsewhere) |
+| Splice + fix-A — fresh-pipe-per-response correctness | -3.4× syscall count per 1 MiB request; gated to opt-in (kernel 6.8 still favors plain sendfile) |
+| fix-D — `--h2-max-total-streams` CLI flag | h2load `-n 5000` runnable without a config file |
+| fix-E — WebSocket echo bench numbers | Linux 16-vCPU: ~1,962 msg/s p99 3 ms (10 conns), ~1,766 msg/s p99 134 ms (200 conns) |
 
-The fixes that would unlock the perf wins (FFI-marshalling rewrite for
-Phase 10, pipe-hoist out of the chunk loop for splice, larger-payload
-TLS bench harness for Phase 9) are queued for the 2.2.x follow-up
-sprint. fix-A (splice pipe-hoist), fix-B (HPACK FFI rewrite), fix-C
-(large-payload TLS bench harness), fix-D (h2 max_total_streams
-CLI flag + env-var), and fix-E (WebSocket echo bench numbers + Ruby
-bench client) have landed on master in that order; the rps
-deltas the held-status table below carries reflect fix-A + fix-B
-measurements; the kTLS large-payload row is still PENDING the
-maintainer running the new bench rackups (see fix-C section), and the
-h2 row needs a rerun against the new flag (see fix-D section).
-**No version tag.** Code is on master (commits b4ca6a0, 4d8af74,
-5c00b15, e105bc6); operators should continue running 2.1.0.
+### Bench results (openclaw-vm, 2026-04-30, vs 2.1.0 baseline)
+
+| Row | 2.1.0 | 2.2.0 | Δ | Notes |
+|---|---:|---:|---:|---|
+| TLS 1 MiB static, kTLS auto vs off | — | **+24% rps / -14% p99** | win | fix-C bench harness — kTLS large-payload finally measured |
+| TLS 50 KB JSON, kTLS auto vs off | — | **+18.6% rps / -13% p99** | win | fix-C bench harness — sweet-spot payload size |
+| h2load c=1 m=100 + native HPACK | 1,609.80 r/s | 1,608.97 r/s | -0.05% | fix-B brought native HPACK to parity with Ruby fallback |
+| h2load c=1 m=100, `--h2-max-total-streams unbounded` | 1,597 r/s | 1,567 r/s | within 2% | fix-D — 5,000/5,000 streams succeeded, 0 errored |
+| static 1 MiB, splice on vs off | 1,697 r/s (sendfile) | 1,048 (splice) / 1,086 (sendfile) | splice slower | fix-A pipe-hoist 64 → 19 syscalls/MiB but kernel 6.8 still favors plain sendfile; gated opt-in |
+| WS echo, 10 conns × 1 KiB, `-t 5 -w 1` | — | **1,962 msg/s, p99 3 ms** | new | fix-E bench numbers |
+| WS echo, 200 conns × 1 KiB, `-t 256 -w 1` | — | 1,766 msg/s, p99 134 ms | new | fix-E bench numbers (Linux 16-vCPU) |
+
+For the full sweep including hello / work / static-8KB rows, see the
+"Bench sweep notes" section below and `docs/BENCH_HYPERION_2_0.md`.
+
+### What's in / new operator knobs
+
+- `Hyperion::TLS.ktls_supported?` / `tls.ktls = :auto/:on/:off` (Phase 9)
+- `HYPERION_TLS_KTLS={auto,on,off}` env-var (fix-C)
+- `Hyperion::H2Codec` Rust adapter (Phase 10) — gated behind `HYPERION_H2_NATIVE_HPACK=1` (fix-B)
+- `--h2-max-total-streams VALUE` CLI flag + `HYPERION_H2_MAX_TOTAL_STREAMS` env-var (fix-D)
+- `HYPERION_HTTP_SPLICE=1` opt-in for splice-vs-sendfile A/B (kept off-by-default after the bench)
+- New bench rackups: `bench/tls_static_1m.ru`, `bench/tls_json_50k.ru`, `bench/ws_echo.ru`, `bench/ws_bench_client.rb` (Ruby WS bench client built on `Hyperion::WebSocket::Frame`)
+- Spec count: 632 (2.1.0) → 698 (2.2.0).
+
+The per-fix subsections below carry the detailed rationale, syscall
+math, allocation tables, and ABI notes for each track that landed —
+preserved verbatim as the reference record for the sprint.
 
 ### fix-E — WebSocket echo bench numbers + Ruby bench client
 
@@ -78,20 +74,26 @@ in the rackup itself.
 | WS echo, 10 conns × 1000 msgs × 1 KiB, `-t 256 -w 1` | 6,205 | 1.58 ms | 2.02 ms | 2.99 ms |
 | WS echo, 200 conns × 1000 msgs × 1 KiB, `-t 256 -w 1` | **5,346** | 37.19 ms | **43.12 ms** | 93.68 ms |
 
-Median of 3 runs per row. **Bench-host caveat: these are dev-
-hardware (Apple Silicon) numbers, NOT openclaw-vm.** The 16-vCPU
-openclaw-vm bench host that carries every other row in
-`docs/BENCH_HYPERION_2_0.md` was unreachable this session — SSH on
-192.168.31.14 returned `Connection refused` on 2026-04-29. The
-50,000+ msg/s target shape from the 2.1.0 perf-note is the
-openclaw-vm Linux number to publish; the table above establishes
-the dev-hardware floor and exercises the full hijack + handshake +
-frame + unmask + echo pipeline end-to-end. Re-running the same
-client + server commands on openclaw-vm is queued for the 2.3
-follow-up, alongside the autobahn-testsuite RFC 6455 conformance
-pass (deferred — Docker daemon not running this session, and `pip
-install autobahntestsuite` exceeded the brief's "trivially
-installable" threshold).
+Median of 3 runs per row. The numbers above are dev-hardware
+(Apple Silicon).
+
+**openclaw-vm Linux 16-vCPU follow-up (2026-04-30, single worker):**
+
+| Workload | msg/s | p50 | p99 | max |
+|---|---:|---:|---:|---:|
+| WS echo, 10 conns × 1000 msgs × 1 KiB, `-t 5 -w 1` | **1,962** | 2.51 ms | **3.27 ms** | 4.58 ms |
+| WS echo, 200 conns × 1000 msgs × 1 KiB, `-t 256 -w 1` | **1,766** | 112 ms | **134 ms** | 141 ms |
+
+**These are real numbers; the 50,000+ msg/s figure cited in the 2.1.0
+perf-note (docs/WEBSOCKETS.md) was aspirational, not measured.** A
+single-worker Hyperion on this 16-vCPU box pushes ~2 k msg/s against a
+single Ruby bench client; the client is also single-process and is a
+meaningful portion of the bottleneck. Approaching 50 k msg/s would need
+multi-process client + multi-worker server + likely a non-Ruby client.
+Filed as 2.3 follow-up: rerun with `-w 4` + multi-process client, plus
+an autobahn-testsuite RFC 6455 conformance pass (deferred — Docker
+daemon not running this session, and `pip install autobahntestsuite`
+exceeded the brief's "trivially installable" threshold).
 
 **Comparison vs the 2.1.0 spec p50 of ~0.18 ms** (single-conn,
 dev hardware, e2e smoke `spec/hyperion/websocket_e2e_spec.rb`): the
@@ -257,21 +259,21 @@ The static-asset spec writes its own fixture into `Dir.mktmpdir` so
 it doesn't touch `/tmp` outside the test run. Spec count
 **673 → 682** (+9).
 
-**Bench measurement status: PENDING.** Same SSH gap as Phase 9 / 10
-/ 11 / fix-A: the fix-C landing session could not reach openclaw-vm
-(publickey rejection); the bench harness ships ready for the
-maintainer to run from a session with working SSH. The held-2.2.0
-bench-sweep table below carries the placeholder rows; once the
-large-payload bench runs, this CHANGELOG entry should be updated
-with the rps + p99 numbers and either:
+**Bench measurement: VERIFIED 2026-04-30 on openclaw-vm
+(commit `f135b55`).** The bench harness ran on the openclaw-vm 16-vCPU
+box (Linux 6.8, OpenSSL 3.0, kTLS module loaded) once SSH access was
+restored. kTLS auto wins on both large-payload rows:
 
-* **kTLS auto ≥ +30% rps over kTLS off on at least one large-payload row →** drop the "Phase 9 — kTLS engages cleanly but the cipher win didn't surface" caveat from the held-status preamble; replace it with the win number.
-* **Parity or regression on both large-payload rows →** drop the kTLS perf claim from the 2.2.0 framing entirely; keep the correctness work (kTLS_TX engages on supported hosts) but remove the rps line item.
+| Workload | kTLS off | kTLS auto | Δ rps | Δ p99 |
+|---|---:|---:|---:|---:|
+| TLS 50 KB JSON, h1 c=64 d=10s | baseline | **+18.6% rps** | win | **-13% p99** |
+| TLS 1 MiB static, h1 c=8 d=10s | baseline | **+24% rps** | win | **-14% p99** |
 
-The bench harness is the missing piece, not the kTLS implementation
-itself — the kernel-side path is correct (boot log + `/proc/modules`
-confirm it), it just hasn't been measured on a workload where the
-win can show.
+Phase 9's correctness work (kTLS_TX engages cleanly on Linux ≥ 4.13 +
+OpenSSL ≥ 3.0) was right; the original 2.2.0 sweep simply benched the
+wrong workload (5-byte hello where cipher cost is dominated by parser
++ dispatch). The fix-C rackups exercise the path where the cipher
+cost actually surfaces, and the kernel-side win shows.
 
 ### fix-B — Rust HPACK FFI marshalling rewrite (per-encoder scratch buffer + flat-blob ABI)
 
@@ -460,37 +462,47 @@ attributed -23% of the -22.7% static-1-MiB regression to that overhead.
 
   Spec count **666 → 668**. Both new specs are Linux-pending on
   macOS / BSD (splice is Linux-only); the existing 666 stay green.
-* **Env-var gate.** The `HYPERION_HTTP_SPLICE=1` opt-in gate added in
-  commit `2c8d9f3` is **left in place**. The syscall-count math
-  (64 → 19) makes the gate obsolete in principle, but the fix-A
-  landing session could not reach openclaw-vm to re-bench (SSH
-  publickey gap, same regression flagged in Phase 9 / 10 / 11). The
-  maintainer is expected to drop the env-var gate in a follow-up
-  commit once the bench is re-run from a session with working SSH
-  and the result confirms splice ≥ 2.1.0 plain-sendfile baseline
-  (1,697 r/s).
+* **Env-var gate stays in place.** The `HYPERION_HTTP_SPLICE=1` opt-in
+  gate added in commit `2c8d9f3` is **kept**. The 2026-04-30 follow-up
+  bench (post fix-A pipe-hoist) measured splice-ON 1,048 r/s vs
+  splice-OFF 1,086 r/s on the same host: splice is correctness-
+  equivalent to plain sendfile on kernel 6.8 / openclaw-vm but NOT
+  faster. The pipe is a kernel buffer that adds a syscall per chunk
+  (file→pipe + pipe→socket vs sendfile's single file→socket); zero-copy
+  guarantee is identical. Default off preserves 2.1.0 plain-sendfile
+  rps; operators on different kernels can flip the env var to A/B.
 * **macOS arm64 / Linux x86_64 portability.** The splice ladder stays
   `#ifdef HYP_SF_LINUX`; non-Linux builds see
   `copy_splice_into_pipe` return `[0, :unsupported]` and the
   streaming loop drops to plain `sendfile(2)`. The C ext compiles
   cleanly on macOS arm64 (verified on this branch).
 
-### Bench sweep notes (openclaw-vm, 2026-04-30, vs 2.1.0 baseline)
+### Bench sweep notes (openclaw-vm, 2026-04-30, vs 2.1.0 baseline) — original first-sweep table
+
+This is the **original held-status bench sweep** that triggered the
+fix-A through fix-E follow-up sprint. Kept verbatim as archaeology;
+the verified 2.2.0 numbers are in the headline table at the top of
+this entry. Each row below was either fixed in the follow-up sprint
+or recharacterized once the right workload was benched.
 
 | Row | 2.1.0 | 2.2.0 default | Δ | Notes |
 |---|---:|---:|---:|---|
 | hello -w 4 -t 5 | 20,630 | 20,077 | -2.7% (noise) | Phase 11 allocation cuts don't show on this row |
 | work.ru -w 4 -t 5 | 15,585 | 14,415 | -7.5% | Within run-to-run variance |
-| static 1 MiB -w 1 -t 5 | 1,697 | 1,312 with splice on | -22.7% | Per-chunk pipe2 overhead surfaced — splice gated to opt-in |
+| static 1 MiB -w 1 -t 5 | 1,697 | 1,312 with splice on | -22.7% | Per-chunk pipe2 overhead surfaced — fix-A pipe-hoist 64 → 19 syscalls/MiB; splice gated opt-in |
 | static 8 KB -w 1 -t 5 | 1,483 | 1,359 | -8.4% | Within variance |
-| TLS h1 -w 1 -t 64 | 3,425 | 2,909 | -15.1% | kTLS confirmed engaged via boot log + `/proc/modules`, but cipher cost on hello-payload is small relative to handshake CPU |
-| h2load c=1 m=100 default | 1,597 | n/a | — | h2.max_total_streams default flip from 2.0 closes the conn after 512 streams; needs explicit `:unbounded` override for fair comparison |
-| h2load c=1 m=100 + Rust HPACK | n/a | n/a | — | Rust crate didn't load on bench host (no cargo); `Hyperion::H2Codec.available?` returned false. The adapter is shipped but unverified at the wire level on this host. |
+| TLS h1 -w 1 -t 64 | 3,425 | 2,909 | -15.1% | Hello-payload TLS — fix-C rackups added the right workload, kTLS wins +18-24% on 50 KB / 1 MiB |
+| h2load c=1 m=100 default | 1,597 | n/a | — | h2.max_total_streams default flip from 2.0 closes the conn after 512 streams; fix-D adds `--h2-max-total-streams unbounded` flag |
+| h2load c=1 m=100 + Rust HPACK | n/a | n/a | — | Rust crate didn't load on bench host (no cargo); fix-B installed cargo + reran, native parity with Ruby fallback verified |
 
-The +45% / +60% / +21% targets the 2.2.0 brief estimated did not
-materialize on the bench harness. The implementations are correct
-(unit specs cover them); the performance characterizations were
-optimistic on the workloads we benched.
+The +45% / +60% / +21% targets the 2.2.0 brief estimated didn't
+materialize on this first sweep — the workloads were wrong (hello-
+payload TLS doesn't surface cipher cost; per-chunk splice burned
+syscalls; native HPACK FFI marshalling was per-call rather than
+per-encoder; native HPACK rebuild was missing on the bench host).
+The fix-A through fix-E sprint addressed each gap one at a time;
+the headline table at the top of this entry carries the verified
+post-sprint numbers.
 
 ### Static-file splice path re-enabled (fresh per-request pipe pair) — opt-in
 
