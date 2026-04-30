@@ -159,7 +159,16 @@ module Hyperion
         # When nil (HTTP/2 path, ad-hoc adapter callers in specs), hijack
         # stays disabled — `env['rack.hijack?']` returns false and the env
         # has no `rack.hijack` key, matching pre-2.1 behaviour.
-        def call(app, request, connection: nil)
+        #
+        # 2.5-C: `runtime:` is the Hyperion::Runtime that owns this
+        # request's metrics + logger + lifecycle hooks. When nil (the
+        # default — every existing in-tree call site stays untouched),
+        # the adapter resolves to `Hyperion::Runtime.default`, which is
+        # the same singleton legacy `Hyperion.metrics` / `Hyperion.logger`
+        # delegate to. Apps with multiple servers (multi-tenant) pass an
+        # explicit Runtime so each server's NewRelic / AppSignal /
+        # OpenTelemetry hooks remain isolated.
+        def call(app, request, connection: nil, runtime: nil)
           env, input = build_env(request, connection: connection)
 
           # 2.1.0 (WS-2) — RFC 6455 §4.2 handshake interception. Runs
@@ -180,6 +189,26 @@ module Hyperion
             env['hyperion.websocket.handshake'] = ws_result
           when :bad_request, :upgrade_required
             return websocket_handshake_failure_response(ws_result)
+          end
+
+          # 2.5-C — per-request lifecycle hooks. The `has_request_hooks?`
+          # guard collapses to two empty-Array checks when no observers
+          # are registered (the default for every Hyperion install that
+          # hasn't opted in), so the hot path stays allocation-free
+          # — verified by `yjit_alloc_audit_spec`. Resolving `runtime`
+          # is itself zero-allocation: `Runtime.default` returns a
+          # memoised singleton.
+          rt = runtime || Hyperion::Runtime.default
+          if rt.has_request_hooks?
+            rt.fire_request_start(request, env)
+            begin
+              response = app.call(env)
+            rescue StandardError => e
+              rt.fire_request_end(request, env, nil, e)
+              raise
+            end
+            rt.fire_request_end(request, env, response, nil)
+            return response
           end
 
           # Phase 11 — return the app's tuple directly. Pre-Phase-11

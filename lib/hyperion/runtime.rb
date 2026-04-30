@@ -96,6 +96,100 @@ module Hyperion
       @metrics = metrics || Hyperion::Metrics.new
       @logger  = logger  || Hyperion::Logger.new
       @clock   = clock
+      # 2.5-C: per-request lifecycle hooks. Pre-allocated empty Arrays so
+      # `has_request_hooks?` can be a single `any?` check on each side
+      # — no nil-guard, no lazy-init branch on the hot path. Hooks are
+      # appended in registration order; FIFO dispatch.
+      @before_request_hooks = []
+      @after_request_hooks  = []
+    end
+
+    # 2.5-C — register a Proc to fire AFTER env is built but BEFORE
+    # `app.call`. Receives `(request, env)` where `request` is the
+    # parsed `Hyperion::Request` and `env` is the mutable Rack env Hash
+    # — callbacks may stash trace context (NewRelic transactions,
+    # OpenTelemetry spans, AppSignal/DataDog handles) into the env so
+    # the corresponding after-hook can finish them.
+    #
+    # Hook errors are caught and logged; they DO NOT abort dispatch.
+    # Multiple hooks fire in registration order (FIFO).
+    def on_request_start(&block)
+      raise ArgumentError, 'block required' unless block
+
+      @before_request_hooks << block
+      block
+    end
+
+    # 2.5-C — register a Proc to fire AFTER `app.call` returns or
+    # raises. Receives `(request, env, response, error)`:
+    #
+    #   * `response` is the `[status, headers, body]` tuple when the
+    #     app returned normally, or `nil` when the app raised.
+    #   * `error` is the `StandardError` the app raised, or `nil` on
+    #     success.
+    #
+    # Use this to finish trace spans, attach response codes to the
+    # active transaction, increment per-route counters, etc. Hook
+    # errors are caught and logged — they never break dispatch.
+    def on_request_end(&block)
+      raise ArgumentError, 'block required' unless block
+
+      @after_request_hooks << block
+      block
+    end
+
+    # 2.5-C — zero-cost guard used by Adapter::Rack#call. When both
+    # arrays are empty (the default — no hooks registered), the
+    # adapter skips the dispatch entirely: no Array iteration, no
+    # Proc invocation, no allocation. The audit harness
+    # (`yjit_alloc_audit_spec`) verifies the per-request alloc count
+    # is unchanged from 2.5-B.
+    def has_request_hooks?
+      !@before_request_hooks.empty? || !@after_request_hooks.empty?
+    end
+
+    # 2.5-C — invoked by Adapter::Rack#call after env is built. Wraps
+    # each hook in a rescue so a misbehaving observer can't break the
+    # dispatch chain — failures are logged with the block's source
+    # location so operators can identify which hook went wrong.
+    def fire_request_start(request, env)
+      @before_request_hooks.each do |hook|
+        hook.call(request, env)
+      rescue StandardError => e
+        log_hook_failure(:before_request, hook, e)
+      end
+      nil
+    end
+
+    # 2.5-C — invoked by Adapter::Rack#call after `app.call` returns
+    # (or raises). `response` is the [status, headers, body] tuple on
+    # success, `nil` on error; `error` is the raised exception or nil.
+    # Same rescue contract as `fire_request_start`: each hook runs
+    # independently; one failure does not prevent later hooks from
+    # firing or the response from being written.
+    def fire_request_end(request, env, response, error)
+      @after_request_hooks.each do |hook|
+        hook.call(request, env, response, error)
+      rescue StandardError => e
+        log_hook_failure(:after_request, hook, e)
+      end
+      nil
+    end
+
+    private
+
+    def log_hook_failure(phase, hook, error)
+      file, line = hook.source_location
+      logger.error do
+        {
+          message: 'request lifecycle hook raised',
+          phase: phase,
+          hook_source: file ? "#{file}:#{line}" : 'unknown',
+          error: error.message,
+          error_class: error.class.name,
+          backtrace: (error.backtrace || []).first(5).join(' | ')
+        }
+      end
     end
   end
 end

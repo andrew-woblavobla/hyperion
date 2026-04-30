@@ -853,7 +853,11 @@ module Hyperion
         if @thread_pool
           @thread_pool.call(@app, request)
         else
-          Hyperion::Adapter::Rack.call(@app, request)
+          # 2.5-C — pass the handler's Runtime so per-request hooks
+          # fire on h2 streams too. Multi-tenant deployments rely on
+          # this to keep tracing context per-server even on the h2
+          # path that doesn't go through Connection#call_app.
+          Hyperion::Adapter::Rack.call(@app, request, runtime: @runtime)
         end
       ensure
         @metrics.decrement(:requests_in_flight)

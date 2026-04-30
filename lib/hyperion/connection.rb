@@ -450,7 +450,12 @@ module Hyperion
         # working at the cost of disabling hijack on those paths.
         @thread_pool.call(app, request)
       else
-        Adapter::Rack.call(app, request, connection: self)
+        # 2.5-C — thread the per-conn Runtime through so request
+        # lifecycle hooks fire against the correct (per-server, in
+        # multi-tenant deployments) observer registry. `@runtime` is
+        # always set by the initializer (either an explicit injection
+        # or `Runtime.default`), so this is a non-nil pass-through.
+        Adapter::Rack.call(app, request, connection: self, runtime: @runtime)
       end
     end
 

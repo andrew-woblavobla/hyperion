@@ -119,6 +119,74 @@ via HYPERION_H2_NATIVE_HPACK=off)` is the explicit-opt-out shape.
 
 Spec count: 893 → 894 (+1 new explicit-opt-out spec). 0 failures, 11 pending.
 
+### 2.5-C — Per-request lifecycle hooks (`Runtime#on_request_start` / `#on_request_end`)
+
+**The user-relevant bit.** Attach NewRelic / AppSignal / DataDog /
+OpenTelemetry agents to Hyperion **without monkey-patching
+`Adapter::Rack#call`**. New first-class API on `Hyperion::Runtime`:
+
+```ruby
+runtime.on_request_start { |request, env| env['otel.span'] = tracer.start_span(request.path) }
+runtime.on_request_end   { |request, env, response, error| env['otel.span'].finish }
+```
+
+The before-hook fires after env is built and before `app.call`. The
+after-hook fires after `app.call` returns or raises, with the
+`[status, headers, body]` response tuple (or `nil` if the app raised)
+plus the raised exception (or `nil` on success). Hooks may stash trace
+context into the env Hash for the after-hook to read back. Multiple
+hooks fire in registration order (FIFO).
+
+**Failure-isolated.** A misbehaving observer (NewRelic agent throwing
+during a hook) is caught and logged with `block.source_location` — the
+dispatch chain continues, subsequent hooks still fire, the response is
+still returned to the client.
+
+**Zero-cost when nothing's registered.** The hot-path guard is a
+single `Array#empty?` check on each side. With no hooks registered,
+`Adapter::Rack#call` short-circuits — no Array iteration, no Proc
+invocation, no allocation. `yjit_alloc_audit_spec` confirms the
+per-request allocation count remains at the 2.5-B baseline (≤10
+objects/req on the full path).
+
+**Per-Server isolation.** The hook registry lives on `Hyperion::Runtime`,
+not on a process-global. Multi-tenant deployments with multiple
+`Hyperion::Server` instances pass a per-tenant `Runtime` and each
+gets its own observer list — no cross-contamination, no global mutex.
+
+**Surface area.**
+- New: `Hyperion::Runtime#on_request_start(&block)` — register a
+  before-hook receiving `(request, env)`.
+- New: `Hyperion::Runtime#on_request_end(&block)` — register an
+  after-hook receiving `(request, env, response, error)`.
+- New: `Hyperion::Runtime#has_request_hooks?` — predicate used by the
+  adapter's hot-path guard. Public-but-internal: callers wiring custom
+  dispatchers can use it for the same zero-cost short-circuit.
+- New: `Hyperion::Runtime#fire_request_start(request, env)` /
+  `#fire_request_end(request, env, response, error)` — invoked by
+  `Adapter::Rack#call`. Public so future adapter implementations
+  (third-party Rack alternatives, custom transports) can fire the
+  same hooks against the user's observer registry.
+- Changed: `Hyperion::Adapter::Rack.call(app, request, connection: nil)`
+  gains a `runtime:` kwarg (default `nil` → `Runtime.default`). Existing
+  call sites (`Connection#call_app`, `Http2Handler`, `ThreadPool`) are
+  updated to pass the per-conn / per-handler runtime through. Apps and
+  third-party callers that never set the kwarg are unaffected.
+
+**Files touched.**
+- `lib/hyperion/runtime.rb` — hook registration + dispatch + failure log.
+- `lib/hyperion/adapter/rack.rb` — `runtime:` kwarg + hot-path guard.
+- `lib/hyperion/connection.rb` — pass `@runtime` through `call_app`.
+- `lib/hyperion/http2_handler.rb` — pass `@runtime` through h2 dispatch.
+- `spec/hyperion/request_lifecycle_hooks_spec.rb` — 13 new examples
+  covering registration API, FIFO order, env-Hash sharing, failure
+  isolation, zero-cost path.
+- `docs/OBSERVABILITY.md` — "Custom request lifecycle hooks" section
+  with NewRelic / AppSignal / OpenTelemetry / DataDog / per-route
+  Prometheus recipes + multi-tenant isolation note.
+
+Spec count: 894 → 907 (+13). 0 failures, 11 pending.
+
 ## [2.4.0] - 2026-04-29
 
 ### Headline
