@@ -1,5 +1,61 @@
 # Changelog
 
+## [Unreleased] - 2.6.0
+
+### 2.6-A — sendfile chunk size 64 KiB → 256 KiB (4× fewer syscalls per 1 MiB)
+
+`Hyperion::Http::Sendfile::USERSPACE_CHUNK` bumped from `64 * 1024`
+to `256 * 1024`.  The constant gates two paths:
+
+  * Per-call cap on the native sendfile(2) loop (`plain_sendfile_loop`)
+    and the splice(2) ladder (`splice_copy_loop`).  Each kernel round
+    now moves up to 256 KiB instead of 64 KiB; a 1 MiB warm-cache
+    static asset moves in 4 kernel rounds vs the legacy 16 — a 4×
+    syscall-count reduction per response.
+  * Chunk size on the userspace `IO.copy_stream` fallback (TLS
+    sockets, hosts where the C ext didn't compile).
+
+64 KiB came from the Linux 2.x-era TCP-send-buffer "sweet spot"
+folklore.  On modern kernels (4.x+) the TCP send buffer auto-tunes
+upward under sustained load and modern NICs+TSO segment 256 KiB-1 MiB
+chunks at line rate.  The reference field — nginx (`sendfile_max_chunk`
+default unlimited, distros ship `2m` overrides), Apache
+(`SendBufferSize` 128k–256k), Caddy (256 KiB hard-coded) — sits at
+256 KiB+; Hyperion now joins.
+
+EAGAIN handling is preserved per chunk: a slow-client socket that
+returns EAGAIN mid-response still surfaces `:eagain` to the Ruby
+façade, which yields the fiber and resumes from the same cursor on
+the next iteration.  Existing 1 MiB / Range-slice / 1-byte / 0-byte
+round-trip integrity tests stay green.  Three new round-trip tests
+land for 4 MiB (multi-chunk), 256 KiB (exactly one chunk), and
+100 KiB (one partial chunk above SMALL_FILE_THRESHOLD).
+
+**Bench delta on openclaw-vm** (Linux 6.x, 1 MiB warm-cache static
+asset, `wrk -t4 -c100 -d20s`, 3 trials, median):
+
+  * 2.5.0 baseline:  1,094 r/s
+  * 2.6-A:           pending bench-rerun on openclaw-vm
+  * Delta:           pending
+
+**Config knob — deliberately not exposed.**  The 256 KiB value is
+the most-likely-good across the field; nginx/Apache/Caddy operators
+don't tune it either, and adding a `sendfile.chunk_bytes` config
+knob would add a Config dependency to a module that today carries
+none.  If a future operator workload demands tuning, the knob can
+be added without breaking compatibility.
+
+### Files touched
+- `lib/hyperion/http/sendfile.rb` — `USERSPACE_CHUNK` constant, chunk
+  cap on `plain_sendfile_loop` + `splice_copy_loop`, doc comment
+  rationale.
+- `spec/hyperion/http_sendfile_spec.rb` — 4 new round-trip tests
+  (4 MiB / 256 KiB / 100 KiB / `USERSPACE_CHUNK == 256 KiB`
+  introspection).
+
+Spec count: 907 → 911 (+4). 0 failures, 11 pending (Linux-only
+splice path skips on macOS).
+
 ## [2.5.0] - 2026-04-29
 
 ### Headline

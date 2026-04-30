@@ -116,6 +116,87 @@ RSpec.describe Hyperion::Http::Sendfile do
     end
   end
 
+  # 2.6-A — sendfile chunk size 64 KiB → 256 KiB (4× fewer syscalls
+  # per 1 MiB response).  Round-trip a 4 MiB / 256 KiB / 100 KiB
+  # payload through the production hot path and assert byte-equality.
+  # The 4 MiB file deliberately exceeds 4× the new chunk so the
+  # native loop fires multiple kernel-call rounds; the 256 KiB file
+  # rides exactly one round; the 100 KiB file sits below one chunk
+  # but above SMALL_FILE_THRESHOLD so it still routes through the
+  # streaming path (not the small-file synchronous fast path).
+  describe '2.6-A — chunk-size round-trip (4 MiB / 256 KiB / 100 KiB)' do
+    it 'round-trips a 4 MiB file byte-equal across multiple chunks' do
+      size = 4 * 1024 * 1024
+      bytes = (0..255).map(&:chr).join.b * (size / 256)
+      f = Tempfile.new(%w[hy-sf-4m .bin]).tap do |t|
+        t.binmode
+        t.write(bytes)
+        t.flush
+        t.rewind
+      end
+      begin
+        with_socket_pair(size) do |client, reader|
+          written = described_class.copy_to_socket(client, f, 0, size)
+          client.close
+          expect(written).to eq(size)
+          expect(reader.value.bytesize).to eq(size)
+          expect(reader.value).to eq(bytes)
+        end
+      ensure
+        f.close!
+      end
+    end
+
+    it 'round-trips a 256 KiB file byte-equal in a single chunk' do
+      size = 256 * 1024
+      bytes = (0..255).map(&:chr).join.b * (size / 256)
+      f = Tempfile.new(%w[hy-sf-256k .bin]).tap do |t|
+        t.binmode
+        t.write(bytes)
+        t.flush
+        t.rewind
+      end
+      begin
+        with_socket_pair(size) do |client, reader|
+          written = described_class.copy_to_socket(client, f, 0, size)
+          client.close
+          expect(written).to eq(size)
+          expect(reader.value).to eq(bytes)
+        end
+      ensure
+        f.close!
+      end
+    end
+
+    it 'round-trips a 100 KiB file byte-equal in a single partial chunk' do
+      # 100 KiB is above SMALL_FILE_THRESHOLD (64 KiB) so it routes
+      # through the streaming path, but below USERSPACE_CHUNK
+      # (256 KiB) so the kernel handles it in one sendfile round.
+      size = 100 * 1024
+      bytes = (0..255).map(&:chr).join.b * (size / 256) + ('Z' * (size % 256)).b
+      f = Tempfile.new(%w[hy-sf-100k .bin]).tap do |t|
+        t.binmode
+        t.write(bytes)
+        t.flush
+        t.rewind
+      end
+      begin
+        with_socket_pair(size) do |client, reader|
+          written = described_class.copy_to_socket(client, f, 0, size)
+          client.close
+          expect(written).to eq(size)
+          expect(reader.value).to eq(bytes)
+        end
+      ensure
+        f.close!
+      end
+    end
+
+    it 'exposes USERSPACE_CHUNK = 256 KiB' do
+      expect(described_class::USERSPACE_CHUNK).to eq(256 * 1024)
+    end
+  end
+
   describe 'EAGAIN / fiber-yield correctness' do
     # Fake out_io that returns :eagain once then accepts the rest.
     # Verifies the loop yields (calls wait_writable) and resumes from the

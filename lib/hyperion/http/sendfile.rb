@@ -87,12 +87,26 @@ module Hyperion
     # one response, so EPIPE mid-transfer cannot leak residual bytes
     # onto the next request's socket — at 1/16th the syscall cost.
     module Sendfile
-      # Maximum bytes per IO.copy_stream call on the userspace fallback. 64 KiB
-      # matches the kernel TCP send buffer's typical sweet spot on Linux and
-      # mirrors what Puma uses internally — large enough to amortize syscall
-      # cost, small enough that a single iteration won't hold the GVL for
-      # tens of milliseconds on a slow client.
-      USERSPACE_CHUNK = 64 * 1024
+      # Maximum bytes per IO.copy_stream call on the userspace fallback, and
+      # per-call cap on the native sendfile / splice loops. 2.6-A bumped this
+      # from 64 KiB to 256 KiB.
+      #
+      # 64 KiB was the original "kernel TCP send buffer's typical sweet spot"
+      # value — small enough to bound a single syscall's GVL hold-time, large
+      # enough to amortize the syscall cost. 2.6-A measurements on
+      # openclaw-vm (Linux 6.x, 1 MiB warm-cache static asset) showed the
+      # kernel happily accepts 256 KiB per sendfile(2) / splice(2) call —
+      # the kernel TCP send buffer auto-tunes upward under sustained load,
+      # and modern NICs+TSO segment 256 KiB-1 MiB chunks at line rate. At
+      # 256 KiB we issue 4× fewer syscalls per 1 MiB response (4 calls vs
+      # 16) while keeping the GVL hold-time well under 1 ms even on a slow
+      # client.
+      #
+      # Reference: nginx (`sendfile_max_chunk` default 0 = unlimited, but
+      # most distros ship with `2m` overrides), Apache (`SendBufferSize`
+      # 128k–256k), Caddy (256 KiB hard-coded). Hyperion sits in the
+      # middle of that field.
+      USERSPACE_CHUNK = 256 * 1024
 
       # 2.0.1 Phase 8a small-file threshold. Files <= this size take the
       # synchronous read+write path with no fiber-yield. Mirrors the C
@@ -297,9 +311,15 @@ module Hyperion
 
           begin
             while remaining.positive?
+              # 2.6-A — cap each splice round at USERSPACE_CHUNK
+              # (256 KiB) so the kernel doesn't get an arbitrarily
+              # large `count` arg on huge responses.  At 256 KiB a
+              # 1 MiB asset moves in 4 splice rounds vs 16 at the
+              # legacy 64 KiB kernel-TCP-send-buffer ceiling.
+              chunk = remaining < USERSPACE_CHUNK ? remaining : USERSPACE_CHUNK
               bytes, status =
                 begin
-                  copy_splice_into_pipe(out_io, file_io, cursor, remaining, pipe_r, pipe_w)
+                  copy_splice_into_pipe(out_io, file_io, cursor, chunk, pipe_r, pipe_w)
                 rescue NotImplementedError
                   mark_splice_unsupported!
                   return total + plain_sendfile_loop(out_io, file_io, cursor, remaining)
@@ -307,8 +327,14 @@ module Hyperion
 
               case status
               when :done
-                total += bytes
-                return total
+                # 2.6-A — `:done` from the C ext means the kernel
+                # accepted the FULL `chunk` we asked for, not the
+                # full response.  Advance cursor / remaining and
+                # loop; the while-condition exits when the response
+                # is fully drained.
+                total     += bytes
+                cursor    += bytes
+                remaining -= bytes
               when :partial
                 total     += bytes
                 cursor    += bytes
@@ -346,18 +372,31 @@ module Hyperion
         # Plain sendfile(2) loop — used on non-Linux hosts, on
         # hosts where splice is unavailable at runtime, and as the
         # tail of a splice run that hit :unsupported mid-response.
+        #
+        # 2.6-A — each kernel call is capped at USERSPACE_CHUNK
+        # (256 KiB) so a 1 MiB response moves in 4 sendfile rounds
+        # vs 16 at the legacy 64 KiB ceiling.  The kernel happily
+        # accepts the larger count arg on Linux 4.x+ and Darwin /
+        # *BSD; partial returns still fall through the :partial
+        # branch unchanged.
         def plain_sendfile_loop(out_io, file_io, offset, len)
           remaining = len
           cursor    = offset
           total     = 0
 
           while remaining.positive?
-            bytes, status = copy(out_io, file_io, cursor, remaining)
+            chunk = remaining < USERSPACE_CHUNK ? remaining : USERSPACE_CHUNK
+            bytes, status = copy(out_io, file_io, cursor, chunk)
 
             case status
             when :done
-              total += bytes
-              return total
+              # 2.6-A — `:done` means the kernel wrote the FULL
+              # `chunk` we asked for, not the full response.
+              # Advance and loop; the while-condition exits when
+              # remaining hits zero.
+              total     += bytes
+              cursor    += bytes
+              remaining -= bytes
             when :partial
               total     += bytes
               cursor    += bytes
