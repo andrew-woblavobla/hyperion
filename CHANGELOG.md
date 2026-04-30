@@ -1,5 +1,36 @@
 # Changelog
 
+## [Unreleased] - 2.5.0
+
+### 2.5-A — WebSocket close-payload validation (RFC 6455 §7.4.1 + §5.5.1)
+
+**The fix.** `Hyperion::WebSocket::Connection#recv` now validates the
+peer's close code against the IANA close-code registry. Codes outside
+the wire-allowed ranges (1000–1003, 1007–1015, 3000–3999, 4000–4999)
+get a 1002 (Protocol Error) response back instead of being echoed.
+Synthetic codes (1005 "No Status Received", 1006 "Abnormal Closure")
+that MUST NOT appear on the wire are rejected with 1002. The reserved
+1016–2999 range is rejected with 1002. A 1-byte close payload (status
+code can't fit) is rejected with 1002. A close reason whose bytes are
+not valid UTF-8 is rejected with 1007 (Invalid Frame Payload Data) per
+RFC 6455 §8.1. An empty close payload (no status, no reason) is
+explicitly permitted per §5.5.1 and gets a 1000 Normal close response.
+
+**Surface area.** New module `Hyperion::WebSocket::CloseCodes` exposes
+`.validate(code) → Symbol` and `.invalid?(code) → Boolean` for any
+caller that wants to apply the same RFC 6455 §7.4.1 ranges (e.g.
+ActionCable adapters, custom WS gateways).
+
+**Why it matters.** 2.4-D's autobahn-testsuite run scored 453/463
+(97.8%) with all 10 failures in section 7.5.1 + 7.9.x — the close-code
+validation gap. 2.5-A closes that gap.
+
+**Autobahn pass: 453/463 → 463/463 (100% on non-perf cases).**
+Section 7 alone: 27/37 → 37/37.
+
+Spec count: 823 (2.4.0) → 893 (+70 in `websocket_close_validation_spec.rb`).
+0 failures, 11 pending.
+
 ## [2.4.0] - 2026-04-29
 
 ### Headline
@@ -23,7 +54,7 @@ New operator visibility:
 - Operator playbook at `docs/OBSERVABILITY.md`
 
 ### Known limitations carried forward to 2.5
-- WebSocket close-payload validation: 10 autobahn cases in section 7.5.1 + 7.9.x fail because `Connection#recv` echoes invalid peer close codes instead of rejecting with 1002 (Protocol Error). Documented in `docs/WEBSOCKETS.md`.
+- WebSocket close-payload validation: 10 autobahn cases in section 7.5.1 + 7.9.x fail because `Connection#recv` echoes invalid peer close codes instead of rejecting with 1002 (Protocol Error). Documented in `docs/WEBSOCKETS.md`. **Resolved in 2.5-A — see Unreleased section above.**
 
 ### 2.4-A — HPACK FFI round-2 (custom C ext, no Fiddle per call)
 

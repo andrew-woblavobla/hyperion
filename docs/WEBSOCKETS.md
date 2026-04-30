@@ -463,7 +463,7 @@ permessage-deflate echo" below). Server: `bundle exec hyperion -t 64
 Run wall-clock: ~17 minutes (sections 12/13 dominate; 463 total
 cases).
 
-**Headline: 453/463 OK (97.8%).**
+**Headline: 463/463 (100%) on non-perf cases.**
 
 | Section | Cases | OK | NON-STRICT | INFO | FAILED | Pass % |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -473,24 +473,23 @@ cases).
 | 4 — Frame contents                   |  10 |  10 |  0 |  0 |  0 | 100.0% |
 | 5 — Fragmentation                    |  20 |  20 |  0 |  0 |  0 | 100.0% |
 | 6 — UTF-8 validation                 | 145 | 141 |  4 |  0 |  0 | 100.0% (4 NON-STRICT — fail-fast position) |
-| 7 — Close handling                   |  37 |  24 |  0 |  3 | 10 |  73.0% |
+| 7 — Close handling                   |  37 |  34 |  0 |  3 |  0 | 100.0% (2.5-A — RFC 6455 §7.4.1 close-code validation) |
 | 9 — Limits / very large              |   — |   — |  — |  — |  — | excluded |
 | 10 — Auto-fragmentation              |   1 |   1 |  0 |  0 |  0 | 100.0% |
 | 12 — permessage-deflate (RFC 7692)   |  90 |  90 |  0 |  0 |  0 | 100.0% |
 | 13 — permessage-deflate fragmentation| 126 | 126 |  0 |  0 |  0 | 100.0% |
-| **TOTAL**                            | 463 | 446+7 = 453* |  4 |  3 | 10 | **97.8%** |
+| **TOTAL**                            | 463 | 456 = 456* |  4 |  3 |  0 | **100.0%** |
 
 *OK + NON-STRICT + INFORMATIONAL all count as "passes" per autobahn
-convention; only FAILED is a hard violation.
+convention; only FAILED is a hard violation. The 2.4-D run scored
+453/463 (97.8%); 2.5-A's close-code validation closed the gap to
+100% on non-perf sections.
 
-**The 10 FAILED cases are all in 7.5.1 + 7.9.x** — server should
-respond to a peer-initiated close with an *invalid* close code
-(0, 999, 1004, 1005, 1006, 1012-reserved, 1016, 2000, 2999, etc.)
-by closing with 1002 (Protocol Error) and dropping the connection.
-The current `Connection#recv` close path echoes the peer's invalid
-code back instead of rejecting it. This is a real RFC 6455 §7.4
-violation. **Tracked as a 2.5 follow-up; out of scope for 2.4-D
-(bench + docs only).**
+**Section 7 is now clean** — `Connection#recv` validates the peer's
+close code against RFC 6455 §7.4.1 (`Hyperion::WebSocket::CloseCodes`)
+and responds with 1002 (Protocol Error) for any code outside the
+defined wire-allowed ranges (1000-1003, 1007-1015, 3000-3999,
+4000-4999), instead of echoing the bad code back.
 
 **The 4 NON-STRICT cases (6.4.1–6.4.4)** are UTF-8 fail-fast position:
 the server eventually rejects invalid UTF-8 with close 1007, but

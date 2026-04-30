@@ -2,6 +2,7 @@
 
 require 'zlib'
 require_relative 'frame'
+require_relative 'close_codes'
 
 module Hyperion
   # WS-4 (2.1.0) — per-connection WebSocket wrapper.
@@ -407,19 +408,24 @@ module Hyperion
         @on_pong&.call(frame.payload)
       end
 
-      # Decode the close frame body — RFC 6455 §5.5.1 — and return
-      # `[:close, code, reason]`. Echoes a close back if we haven't
-      # initiated one already, then leaves the socket alive for the
-      # caller to call `close` (which is a no-op once @state moves to
-      # :closing). Subsequent recv raises StateError.
+      # Decode the close frame body — RFC 6455 §5.5.1 + §7.4.1 — and
+      # return `[:close, code, reason]`. The peer's code is validated
+      # against the IANA close-code registry; an invalid code (out of
+      # range, reserved, or synthetic-only) gets a 1002 (Protocol
+      # Error) response back, NOT an echo. An invalid-UTF-8 reason
+      # gets a 1007 (Invalid Frame Payload Data) response. A 1-byte
+      # payload (status code can't fit) gets a 1002.
+      #
+      # Either way the socket moves to :closing and `recv` returns
+      # the [:close, ...] tuple; the caller's next recv raises StateError.
       def handle_close_frame(frame)
-        code, reason = parse_close_payload(frame.payload)
+        verdict, code, reason = parse_and_validate_close(frame.payload)
         @close_code = code
         @close_reason = reason
 
         if @state == :open
-          # Echo the close back to the peer (RFC §5.5.1).
-          send_close_frame(code || CLOSE_NORMAL, '')
+          response_code, response_reason = close_response_for(verdict, code, reason)
+          send_close_frame(response_code, response_reason)
           @state = :closing
         end
         @on_close&.call(code, reason)
@@ -428,17 +434,64 @@ module Hyperion
         [:close, code, reason]
       end
 
-      def parse_close_payload(payload)
+      # Returns [verdict, code, reason] where verdict is one of:
+      #   :ok                  — clean close, echo peer's code back
+      #   :payload_too_short   — 1-byte payload (status code can't fit) → 1002
+      #   :invalid_utf8        — reason bytes are not valid UTF-8     → 1007
+      #   :invalid_code        — close code outside any defined range  → 1002
+      #   :reserved            — close code in IETF reserved range     → 1002
+      #   :no_status_on_wire   — close code is 1005 / 1006             → 1002
+      #
+      # `code` is the peer-supplied integer (or nil for an empty
+      # payload, which is the "no status, no reason" graceful close
+      # explicitly permitted by RFC 6455 §5.5.1) and `reason` is the
+      # decoded text (scrubbed if it wasn't valid UTF-8).
+      def parse_and_validate_close(payload)
         bin = payload.b
-        return [nil, nil] if bin.bytesize.zero?
-        return [CLOSE_PROTOCOL_ERROR, ''] if bin.bytesize == 1
+        return [:ok, nil, nil] if bin.bytesize.zero?
+        return [:payload_too_short, nil, ''] if bin.bytesize == 1
 
         code = (bin.getbyte(0) << 8) | bin.getbyte(1)
-        reason = bin.bytesize > 2 ? bin.byteslice(2, bin.bytesize - 2).force_encoding(Encoding::UTF_8) : ''
-        # If reason isn't valid UTF-8 leave the bytes as-is — the
-        # caller can do their own decoding; we don't want to swallow
-        # information in a debugging path.
-        reason = reason.scrub('?') unless reason.valid_encoding?
+        reason_bytes = bin.bytesize > 2 ? bin.byteslice(2, bin.bytesize - 2) : ''.b
+        reason = reason_bytes.dup.force_encoding(Encoding::UTF_8)
+
+        unless reason.valid_encoding?
+          # RFC 6455 §8.1 — reason text must be valid UTF-8. Surface
+          # the scrubbed reason for `@close_reason`/`on_close` so the
+          # operator can still read it; the on-wire response is 1007.
+          return [:invalid_utf8, code, reason.scrub('?')]
+        end
+
+        case Hyperion::WebSocket::CloseCodes.validate(code)
+        when :ok                then [:ok, code, reason]
+        when :no_status_on_wire then [:no_status_on_wire, code, reason]
+        when :reserved          then [:reserved, code, reason]
+        else                         [:invalid_code, code, reason]
+        end
+      end
+
+      # Map a parse-and-validate verdict onto the close-frame we send back.
+      # For :ok we echo the peer's code (and an empty reason — the spec
+      # doesn't require us to echo their reason text); everything else
+      # is a protocol-violation response.
+      def close_response_for(verdict, code, _reason)
+        case verdict
+        when :ok                then [code || CLOSE_NORMAL, '']
+        when :invalid_utf8      then [CLOSE_INVALID_PAYLOAD, 'invalid utf-8 in close reason']
+        when :invalid_code      then [CLOSE_PROTOCOL_ERROR, 'invalid close code']
+        when :reserved          then [CLOSE_PROTOCOL_ERROR, 'reserved close code']
+        when :no_status_on_wire then [CLOSE_PROTOCOL_ERROR, 'close code MUST NOT appear on wire']
+        when :payload_too_short then [CLOSE_PROTOCOL_ERROR, 'close payload < 2 bytes']
+        else                         [CLOSE_PROTOCOL_ERROR, 'invalid close frame']
+        end
+      end
+
+      # Legacy shim retained for `drain_for_close` — the drain path only
+      # cares about the (code, reason) pair so it can stash them on
+      # `@close_code` / `@close_reason`. Validation is irrelevant during
+      # drain since we're already mid-close.
+      def parse_close_payload(payload)
+        _, code, reason = parse_and_validate_close(payload)
         [code, reason]
       end
 
