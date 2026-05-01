@@ -27,6 +27,16 @@ module Hyperion
     #   PageCache.content_type(path)     -> String|nil  (specs helper)
     #   PageCache.auto_threshold         -> Integer
     #   PageCache.max_key_len            -> Integer
+    #   PageCache.register_prebuilt(path, response_bytes, body_len) -> Integer
+    #     (2.10-F) — register a prebuilt HTTP/1.1 response under a route
+    #     path (no on-disk file). `body_len` tells `serve_request` where
+    #     the body starts so HEAD requests can write headers-only.
+    #   PageCache.serve_request(socket, method, path) -> [:ok, n] | :miss
+    #     (2.10-F) — fold the matched-route hot path into C: hash lookup,
+    #     write the prebuilt response (HEAD = headers only), GVL released
+    #     during the write() syscall. Method gate: only GET and HEAD are
+    #     eligible; anything else returns :miss so the Ruby caller can
+    #     fall back to its non-cache path.
     #
     # This Ruby file extends the surface with composite helpers that
     # are easier to express above the C boundary:

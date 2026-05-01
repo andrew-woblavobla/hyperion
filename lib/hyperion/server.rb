@@ -116,10 +116,29 @@ module Hyperion
       buffer = (head + body).freeze
 
       method_key = method_sym.to_s.upcase.to_sym
-      entry = RouteTable::StaticEntry.new(method_key, path.dup.freeze, buffer).freeze
-      # The handler closure returns the StaticEntry so the
-      # Connection dispatcher can branch on `is_a?(StaticEntry)`.
-      route_table.register(method_sym, path, ->(_request) { entry })
+      # 2.10-F — record the headers prefix length on the StaticEntry
+      # struct so HEAD-method writes can serve a headers-only prefix.
+      entry = RouteTable::StaticEntry.new(method_key, path.dup.freeze, buffer, head.bytesize).freeze
+      # 2.10-F — register the entry DIRECTLY (StaticEntry responds to
+      # `#call`) instead of wrapping it in a closure, so the dispatch
+      # path can branch on `is_a?(StaticEntry)` BEFORE invoking the
+      # handler — that's what unlocks the C-ext fast path.
+      route_table.register(method_sym, path, entry)
+      # 2.10-F — also register HEAD for any GET registration.  HTTP
+      # mandates HEAD-on-a-GET-resource, and the C fast path strips
+      # the body bytes for HEAD requests inside `serve_request`.
+      # Idiomatic for static-asset routes (every CDN-shaped GET URL
+      # MUST also answer HEAD with the same headers).  No-op on a
+      # POST/PUT/etc. registration — those don't get a HEAD twin.
+      route_table.register(:HEAD, path, entry) if method_key == :GET
+      # 2.10-F — fold the prebuilt response into the C-side PageCache so
+      # `PageCache.serve_request` can write it without ever crossing
+      # back into Ruby.  Best-effort: if the C ext isn't available
+      # (JRuby / TruffleRuby), the dispatcher silently falls back to
+      # the Ruby `socket.write` path that's been there since 2.10-D.
+      if defined?(::Hyperion::Http::PageCache) && ::Hyperion::Http::PageCache.respond_to?(:register_prebuilt)
+        ::Hyperion::Http::PageCache.register_prebuilt(path, buffer, body.bytesize)
+      end
       entry
     end
 

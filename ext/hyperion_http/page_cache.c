@@ -117,6 +117,12 @@ static ID id_to_io_pc;
 static VALUE sym_ok_pc;
 static VALUE sym_stale_pc;
 static VALUE sym_missing_pc;
+/* 2.10-F — sentinel returned by `serve_request` when the path/method
+ * tuple isn't a hit. Distinct from `:missing` so the Ruby caller can
+ * tell "not in cache" (Rack-fallback) apart from "in cache but not
+ * cached for this method" (also Rack-fallback, same outcome — but the
+ * symbol is `:miss` so logs / metrics can tell them apart). */
+static VALUE sym_miss_pc;
 
 #define HYP_PC_BUCKET_SIZE 1024u
 #define HYP_PC_BUCKET_MASK (HYP_PC_BUCKET_SIZE - 1u)
@@ -132,9 +138,16 @@ typedef struct hyp_page_s {
     char    *response_buf;  /* pre-built HTTP/1.1 response, heap-owned */
     size_t   response_len;
     size_t   body_len;      /* informational; body bytes only */
-    time_t   mtime;         /* last-known file mtime */
+    size_t   headers_len;   /* headers-only span (for HEAD writes) =
+                             * response_len - body_len for cache_file
+                             * entries; explicit for register_prebuilt
+                             * entries that may carry a chunked body. */
+    time_t   mtime;         /* last-known file mtime; 0 for register_prebuilt */
     double   last_check;    /* dtime() of last stat */
     int      immutable;     /* non-zero → never re-stat */
+    int      prebuilt;      /* 1 = registered via register_prebuilt
+                             * (no on-disk file backing — never re-stat,
+                             * never invalidate on missing file). */
     char    *content_type;  /* heap-owned, picked at insert time */
 } hyp_page_t;
 
@@ -425,9 +438,11 @@ static hyp_page_t *hyp_pc_alloc_page(const char *path, size_t path_len,
     }
     p->response_len = resp_len;
     p->body_len     = body_len;
+    p->headers_len  = (resp_len >= body_len) ? (resp_len - body_len) : resp_len;
     p->mtime        = mtime;
     p->last_check   = hyp_pc_now();
     p->immutable    = 0;
+    p->prebuilt     = 0;
     return p;
 }
 
@@ -478,7 +493,7 @@ static hyp_page_slot_t *hyp_pc_lookup_locked(const char *path, size_t path_len,
         return NULL;
     }
     hyp_page_t *p = slot->page;
-    if (p->immutable) {
+    if (p->immutable || p->prebuilt) {
         if (was_stale) *was_stale = 0;
         return slot;
     }
@@ -527,6 +542,7 @@ static hyp_page_slot_t *hyp_pc_lookup_locked(const char *path, size_t path_len,
     p->response_buf = new_resp;
     p->response_len = new_resp_len;
     p->body_len     = new_body_len;
+    p->headers_len  = (new_resp_len >= new_body_len) ? (new_resp_len - new_body_len) : new_resp_len;
     p->mtime        = new_mtime;
     p->last_check   = now;
     if (was_stale) *was_stale = 1;
@@ -692,6 +708,207 @@ static VALUE rb_pc_write_to(VALUE self, VALUE socket_io, VALUE rb_path) {
         rb_sys_fail("Hyperion::Http::PageCache.write_to");
     }
     return SSIZET2NUM(args.total);
+}
+
+/* PageCache.register_prebuilt(path, response_bytes, body_len) -> Integer
+ *
+ * 2.10-F — register a fully prebuilt HTTP response under a route path
+ * (e.g. `/health`).  Unlike `cache_file`, the entry has NO on-disk
+ * backing — `serve_request` looks it up directly and writes the
+ * stored bytes.  `body_len` tells `serve_request` where the body
+ * starts inside `response_bytes` so HEAD requests can write the
+ * headers-only prefix.
+ *
+ * `response_bytes.bytesize` MUST be >= `body_len`.  Returns the
+ * stored response byte count on success.
+ *
+ * Used by `Hyperion::Server.handle_static` to fold the prebuilt
+ * static-route response into the C fast path so the request hot
+ * path is one hash lookup + one `write()` syscall, fully outside
+ * Ruby method dispatch. */
+static VALUE rb_pc_register_prebuilt(VALUE self, VALUE rb_path,
+                                     VALUE rb_response, VALUE rb_body_len) {
+    (void)self;
+    Check_Type(rb_path, T_STRING);
+    Check_Type(rb_response, T_STRING);
+
+    const char *path     = RSTRING_PTR(rb_path);
+    size_t      path_len = (size_t)RSTRING_LEN(rb_path);
+    if (path_len == 0 || path_len > HYP_PC_MAX_KEY_LEN) {
+        rb_raise(rb_eArgError, "Hyperion::Http::PageCache.register_prebuilt: "
+                 "path empty or > %d bytes", HYP_PC_MAX_KEY_LEN);
+    }
+    const char *resp_buf = RSTRING_PTR(rb_response);
+    size_t      resp_len = (size_t)RSTRING_LEN(rb_response);
+    long        body_len_signed = NUM2LONG(rb_body_len);
+    if (body_len_signed < 0) {
+        rb_raise(rb_eArgError, "body_len must be >= 0");
+    }
+    size_t      body_len = (size_t)body_len_signed;
+    if (body_len > resp_len) {
+        rb_raise(rb_eArgError,
+                 "body_len (%zu) must be <= response_bytes.bytesize (%zu)",
+                 body_len, resp_len);
+    }
+
+    hyp_page_t *page = (hyp_page_t *)calloc(1, sizeof(*page));
+    if (page == NULL) {
+        rb_raise(rb_eNoMemError, "register_prebuilt: page alloc");
+    }
+    page->path = (char *)malloc(path_len + 1);
+    if (page->path == NULL) {
+        free(page);
+        rb_raise(rb_eNoMemError, "register_prebuilt: path alloc");
+    }
+    memcpy(page->path, path, path_len);
+    page->path[path_len] = '\0';
+    page->path_len = path_len;
+
+    /* For prebuilt entries we don't attempt mime sniffing — the
+     * caller already baked Content-Type into the response.  Stash a
+     * placeholder so response_bytes() / content_type() helpers stay
+     * functional. */
+    page->content_type = strdup("__prebuilt__");
+    if (page->content_type == NULL) {
+        free(page->path);
+        free(page);
+        rb_raise(rb_eNoMemError, "register_prebuilt: content_type alloc");
+    }
+
+    page->response_buf = (char *)malloc(resp_len);
+    if (page->response_buf == NULL) {
+        free(page->content_type);
+        free(page->path);
+        free(page);
+        rb_raise(rb_eNoMemError, "register_prebuilt: response alloc (%zu bytes)",
+                 resp_len);
+    }
+    memcpy(page->response_buf, resp_buf, resp_len);
+    page->response_len = resp_len;
+    page->body_len     = body_len;
+    page->headers_len  = resp_len - body_len;
+    page->mtime        = 0;
+    page->last_check   = hyp_pc_now();
+    page->immutable    = 1;
+    page->prebuilt     = 1;
+
+    uint64_t h = hyp_pc_hash(path, path_len);
+    pthread_mutex_lock(&hyp_pc_lock);
+    hyp_pc_insert_locked(page, h);
+    pthread_mutex_unlock(&hyp_pc_lock);
+
+    return SIZET2NUM(resp_len);
+}
+
+/* 2.10-F — fast-path lookup-and-write.
+ *
+ * Method gate: only GET and HEAD are eligible.  Anything else returns
+ * `:miss` so the Ruby caller falls through to its non-cache path.
+ * Comparison is case-insensitive against ASCII bytes (the request
+ * line method is parsed verbatim, so callers that already canonical-
+ * cased their method gain a single fast path).
+ *
+ * Returns:
+ *   * `[:ok, bytes_written]` — hit, response (or headers-only on HEAD)
+ *     was written in full.
+ *   * `:miss` — no match (path absent, method not GET/HEAD, or
+ *     boundary-case empty/oversized path).
+ *
+ * Concurrency: the C lock is held just long enough to snapshot the
+ * response bytes onto the heap; the actual `write()` runs without the
+ * GVL via `rb_thread_call_without_gvl`. */
+typedef enum {
+    HYP_PC_METHOD_OTHER = 0,
+    HYP_PC_METHOD_GET   = 1,
+    HYP_PC_METHOD_HEAD  = 2
+} hyp_pc_method_t;
+
+static hyp_pc_method_t hyp_pc_classify_method(const char *m, size_t len) {
+    if (len == 3 &&
+        (m[0] == 'G' || m[0] == 'g') &&
+        (m[1] == 'E' || m[1] == 'e') &&
+        (m[2] == 'T' || m[2] == 't')) {
+        return HYP_PC_METHOD_GET;
+    }
+    if (len == 4 &&
+        (m[0] == 'H' || m[0] == 'h') &&
+        (m[1] == 'E' || m[1] == 'e') &&
+        (m[2] == 'A' || m[2] == 'a') &&
+        (m[3] == 'D' || m[3] == 'd')) {
+        return HYP_PC_METHOD_HEAD;
+    }
+    return HYP_PC_METHOD_OTHER;
+}
+
+static VALUE rb_pc_serve_request(VALUE self, VALUE socket_io,
+                                 VALUE rb_method, VALUE rb_path) {
+    (void)self;
+    Check_Type(rb_method, T_STRING);
+    Check_Type(rb_path,   T_STRING);
+
+    const char *method   = RSTRING_PTR(rb_method);
+    size_t      mlen     = (size_t)RSTRING_LEN(rb_method);
+    hyp_pc_method_t kind = hyp_pc_classify_method(method, mlen);
+    if (kind == HYP_PC_METHOD_OTHER) {
+        return sym_miss_pc;
+    }
+
+    const char *path     = RSTRING_PTR(rb_path);
+    size_t      path_len = (size_t)RSTRING_LEN(rb_path);
+    if (path_len == 0 || path_len > HYP_PC_MAX_KEY_LEN) {
+        return sym_miss_pc;
+    }
+
+    /* Resolve the fd up front — extract_fd may raise, and we want
+     * the raise to happen BEFORE we acquire the C lock or allocate. */
+    int fd = hyp_pc_extract_fd(socket_io, "socket_io");
+
+    pthread_mutex_lock(&hyp_pc_lock);
+    int was_stale = 0;
+    hyp_page_slot_t *slot = hyp_pc_lookup_locked(path, path_len, &was_stale);
+    if (slot == NULL) {
+        pthread_mutex_unlock(&hyp_pc_lock);
+        return sym_miss_pc;
+    }
+    /* HEAD writes only the headers prefix; GET writes the full
+     * response.  Snapshot under the lock so a concurrent eviction
+     * can't free the source buffer mid-write. */
+    size_t write_len = (kind == HYP_PC_METHOD_HEAD)
+                           ? slot->page->headers_len
+                           : slot->page->response_len;
+    char  *snapshot  = (char *)malloc(write_len);
+    if (snapshot == NULL) {
+        pthread_mutex_unlock(&hyp_pc_lock);
+        rb_raise(rb_eNoMemError, "Hyperion::Http::PageCache.serve_request: "
+                 "snapshot alloc (%zu bytes)", write_len);
+    }
+    memcpy(snapshot, slot->page->response_buf, write_len);
+    pthread_mutex_unlock(&hyp_pc_lock);
+
+    hyp_pc_write_args_t args;
+    args.fd    = fd;
+    args.buf   = snapshot;
+    args.len   = write_len;
+    args.total = 0;
+    args.err   = 0;
+
+    rb_thread_call_without_gvl(hyp_pc_write_blocking, &args, RUBY_UBF_IO, NULL);
+
+    free(snapshot);
+
+    if (args.err != 0 && args.total == 0) {
+        errno = args.err;
+        rb_sys_fail("Hyperion::Http::PageCache.serve_request");
+    }
+
+    /* Build the [:ok, bytes_written] return tuple.  Two-element
+     * Array allocation is the only Ruby-level allocation on this
+     * path (the integer auto-fixnums for any reasonable response
+     * size). */
+    VALUE result = rb_ary_new_capa(2);
+    rb_ary_push(result, sym_ok_pc);
+    rb_ary_push(result, SSIZET2NUM(args.total));
+    return result;
 }
 
 /* PageCache.set_immutable(path, bool) -> bool */
@@ -888,6 +1105,10 @@ void Init_hyperion_page_cache(void) {
                                rb_pc_auto_threshold, 0);
     rb_define_singleton_method(rb_mHyperionHttpPageCache, "max_key_len",
                                rb_pc_max_key_len, 0);
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "register_prebuilt",
+                               rb_pc_register_prebuilt, 3);
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "serve_request",
+                               rb_pc_serve_request, 3);
 
     id_fileno_pc = rb_intern("fileno");
     id_to_io_pc  = rb_intern("to_io");
@@ -895,8 +1116,10 @@ void Init_hyperion_page_cache(void) {
     sym_ok_pc      = ID2SYM(rb_intern("ok"));
     sym_stale_pc   = ID2SYM(rb_intern("stale"));
     sym_missing_pc = ID2SYM(rb_intern("missing"));
+    sym_miss_pc    = ID2SYM(rb_intern("miss"));
 
     rb_gc_register_mark_object(sym_ok_pc);
     rb_gc_register_mark_object(sym_stale_pc);
     rb_gc_register_mark_object(sym_missing_pc);
+    rb_gc_register_mark_object(sym_miss_pc);
 }

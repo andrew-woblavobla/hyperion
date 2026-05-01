@@ -48,11 +48,41 @@ module Hyperion
       # `[status, headers, body]` shape contract visible while
       # giving the dispatcher a single `is_a?` branch to engage the
       # one-syscall fast path.
-      StaticEntry = Struct.new(:method, :path, :buffer) do
+      # 2.10-F adds `headers_len` so the C fast path
+      # (`PageCache.serve_request`) can write the headers-only prefix
+      # for HEAD requests without reparsing the buffer.  Defaults to
+      # `buffer.bytesize` for back-compat with callers that
+      # constructed StaticEntry the 2.10-D way (3 args, no body
+      # split) — those entries fall back to writing the whole buffer
+      # on HEAD too, which is RFC-correct (HEAD MAY include the body
+      # so long as Content-Length matches; the spec only forbids the
+      # SERVER from sending body bytes the client didn't ask for).
+      StaticEntry = Struct.new(:method, :path, :buffer, :headers_len) do
         # Returns the pre-built response bytes ready for one
         # `socket.write` call.  Always frozen.
         def response_bytes
           buffer
+        end
+
+        # 2.10-F — StaticEntry responds to `#call` so it can be
+        # registered directly in the route table (instead of via a
+        # closure wrapping it).  Returning `self` keeps the
+        # `[status, headers, body]` contract: `dispatch_direct!`'s
+        # is_a?(StaticEntry) branch handles the wire write.  Pre-
+        # 2.10-F callers that registered via
+        # `Server.handle_static` still work — that registration
+        # path now stores the entry directly and the route table's
+        # `respond_to?(:call)` invariant is preserved.
+        def call(_request)
+          self
+        end
+
+        # 2.10-F — bytes-count of the headers-only prefix.  Used by
+        # callers that reach the StaticEntry directly (specs, custom
+        # writers); the C fast path reads the C-side `headers_len`
+        # mirror that `PageCache.register_prebuilt` records.
+        def headers_bytesize
+          headers_len || buffer.bytesize
         end
       end
 

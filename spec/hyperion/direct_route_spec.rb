@@ -240,6 +240,53 @@ RSpec.describe 'Hyperion::Server.handle (direct route registration)' do
       server&.stop
     end
 
+    it 'serves handle_static via the C-ext fast path (2.10-F)' do
+      Hyperion::Server.handle_static(:GET, '/c-fast', "fast\n")
+
+      # The handle_static registration MUST also register the prebuilt
+      # response with the C-side PageCache so PageCache.serve_request
+      # finds it.  This is the contract that 2.10-F's fast path
+      # depends on; assert it directly so a regression in
+      # Server.handle_static is caught at unit-spec time, not at the
+      # next bench run.
+      tcp_server = TCPServer.new('127.0.0.1', 0)
+      pair_port  = tcp_server.addr[1]
+      reader = Thread.new { tcp_server.accept.read }
+      client = TCPSocket.new('127.0.0.1', pair_port)
+      result = Hyperion::Http::PageCache.serve_request(client, 'GET', '/c-fast')
+      client.close
+      reader.value
+      tcp_server.close
+      expect(result).to be_a(Array)
+      expect(result.first).to eq(:ok)
+
+      server, port = boot_server(fallback_app)
+      Thread.new { server.run_one }
+      response = request(port, 'GET', '/c-fast')
+      expect(response).to include('200 OK')
+      expect(response).to end_with("fast\n")
+    ensure
+      server&.stop
+    end
+
+    it 'serves HEAD on a handle_static route with headers-only body' do
+      body = "this is the body\n"
+      Hyperion::Server.handle_static(:GET, '/head-route', body)
+
+      server, port = boot_server(fallback_app)
+      Thread.new { server.run_one }
+      response = request(port, 'HEAD', '/head-route')
+
+      # Headers must come through; the body bytes MUST NOT be on the
+      # wire (HEAD strips the body).
+      expect(response).to include('HTTP/1.1 200 OK')
+      expect(response).to include('content-type: text/plain')
+      expect(response).to include("content-length: #{body.bytesize}")
+      expect(response).not_to include('this is the body')
+    ensure
+      server&.stop
+    end
+
     it 'fires Runtime lifecycle hooks on direct-dispatch routes' do
       starts = []
       ends   = []

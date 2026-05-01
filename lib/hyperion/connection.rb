@@ -486,6 +486,21 @@ module Hyperion
       @metrics.increment(:bytes_read, 0) # no-op — bytes already counted upstream
       @metrics.increment(:requests_in_flight)
       @metrics.increment(:direct_route_hits)
+
+      # 2.10-F — C-ext fast path for prebuilt static responses.  When
+      # the matched route is a `StaticEntry`, the prebuilt response
+      # bytes are already registered with `Hyperion::Http::PageCache`
+      # under the route path; `PageCache.serve_request` does the
+      # whole thing — hash lookup, snapshot under the C lock, GVL-
+      # released write — without invoking the handler closure or
+      # building a `[status, headers, body]` tuple.  Lifecycle hooks
+      # still fire (with `env=nil`, matching the 2.10-D contract) so
+      # APM observers see direct-route requests regardless of whether
+      # the wire write happens in Ruby or C.
+      if handler.is_a?(::Hyperion::Server::RouteTable::StaticEntry)
+        return dispatch_direct_static!(socket, request, handler, request_started_at)
+      end
+
       response = nil
       error    = nil
       begin
@@ -533,6 +548,70 @@ module Hyperion
       500
     end
 
+    # 2.10-F — StaticEntry-only dispatch path.  Calls `PageCache.serve_request`
+    # which performs the full lookup + snapshot + write entirely in C
+    # (with the GVL released across the write syscall).  On `:miss`
+    # (e.g. the C cache was cleared between registration and request,
+    # or the request method is something we didn't pre-register —
+    # POST against a GET route would have already missed the route
+    # table, so this branch is paranoia) we fall back to the Ruby
+    # `socket.write` path — same bytes, slightly more overhead.
+    #
+    # Lifecycle hooks (`Runtime#on_request_start` / `#on_request_end`)
+    # MUST still fire here so APM observers see direct-route hits.
+    # `env` is `nil` on direct routes, matching the 2.10-D contract.
+    def dispatch_direct_static!(socket, request, entry, request_started_at)
+      error = nil
+      begin
+        @runtime.fire_request_start(request, nil) if @runtime.has_request_hooks?
+        bytes_written = serve_static_entry(socket, request, entry)
+        # We always emit a 200 from a StaticEntry (that's what
+        # `Server.handle_static` builds).  Track the bytes for
+        # operators tracking egress, mirroring what ResponseWriter
+        # does on the regular path.
+        @metrics.increment(:bytes_written, bytes_written)
+      rescue StandardError => e
+        error = e
+        @metrics.increment(:app_errors)
+        @logger.error do
+          { message: 'static direct route write failed',
+            method: request.method,
+            path: request.path,
+            error: e.message,
+            error_class: e.class.name }
+        end
+      ensure
+        @metrics.decrement(:requests_in_flight)
+      end
+
+      if @runtime.has_request_hooks?
+        @runtime.fire_request_end(request, nil, error.nil? ? entry : nil, error)
+      end
+
+      status = error ? 500 : 200
+      @metrics.increment_status(status)
+      log_request(request, status, request_started_at) if @log_requests
+      observe_request_duration(request, status, request_started_at)
+      status
+    end
+
+    # 2.10-F — call into the C ext when available, else fall back to
+    # the 2.10-D Ruby `socket.write` path.  Returns bytes written.
+    def serve_static_entry(socket, request, entry)
+      if defined?(::Hyperion::Http::PageCache) &&
+         ::Hyperion::Http::PageCache.respond_to?(:serve_request)
+        result = ::Hyperion::Http::PageCache.serve_request(socket, request.method, entry.path)
+        return result.last if result.is_a?(Array) && result.first == :ok
+      end
+      # Fallback: Ruby write of the full buffer (or headers-only on HEAD).
+      bytes = if request.method == 'HEAD' && entry.headers_bytesize < entry.buffer.bytesize
+                entry.buffer.byteslice(0, entry.headers_bytesize)
+              else
+                entry.buffer
+              end
+      socket.write(bytes)
+    end
+
     # 2.10-D — write a direct-route response.  Returns the status
     # code that was written (so `dispatch_direct!` can bump the
     # status counter without re-parsing the response).  Two
@@ -541,6 +620,10 @@ module Hyperion
     # response per-request without paying for env construction.
     def write_direct_response(socket, response)
       if response.is_a?(::Hyperion::Server::RouteTable::StaticEntry)
+        # 2.10-F note: the StaticEntry-from-handler path (a Rack-style
+        # handler that returns a StaticEntry, not a route registered
+        # via `Server.handle_static`) lands here.  Keep the 2.10-D
+        # one-shot Ruby write — these are NOT in the C cache.
         socket.write(response.response_bytes)
         return 200
       end

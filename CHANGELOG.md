@@ -2,6 +2,109 @@
 
 ## 2.10.1 — TBD
 
+### 2.10-F — C-ext fast-path response writer for prebuilt responses
+
+Folds the matched-route hot path for `Server.handle_static` into a
+single C function so the request never re-enters Ruby on the response
+side.  Closes the syscall-overhead gap between Hyperion's 2.10-D
+direct-route path (5,619 r/s on `hello` per the 2.10-D bench) and
+Agoo's pure-C static path (19,364 r/s) by eliminating the Ruby
+plumbing around the `write()` syscall: no handler closure dispatch,
+no `[status, headers, body]` tuple materialization, no extra GVL
+acquire/release for the response phase.
+
+**Headline shape.** New
+`Hyperion::Http::PageCache.serve_request(socket, method, path)` C-ext
+entry point: hash lookup, snapshot under the C lock, write outside
+the GVL via `rb_thread_call_without_gvl`, return
+`[:ok, bytes_written]` on hit / `:miss` on absence.  HEAD requests
+write the headers-only prefix (body stripped on the C side, no
+extra Ruby work).
+
+**Why the previous shape was leaving cycles on the table.**  2.10-D's
+`Connection#dispatch_direct!` matched the route in O(1), but the
+write path was still pure Ruby:
+`handler.call(request) → StaticEntry → socket.write(buf)`.  Each
+step involves Ruby method dispatch, ivar reads, GC roots updated,
+and (for any blocking I/O wait the kernel returns from `write()`)
+a fresh GVL re-acquire.  Strace on the 2.10-D `hello` path showed
+~30,000 ancillary syscalls per second (`clone3`, `futex`) for what
+should be one `write()` per request — that's the Ruby plumbing
+talking, not the protocol.  2.10-F shrinks the response phase to
+ONE C call that does the whole thing.
+
+**Operator surface.**
+
+```ruby
+# Already worked in 2.10-D — same call:
+Hyperion::Server.handle_static(:GET, '/health', "OK\n")
+
+# 2.10-F changes what happens UNDER this call:
+#  1. The prebuilt buffer is registered with the C-side PageCache
+#     under '/health'.
+#  2. Connection#dispatch_direct! detects StaticEntry routes
+#     and calls PageCache.serve_request(socket, method, '/health'),
+#     which does the hash lookup + GVL-released write in C.
+#  3. HEAD on a GET-registered handle_static now serves headers-
+#     only automatically (HTTP semantic; the C side strips body
+#     bytes for HEAD).
+```
+
+No CHANGELOG-touching API changes for callers — this is a hot-path
+micro-architecture rework.
+
+**Files added.**
+
+| File | Purpose |
+|---|---|
+| `spec/hyperion/page_cache_serve_request_spec.rb` | 13 examples covering `:ok`/`:miss`, GET full body, HEAD headers-only, method-gating (POST/PUT/etc. miss), case-insensitive method match, last-writer-wins on `register_prebuilt`, oversized-path rejection, no-deadlock under 8-thread `serve_request` contention. |
+
+**Files touched.**
+
+| File | Change |
+|---|---|
+| `ext/hyperion_http/page_cache.c` | Add `rb_pc_register_prebuilt(path, response_bytes, body_len)` so the prebuilt handle_static buffer can be folded into the C cache without ever reading from disk. Add `rb_pc_serve_request(socket_io, method, path)` — C-ext fast path: classifies method (GET/HEAD/other) inline, looks up in the existing FNV-1a bucket table, snapshots under the pthread mutex, writes via the existing `hyp_pc_write_blocking` helper (still under `rb_thread_call_without_gvl`). Extends `hyp_page_t` with `headers_len` (= response_len − body_len, used for HEAD writes) and `prebuilt` (skips re-stat for entries that have no on-disk file). New `:miss` symbol distinct from `:missing` so logs/metrics can tell "not in cache" apart from "in cache but method-ineligible". |
+| `lib/hyperion/http/page_cache.rb` | Document the new C surface (`register_prebuilt`, `serve_request`) in the module-level comment; no Ruby-side helper added — these are direct C exports. |
+| `lib/hyperion/server/route_table.rb` | `StaticEntry` gains a 4th field `headers_len` (defaulted nil for back-compat with 2.10-D 3-arg constructions), responds to `#call(request)` returning `self` (so `Server.handle_static` can register the entry directly into the route table — the 2.10-D wrapping closure is gone), exposes `headers_bytesize` for the Ruby fallback HEAD-strip path. |
+| `lib/hyperion/server.rb` | `Server.handle_static` now: (a) records `head.bytesize` on the StaticEntry as `headers_len`; (b) registers the StaticEntry **directly** into the route table (not wrapped in `->(req) { entry }`); (c) registers a HEAD twin for any GET registration (HTTP-mandated); (d) calls `Hyperion::Http::PageCache.register_prebuilt` to fold the prebuilt buffer into the C cache. |
+| `lib/hyperion/connection.rb` | `dispatch_direct!` branches on `handler.is_a?(StaticEntry)` BEFORE invoking the handler closure; on hit, calls new `dispatch_direct_static!` which fires lifecycle hooks, calls `PageCache.serve_request(socket, request.method, entry.path)` via the new `serve_static_entry` helper, and falls back to a Ruby `socket.write` of `entry.buffer` (or `headers_bytesize` prefix on HEAD) if the C cache returned `:miss`. Lifecycle-hook contract from 2.10-D preserved — `env=nil` on direct routes still holds. |
+| `spec/hyperion/direct_route_spec.rb` | +2 examples: end-to-end serves `handle_static` via the C-ext fast path (asserts `PageCache.serve_request` finds the registered entry and returns `[:ok, n]`); end-to-end HEAD on a `handle_static`-registered GET route returns headers-only on the wire. |
+
+**Spec count: 1045 → 1060 (+15).** All 1060 examples green; 11 pending
+(unchanged platform-only kTLS / io_uring / Linux-splice branches from
+the 2.10.0 baseline).
+
+**Judgment calls (documented for archaeology).**
+
+1. **HEAD twin auto-registration.** `Server.handle_static(:GET, ...)` now
+   ALSO registers HEAD on the same path. Operators registering HEAD
+   explicitly through `Server.handle(:HEAD, path, handler)` continue to
+   work — the route_table is last-writer-wins, so explicit overrides
+   take precedence if registered after `handle_static`. The alternative
+   was to teach `RouteTable#lookup` to fall back GET→HEAD, but that
+   would have widened the hot-path lookup from one Hash#[] to two
+   without operator opt-in. Auto-registration was the cheaper choice.
+
+2. **`:miss` vs `:missing`.** Two different symbols intentionally:
+   `:missing` = "you asked for this and the on-disk file isn't cached"
+   (the existing 2.10-C `write_to`/`fetch` contract); `:miss` = "the
+   route lookup didn't yield a serveable prebuilt entry" (new in 2.10-F).
+   Operators wiring metrics on the C path can split the two reasons.
+
+3. **GVL release.** The implementation reuses the existing
+   `hyp_pc_write_blocking` helper — same `rb_thread_call_without_gvl`
+   shape as 2.10-C's `PageCache.write_to`, same EAGAIN-with-bounded-
+   `select` retry. No new lock, no new write strategy: just a smaller
+   call surface.
+
+4. **`StaticEntry#call` returning self.** Keeps the route_table
+   `respond_to?(:call)` invariant intact so the same hash can hold both
+   prebuilt entries AND user-defined Rack-tuple handlers without a
+   separate registration API. `dispatch_direct!`'s
+   `handler.is_a?(StaticEntry)` branch fires BEFORE `handler.call(request)`,
+   so the `call` method is only ever exercised by callers reaching for
+   the route table directly (specs, custom dispatchers).
+
 ### 2.10-E — Static asset preload + immutable flag
 
 Adds a boot-time hook that walks operator-supplied directory trees,
