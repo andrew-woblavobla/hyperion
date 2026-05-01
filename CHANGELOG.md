@@ -2,6 +2,33 @@
 
 ## [Unreleased] - 2.9.0
 
+### 2.9-D — Matched-config PG bench (honest ratio quantified)
+
+The 2.0.0 BENCH row 7's "PG +378% / 4.78×" was apples-to-oranges
+(Puma tested at pool=100 against local PG max_conn=100, timed out
+200/200 wrk requests at the pool ceiling; Hyperion tested against
+WAN PG max_conn=500). The 2.6-E audit annotated the row as
+"honest matched ratio ~2.2×" without a clean rerun.
+
+2.9-D ran the clean matched-config bench against the local PG
+(max_conn=100) with both servers at pool=80 (under ceiling, no
+timeouts):
+
+| Server | Run 1 | Run 2 | Run 3 | Median | p99 |
+|---|---:|---:|---:|---:|---:|
+| Hyperion `--async-io -t 5 -w 1` pool=80 | 1,568 | 1,562 | 1,565 | **1,565 r/s** | 138 ms |
+| Puma `-t 80:80 -w 1` pool=80 | 1,104 | 1,211 | 1,206 | **1,206 r/s** | 186 ms |
+
+**Verdict: Hyperion +29.8% rps, p99 26% lower.** Real, durable,
+matched-config Hyperion win. The original 4.78× / 378% ratio was a
+config artifact (Puma at the ceiling); the honest architectural
+advantage of async-io fiber pool over threadpool on this workload
+is +30% rps + 26% lower tail.
+
+`docs/BENCH_HYPERION_2_0.md` row 7 will be updated to lead with
+the verified +30% number alongside the historical 4.78× as a
+deprecated framing.
+
 ### 2.9-A — sendfile chunk-size A/B on fresh host (2.6-A delta quantified)
 
 The 2.7-A bisect found that 2.6-A's "+20.7% rps from chunk size 64 KiB
