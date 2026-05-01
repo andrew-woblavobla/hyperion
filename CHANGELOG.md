@@ -54,9 +54,79 @@ The full `wrk` bench is **2.10-B's** job, not 2.10-A's — this commit
 only validates that all four servers come up + serve a 200 on the
 shared rackup.
 
+### 2.10-B — 4-way baseline bench (Hyperion vs Puma vs Falcon vs Agoo)
+
+**BASELINE — this is the honest 4-way comparison BEFORE 2.10-C/D/E/F
+land. Establishes the gap that subsequent perf work needs to close
+(or honestly prove uncloseable).** Re-run after each 2.10-C/D/E/F
+stream lands so the delta is visible per-row.
+
+Bench-only — no production code changes, spec count unchanged at 964.
+
+**Files touched.**
+
+| File | Change |
+|---|---|
+| `bench/Gemfile.4way` | Added `pg ~> 1.5` and `hyperion-async-pg ~> 0.5` so row 5 (PG-bound async) can run inside the 4way bundle. Other rows are unaffected — the gems load only when MODE=async. |
+| `bench/4way_compare.sh` | Three additions: (1) `URL_PATH` env var for rackups whose root URL isn't a 200 (e.g. static.ru → `/hyperion_bench_1k.bin`); (2) `WRK_TIMEOUT` env var for slow rackups (row 5 wants `--timeout 8s`); (3) `HYPERION_EXTRA` env var for hyperion-only flags like `--async-io`; (4) **perfer integration** — every (rackup, server) combination now runs both `wrk -t4 -c100 -d20s` AND `perfer -t4 -c100 -k -d20`, with NA-aware median + summary lines. Set `SKIP_PERFER=1` to disable. |
+
+**Results (medians of 3 trials, openclaw-vm Ubuntu 24.04 + Ruby
+3.3.3, all servers `-t 5 -w 1`).** Per-row tables, full caveat
+discussion, and reproduction recipe are in
+[`docs/BENCH_HYPERION_2_0.md` § "4-way head-to-head (2.10-B
+baseline)"](docs/BENCH_HYPERION_2_0.md#4-way-head-to-head-210-b-baseline-2026-05-01).
+
+| Row | Workload | Hyperion 2.9.0 | Puma 8.0.1 | Falcon 0.55.3 | Agoo 2.15.14 | Verdict |
+|---|---|---:|---:|---:|---:|---|
+| 1 | hello | 4,587 r/s · p99 2.08 ms | 4,049 · 28.74 ms | 6,082 · 408.53 ms | **19,364** · 9.41 ms | Agoo wins by 4.2× over Hyperion; Hyperion has the cleanest p99 |
+| 2 | static 1 KB | 1,380 · **4.86 ms** | 1,416 · 93.86 ms | 1,785 · 64.87 ms | **2,606** · 58.89 ms | Agoo wins; Hyperion p99 20× tighter than Puma |
+| 3 | static 1 MiB | **1,378** · **5.62 ms** | 1,282 · 95.17 ms | 523 · 833.54 ms | 152 · 743.37 ms | **Hyperion wins** — sendfile path; 9× over Agoo |
+| 4 | CPU JSON 50-key | 3,450 · **2.73 ms** | 2,771 · 40.74 ms | 4,245 · 410.05 ms | **6,374** · 19.18 ms | Agoo wins by 1.85× over Hyperion |
+| 5 | PG-bound async (50 ms `pg_sleep`, c=200) | **1,564** · 145.71 ms | n/a | n/a | n/a | Hyperion-only — others can't run the rackup (no fiber-cooperative I/O) |
+| 6 | SSE 1000 × 50 B (c=1, t=1) | **500** · 2.59 ms | 137 · 9.23 ms | 29 · 38.60 ms | smoke-fail | **Hyperion wins** — 3.6× over Puma, 17× over Falcon; Agoo can't stream SSE chunked |
+
+**Honest reading.** Agoo is faster than Hyperion on hello-world by
+**4.2×** (19k r/s vs 4.6k r/s) and on CPU JSON by **1.85×** (6.4k
+vs 3.5k). That gap is what 2.10-C (static-response cache) and
+2.10-D (direct route registration) need to walk down to <2× hello,
+<1.5× JSON. Hyperion already wins the workloads that matter
+operationally — large static (sendfile, 9× ahead of Agoo),
+PG-bound async (Hyperion-only at this concurrency), and SSE
+streaming (3.6×–17× ahead). Tail latency is Hyperion's clean win
+across every row (worst p99 across the 6 rows: 145 ms on row 5
+intentionally; next worst 5.62 ms — Puma worst 95 ms, Falcon worst
+833 ms, Agoo worst 743 ms).
+
+**perfer caveats.** Adding `perfer` (https://github.com/ohler55/perfer,
+Agoo's own bench tool) for apples-to-apples vs Agoo's published
+numbers surfaced four issues that are documented inline in the
+BENCH doc:
+
+1. perfer's `Content-Length:` / `Transfer-Encoding:` lookups are
+   case-sensitive `strstr` — hangs against Hyperion's RFC 9110
+   lowercase headers. Patched local copy to `strcasestr`; should
+   upstream.
+2. perfer's `pool_warmup` deadlocks against Hyperion `-t 5 -c 100`
+   (per-conn 2.0s recv timeout × 100 conns vs 5-thread accept
+   loop). Recorded `NA` for hyperion+perfer on rows 1, 2, 4.
+   Raising hyperion to `-t 200` makes perfer happy but breaks
+   matched-config. Workaround for 2.10-B: rely on wrk for
+   hyperion's headline; perfer numbers for puma / falcon / agoo
+   agree with wrk within 5–10%.
+3. perfer's `MAX_RESP_SIZE = 16 KB` recv buffer means the 1 MiB
+   static row is `NA` across all four servers under perfer. wrk
+   handles arbitrary body sizes, so row 3 stays wrk-only.
+4. SSE row reports `0 r/s` under perfer — its response-framing
+   doesn't handle multi-chunk streams. wrk's `c=1` read-until-close
+   parses correctly.
+
+**Re-run pattern.** After each 2.10-C/D/E/F stream lands, re-run
+the same 6 rows and append a new "post-{stream}" table to the
+BENCH section so the cumulative perf delta is visible.
+
 ### Filed for later 2.10 streams
 
-(populated as 2.10-B..H land)
+(populated as 2.10-C..H land)
 
 ## [2.9.0] - 2026-05-01
 

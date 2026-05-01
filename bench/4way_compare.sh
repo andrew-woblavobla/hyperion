@@ -31,8 +31,18 @@
 #               --hybrid -n 1 --forks 1 --threads 5 --config hello.ru
 #   Agoo:     bundle exec ruby bench/agoo_boot.rb hello.ru 9810 5
 #
-# Output: per-server "run=N rps=… p99=…" lines + a per-server
-# median-of-3 summary at the end.
+# Output: per-server "wrk run=N rps=… p99=…" + "perfer run=N rps=… p99=…"
+# lines + a per-server median-of-3 summary at the end.
+#
+# 2.10-B: also runs Agoo's `perfer` (https://github.com/ohler55/perfer) on
+# the same workload so we have a head-to-head against agoo's headline
+# numbers (which are published with perfer, not wrk). Perfer must be
+# pre-built at $PERFER_BIN (default /tmp/perfer/bin/perfer). Build it via
+#   git clone https://github.com/ohler55/perfer.git /tmp/perfer && (cd /tmp/perfer && make)
+# Perfer's recv code uses case-sensitive strstr for "Content-Length:" —
+# this hangs against RFC 9110 lowercase headers (Hyperion). Patch drop.c
+# to use strcasestr (and add `#define _GNU_SOURCE` + rebuild) before use.
+# Set SKIP_PERFER=1 to disable.
 
 set -u
 
@@ -54,6 +64,10 @@ DURATION="${DURATION:-20s}"
 WRK_THREADS="${WRK_THREADS:-4}"
 WRK_CONNS="${WRK_CONNS:-100}"
 RUNS="${RUNS:-3}"
+# Path the smoke check + wrk hit. Defaults to "/" but rackups like
+# bench/static.ru need a real file path (e.g. /hyperion_bench_1k.bin).
+URL_PATH="${URL_PATH:-/}"
+WRK_TIMEOUT="${WRK_TIMEOUT:-}"
 LOG="/tmp/4way-$$.log"
 
 echo "============================================================"
@@ -96,7 +110,7 @@ wait_for_bind() {
   local label="$1"
   for i in $(seq 1 7); do
     sleep 1
-    if curl -sS -o /dev/null --max-time 1 "http://$HOST:$PORT/" 2>/dev/null; then
+    if curl -sS -o /dev/null --max-time 1 "http://$HOST:$PORT$URL_PATH" 2>/dev/null; then
       echo "[$label] bound after ${i}s" | tee -a "$LOG"
       return 0
     fi
@@ -135,8 +149,8 @@ run_server() {
 
   # Smoke a single 200.
   local code
-  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://$HOST:$PORT/" || echo "000")
-  echo "[$label] smoke GET / -> HTTP $code" | tee -a "$LOG"
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://$HOST:$PORT$URL_PATH" || echo "000")
+  echo "[$label] smoke GET $URL_PATH -> HTTP $code" | tee -a "$LOG"
   if [ "$code" != "200" ]; then
     echo "[$label] SMOKE-FAILURE (non-200)" | tee -a "$LOG"
     stop_port
@@ -161,23 +175,68 @@ run_server() {
 
   local rps_list=()
   local p99_list=()
+  local wrk_extra=()
+  if [ -n "$WRK_TIMEOUT" ]; then
+    wrk_extra+=(--timeout "$WRK_TIMEOUT")
+  fi
   for run in $(seq 1 "$RUNS"); do
     local out rps p99
     out=$(wrk -t"$WRK_THREADS" -c"$WRK_CONNS" -d"$DURATION" --latency \
-      "http://$HOST:$PORT/" 2>&1)
+      "${wrk_extra[@]}" \
+      "http://$HOST:$PORT$URL_PATH" 2>&1)
     rps=$(echo "$out" | awk '/Requests\/sec:/ { print $2 }')
     p99=$(echo "$out" | awk '/^ *99%/ { print $2 }')
     rps_list+=("${rps:-NA}")
     p99_list+=("${p99:-NA}")
-    echo "[$label] run=$run rps=$rps p99=$p99" | tee -a "$LOG"
+    echo "[$label] wrk run=$run rps=$rps p99=$p99" | tee -a "$LOG"
     sleep 2
   done
 
   local rps_med p99_med
   rps_med=$(median "${rps_list[@]}")
   p99_med=$(median "${p99_list[@]}")
-  echo "[$label] MEDIAN rps=$rps_med p99=$p99_med (runs: ${rps_list[*]})" | tee -a "$LOG"
-  echo "$label: rps_med=$rps_med p99_med=$p99_med" >> "/tmp/4way-summary.log"
+  echo "[$label] WRK MEDIAN rps=$rps_med p99=$p99_med (runs: ${rps_list[*]})" | tee -a "$LOG"
+  echo "$label: wrk_rps_med=$rps_med wrk_p99_med=$p99_med" >> "/tmp/4way-summary.log"
+
+  # 2.10-B: also run perfer (Agoo's bench tool) for apples-to-apples vs Agoo's
+  # published numbers. Perfer is at $PERFER_BIN (default /tmp/perfer/bin/perfer).
+  # If unavailable or it times out, we record "NA" and continue — the wrk
+  # numbers above are the headline result either way.
+  local perfer_bin="${PERFER_BIN:-/tmp/perfer/bin/perfer}"
+  if [ -x "$perfer_bin" ] && [ "${SKIP_PERFER:-0}" != "1" ]; then
+    local prps_list=()
+    local pp99_list=()
+    local pdur="${DURATION%s}"
+    for run in $(seq 1 "$RUNS"); do
+      local pout prps pp99
+      # Perfer can deadlock during warmup against servers with small thread
+      # pools (its connect+send-all then recv-all model assumes the server
+      # drains quickly). Wrap with a hard timeout and treat as NA on failure.
+      pout=$(timeout 60 "$perfer_bin" \
+        -t "$WRK_THREADS" -c "$WRK_CONNS" -k -d "$pdur" \
+        -l 50,90,99 "http://$HOST:$PORT$URL_PATH" 2>&1)
+      if echo "$pout" | grep -q "timed out"; then
+        prps="NA"; pp99="NA"
+      else
+        prps=$(echo "$pout" | awk '/Throughput:/ { print $2 }')
+        pp99=$(echo "$pout" | awk '/99\.00%:/ { print $2" "$3 }' | head -1)
+      fi
+      prps_list+=("${prps:-NA}")
+      pp99_list+=("${pp99:-NA}")
+      echo "[$label] perfer run=$run rps=$prps p99=$pp99" | tee -a "$LOG"
+      sleep 2
+    done
+    local prps_med pp99_med
+    # NA-aware median: if any run is NA, set median to NA.
+    if printf '%s\n' "${prps_list[@]}" | grep -q "^NA$"; then
+      prps_med="NA"; pp99_med="NA"
+    else
+      prps_med=$(median "${prps_list[@]}")
+      pp99_med=$(median "${pp99_list[@]}")
+    fi
+    echo "[$label] PERFER MEDIAN rps=$prps_med p99=$pp99_med (runs: ${prps_list[*]})" | tee -a "$LOG"
+    echo "$label: perfer_rps_med=$prps_med perfer_p99_med=$pp99_med" >> "/tmp/4way-summary.log"
+  fi
 
   stop_port
 }
@@ -187,7 +246,11 @@ run_server() {
 for srv in "${SUBSET[@]}"; do
   case "$srv" in
     hyperion)
-      run_server hyperion bundle exec hyperion -t 5 -w 1 -p "$PORT" "$RACKUP"
+      # HYPERION_EXTRA injects extra flags before -t (e.g. "--async-io" for row 5)
+      # shellcheck disable=SC2206
+      hyp_extra=(${HYPERION_EXTRA:-})
+      run_server hyperion bundle exec hyperion "${hyp_extra[@]}" \
+        -t "${HYPERION_THREADS:-5}" -w 1 -p "$PORT" "$RACKUP"
       ;;
     puma)
       run_server puma bundle exec puma -t 5:5 -w 1 \

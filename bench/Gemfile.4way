@@ -23,3 +23,8 @@ gem 'falcon', '~> 0.55'
 gem 'agoo'
 
 gem 'hyperion-rb', path: ENV.fetch('HYPERION_PATH', '/home/ubuntu/hyperion')
+
+# 2.10-B — needed for row 5 (PG-bound async). Only used when bench/pg_concurrent.ru
+# is the rackup; the other rows (hello, static, work, sse_generic) ignore them.
+gem 'pg',                '~> 1.5'
+gem 'hyperion-async-pg', '~> 0.5'
