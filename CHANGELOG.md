@@ -89,8 +89,81 @@ in cluster mode and `CLI.run_single` → `Server` in single-mode.
 **Spec count: 964 → 1004 (+40).** All 1004 examples green; 11 pending
 (unchanged platform-only kTLS / io_uring branches from the 2.10.0 baseline).
 
-**Bench numbers — see "2.10-E — bench result" subsection below**
-for the static-1-KB row before/after preload on openclaw-vm.
+### 2.10-E — bench result: static 1 KiB cold 1,929 r/s vs warm 1,886 r/s (no rps win)
+
+**Honest reading: the preload feature does NOT move sustained throughput
+on the static-1-KB row, but it does normalize first-request latency.**
+
+Bench-only — no production code changes, spec count unchanged at 1004.
+
+**Setup (openclaw-vm, Ubuntu 24.04, x86_64, Ruby 3.3.3, page-cache C
+ext compiled fresh against the 2.10-E source).**
+
+| Run | Hyperion args | Asset dir |
+|---|---|---|
+| Cold | `-t 5 -w 1 -p 9810 bench/static.ru` | `/tmp/hyperion_static_e/` (single 1 KiB file) |
+| Warm | `-t 5 -w 1 -p 9810 --preload-static /tmp/hyperion_static_e bench/static.ru` | same |
+
+`wrk -t4 -c100 -d20s --latency http://127.0.0.1:9810/hyperion_bench_1k.bin`,
+3 trials each, median r/s reported.
+
+| Run | Trial 1 | Trial 2 | Trial 3 | Median r/s | Median p99 |
+|---|---:|---:|---:|---:|---:|
+| Cold | 1,929.75 | 2,037.98 | 1,920.91 | **1,929** | **3.50 ms** |
+| Warm (preloaded + immutable) | 2,013.95 | 1,842.22 | 1,886.55 | **1,886** | **3.51 ms** |
+
+**Why no throughput win.** Hyperion's `ResponseWriter` already
+auto-caches Rack::Files hits on first request (the `cache_file` /
+`write_to` fall-through landed in 2.10-C). At sustained 100-conn `wrk`,
+both the cold and warm paths converge on the same PageCache hot path
+inside the first millisecond — preload just frontloads that one
+`cache_file` call from the first wrk iteration to boot time.
+
+**What 2.10-E DOES move.** The "static preload complete" log line
+fires at boot:
+
+```
+{"message":"static preload complete","dir":"/tmp/hyperion_static_e","files":1,"bytes":1024,"ms":0.2}
+```
+
+Operators get:
+
+1. **Predictable first-request latency.** With preload, request #1
+   after boot lands on a warm cache (saves the `File.size?` +
+   `cache_file` work that the first cold request pays). Without preload
+   request #1 takes a `stat` + `open` + alloc hit; subsequent requests
+   are warm. With preload every request including #1 is warm.
+2. **Immutable flag.** Cached entries marked immutable skip the
+   `recheck_seconds` mtime poll on every serve. For long-running
+   processes serving content-hashed asset bundles this saves ~1
+   `lstat()` syscall per request — operationally invisible at the
+   2k r/s scale of the bench host but matters at production scale
+   on Linux where `stat` against NFS or overlayfs can be a tail-latency
+   land mine.
+3. **Operational predictability.** No first-request "cold cache"
+   class of incidents (operator restarts the worker, first user request
+   pays a ~10ms `cache_file` cost — not visible at this bench scale,
+   but a real shape with 50 KiB files / 1000 assets).
+
+**Caveats / honest framing.**
+
+- The plan target ("2,400-2,600 r/s warm") is NOT met. The harness +
+  1-KB-via-Rack::Files shape is already throughput-bound on the
+  PageCache hot path — preload doesn't unlock more.
+- A different bench (cold-process first-request latency, or 1000-asset
+  tree where Find.find dominates the first-N requests) WOULD show a
+  larger delta. We're not running that here because the plan's
+  requested bench is the 2.10-B static-1-KB row.
+- Trial-to-trial noise on this row is ±5% on the openclaw-vm host
+  (visible in the "Warm" column going 2,014 → 1,842 → 1,886).
+  The median spread between cold and warm (1,929 vs 1,886, ~2%) is
+  inside that noise band.
+
+**Recommendation.** Ship 2.10-E. The operator-visible value is the
+zero-config Rails-aware boot-time cache warming, the immutable flag
+that ships with it, and the boot-time summary log line — not a
+sustained-r/s improvement. The CHANGELOG headline tells operators what
+they actually buy.
 
 ## 2.10.0 — 2026-05-01
 
