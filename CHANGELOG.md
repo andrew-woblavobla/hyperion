@@ -246,6 +246,114 @@ drains.
 green on macOS arm64; Linux x86_64 verified via the bench host
 boot.
 
+### 2.10-D — Server.handle direct route registration (bypass Rack adapter)
+
+**Headline.** New `Hyperion::Server.handle(:GET, '/path', handler)`
++ `Hyperion::Server.handle_static(:GET, '/path', body)` API.
+Mirrors agoo's `Agoo::Server.handle(:GET, "/hello", handler)`
+design.  On a registered route, `Connection#serve` skips the
+Rack adapter entirely — no env-hash build, no middleware chain
+walk, no body iteration; the handler is called directly with
+the parsed `Hyperion::Request` value object.  Lifecycle hooks
+(`Runtime#on_request_start` / `on_request_end`) still fire so
+NewRelic / AppSignal / OpenTelemetry instrumentation works
+regardless of dispatch shape.
+
+**Win source.** `handle_static` builds the FULL HTTP/1.1
+response buffer (status line + Content-Type + Content-Length +
+body) ONCE at registration time; the hot path is one
+`socket.write(buffer)` syscall per request — same shape as the
+existing 503 / 413 / 408 fast paths in `Server` / `Connection`,
+zero Ruby allocation past the Connection ivars.  `handle` (the
+dynamic-handler form) bypasses env construction but still
+walks the standard `ResponseWriter` for the
+`[status, headers, body]` tuple — slower than the static path
+but still skips the entire Rack-adapter overhead.
+
+**Bench validation on openclaw-vm.** Hello-world via
+`handle_static` vs the 2.10-B Rack-lambda baseline:
+
+| Path | r/s (median of 3) | vs 2.10-B baseline | vs Agoo 2.15.14 |
+|---|---:|---:|---:|
+| 2.10-B Rack lambda (Hyperion 2.9.0) | 4,587 | — | −76% (Agoo wins) |
+| **2.10-D handle_static** | **TBD on openclaw-vm bench window** | TBD | TBD |
+| Agoo 2.15.14 (reference) | 19,364 | +322% | — |
+
+The bench validation step requires SSH to openclaw-vm; this
+commit lands the API + specs.  The bench harness re-run will
+populate the row above on the next bench window.  Plan target
+is ≥ 12,000 r/s on `/hello` via `handle_static` (+160% over
+2.10-B baseline; closes the gap toward Agoo's 19,364 r/s by
+~70% of the absolute remaining distance — within striking
+range for further opportunistic squeezes from the connection
+fast-path in 2.10-E/F).
+
+**Files added.**
+
+| File | Purpose |
+|---|---|
+| `lib/hyperion/server/route_table.rb` | `RouteTable` class + `StaticEntry` value object.  Per-method Hash keyed by exact-match path String; O(1) lookup; Mutex-guarded writes.  `KNOWN_METHODS` matrix matches agoo's surface verbatim (GET / POST / PUT / DELETE / HEAD / PATCH / OPTIONS). |
+| `spec/hyperion/direct_route_spec.rb` | 21 specs covering register / lookup / dispatch happy path, fall-through to Rack adapter on miss, lifecycle-hook firing on direct routes, `handle_static` byte-exact response, method case-insensitive matching, concurrent multi-thread registration, error paths (unknown method, non-String path, non-callable handler). |
+
+**Files touched.**
+
+| File | Change |
+|---|---|
+| `lib/hyperion/server.rb` | `require_relative 'server/route_table'`; class-level `Server.route_table` singleton + `Server.handle` / `Server.handle_static` registration API; `route_table:` constructor kwarg + `attr_reader :route_table`; plumb `@route_table` through every `Connection.new` site (4 inline-dispatch branches) and into `ThreadPool.new`. |
+| `lib/hyperion/connection.rb` | `Connection.new` accepts `route_table:` kwarg (defaults to `Hyperion::Server.route_table` singleton).  In the request loop, after parse + before per-conn fairness gate: if `@route_table.lookup(method, path)` hits, call `dispatch_direct!` and skip the Rack-adapter path entirely.  New private helpers `dispatch_direct!` / `write_direct_response` / `should_keep_alive_after_direct?` — direct dispatch fires `runtime.fire_request_start` / `fire_request_end` (env is `nil` on the direct branch, documented contract for observers), writes either a `StaticEntry` buffer in one syscall or a full Rack tuple via the existing `ResponseWriter`, then continues the keep-alive loop. |
+| `lib/hyperion/thread_pool.rb` | `ThreadPool.new` accepts `route_table:` kwarg; `:connection` job spawns `Connection.new(..., route_table: @route_table)` so the per-worker fast path inherits the registered routes. |
+
+**Public Ruby API.**
+
+```ruby
+# Static — response buffer baked at registration time, one
+# socket.write per hit.  The hello-bench win zone.
+Hyperion::Server.handle_static(:GET, '/health', "OK\n")
+Hyperion::Server.handle_static(:GET, '/version',
+                               '{"v":"1.0"}',
+                               content_type: 'application/json')
+
+# Dynamic — handler#call(request) returns a [status, headers,
+# body] tuple per request.  Bypasses env construction; still
+# uses ResponseWriter for the writeout.
+class HealthCheck
+  def call(request)
+    [200, { 'content-type' => 'text/plain' },
+     ["#{Process.pid}\t#{Time.now.to_i}\n"]]
+  end
+end
+Hyperion::Server.handle(:GET, '/-/probe', HealthCheck.new)
+```
+
+**Lifecycle hooks invariant.** `Runtime#on_request_start` /
+`on_request_end` fire on direct routes regardless of the
+`StaticEntry` vs `[status, headers, body]` branch.  The `env`
+positional is `nil` on the direct path (no Rack env was built
+— that's the whole point); observers that depend on env keys
+(e.g. NewRelic transaction names from `PATH_INFO`) should read
+`request.path` / `request.method` from the `Hyperion::Request`
+positional instead.  Documented + spec-covered.
+
+**Per-process route table.** Forked workers each inherit a
+copy of the parent process's table at fork time (no IPC, no
+shared memory).  Registrations made BEFORE `Server.start`
+propagate to every worker via copy-on-write; registrations
+made AFTER fork (e.g. from `on_worker_boot`) only affect the
+calling worker — by design, this is the operator's escape
+hatch for per-worker routing (e.g. a debug endpoint that
+wants to know which worker served the response).
+
+**Concurrency.** Registrations are Mutex-guarded; lookups are
+lock-free (Ruby Hash reads under MRI are safe against a
+mutex-guarded concurrent write because the GVL pins the
+writer during the bucket update).  Concurrent multi-thread
+registration is regression-tested via an 8-thread × 100-route
+stress example.
+
+**Spec count.** 989 → 1018 (+21 from `direct_route_spec.rb`,
++8 from a parallel 2.10-G h2 timing spec landing in this same
+window).  All 1018 green on macOS arm64.
+
 ### 2.10-G — Investigate Hyperion h2 max-lat ~40 ms ceiling (instrumentation, fix deferred)
 
 **Status: instrumentation landed, bench-host re-run deferred to next bench
