@@ -11,6 +11,42 @@ gem install hyperion-rb
 bundle exec hyperion config.ru
 ```
 
+## What's new in 2.10.0
+
+**4-way bench harness, page cache, direct routes, and the h2 40 ms
+ceiling killed.** This sprint widens the comparison matrix to all four
+major Ruby web servers (Hyperion + Puma + Falcon + Agoo) and ships
+four substantive perf streams against that backdrop:
+
+- **2.10-A / 2.10-B — 4-way bench harness + honest baseline.**
+  `bench/4way_compare.sh` runs the same 6 workloads (hello, static
+  1 KB / 1 MiB, CPU JSON, PG-bound, SSE) against all four servers from
+  one script. Baseline numbers committed *before* any code changes:
+  Agoo wins the static-asset and JSON columns by ~2-4×, Hyperion wins
+  the static 1 MiB column by 9× and the SSE column by 3.6-17×.
+- **2.10-C — `Hyperion::Http::PageCache` (pre-built static response
+  cache).** Open-addressed bucket table behind a pthread mutex
+  (GVL-released for writes), engages automatically on `Rack::Files`
+  responses. **Static 1 KB: 1,380 → 1,880 r/s (+36%), p99 3.7 → 2.7
+  ms.** Closes the Agoo gap from −47% to −28% on that column.
+- **2.10-D — `Hyperion::Server.handle` direct route registration.**
+  New API for hot Rack-bypass paths (`Server.handle '/health' do …
+  end`, `Server.handle_static '/robots.txt', body: '...'`). Skips Rack
+  adapter + env-build for matched routes. **`hello` via
+  `handle_static`: 4,408 → 5,619 r/s (+27%), p99 1.93 ms** — the
+  cleanest p99 in the 4-way matrix.
+- **2.10-G — h2 max-latency ceiling at ~40 ms: fixed.** Filed by 2.9-B
+  as a "first-stream cost" hypothesis, the instrumentation revealed
+  it was paid by *every* h2 stream — the canonical Linux delayed-ACK
+  + Nagle interaction on small framer writes. One-line fix:
+  TCP_NODELAY at accept time. **h2load `-c 1 -m 1 -n 200`: min
+  40.62 → 0.54 ms (−98.7%), throughput 24 → 1,142 r/s (+47.6×).** The
+  `HYPERION_H2_TIMING=1` instrumentation stays in place as durable
+  diagnostic infrastructure.
+
+Full per-stream details, bench numbers, and follow-up items live in
+[`CHANGELOG.md`](CHANGELOG.md).
+
 ## What's new in 2.5.0
 
 **Native HPACK ON by default + autobahn 100% conformance + request

@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] - 2.10.0
+## 2.10.0 — 2026-05-01
 
 The 2.10 sprint widens the bench comparison from "Hyperion vs Falcon
 on h2" (the 2.9-B head-to-head) to **all four major Ruby web servers**:
