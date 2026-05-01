@@ -11,12 +11,19 @@
 > the published absolute rps numbers do **not** reproduce on the same
 > host with no code changes:
 >
-> | Row | Published 2.0.0 | Spot-check 2026-05-01 | Δ |
-> |---|---:|---:|---:|
-> | Hello-world `-w 16 -t 5` | 96,813 r/s | **76,593 r/s** | **-21%** |
-> | Hello-world `-w 4 -t 5` | 20,630 r/s | **17,667 r/s** | **-14%** |
-> | Static 1 MiB `-w 1 -t 5` | 1,809 r/s | **1,228 r/s** | **-32%** |
-> | Static 1 MiB Puma `-w 1 -t 5:5` | 2,139 r/s | **1,593 r/s** (Puma 6.6.1) | **-26%** |
+> | Row | Published 2.0.0 | Spot-check 2026-04-30 (degraded host) | Spot-check 2026-05-01 (fresh-boot host) | Δ vs published |
+> |---|---:|---:|---:|---:|
+> | Hello-world `-w 16 -t 5` | 96,813 r/s | 76,593 r/s | (not re-run) | — |
+> | Hello-world `-w 4 -t 5` | 20,630 r/s | 17,667 r/s | (not re-run) | — |
+> | Static 1 MiB `-w 1 -t 5` Hyp | 1,809 r/s | 1,228 r/s | **3,041 r/s** | **+68%** |
+> | Static 1 MiB Puma `-w 1 -t 5:5` | 2,139 r/s | 1,593 r/s (Puma 6.6.1) | (not re-run) | — |
+>
+> **The 2.7-A bisect pinned the static drift to bench-host degradation,
+> not algorithmic regression.** A fresh openclaw-vm boot (5 min uptime,
+> no neighbor-VM contention) puts Hyperion at ~3,000 r/s with p99 ~2.5
+> ms across every released tag from v2.0.1 to master — _better_ than
+> the published 2.0.0 figure. The 2026-04-30 "1,228 r/s" reading was
+> a degraded-host artifact, not a 2.6.0 regression.
 >
 > The bench host is a single KVM VM running other workloads in the
 > background; absolute-rps drift between sweep dates is real. **The
@@ -82,7 +89,7 @@ Topology-relevance column: **prod** = applies to nginx-fronted plaintext-h1 depl
 | 4 | Static 1 MiB `-w 1 -t 5` (`bench/static.ru`) | 1,809 | **2,139** | -15.4% | 4.37 ms / 57.74 ms | prod | NO (rps), **YES (p99 13.2× lower)** |
 | 5 | Static 8 KB `-w 1 -t 5` (`bench/static_8k.ru`) | 121 | **1,246** | -90.3% | 43.85 ms / 109.05 ms | prod | **NO** — see [caveat](#caveat-static-8k-at--t-5); -t 64 gets to 1,112; closed in 2.0.1 |
 | 6 | SSE 1000×50 B (`bench/sse.ru`, `wrk -t1 -c1`) — **Hyperion-flush-sentinel internal test, not a fair Puma comparison** | **24** | 0 (rackup uses a Hyperion-only sentinel, Puma framing breaks) | n/a — see [SSE row](#sse-streaming) | 41.19 ms / — | prod (with caveat) | Hyperion-only protocol exercise; the cross-server number lives in row 6b. |
-| 6b | SSE 1000×50 B (`bench/sse_generic.ru`, `wrk -t1 -c1`) — **generic Rack 3 chunked rackup, no sentinel** | **pending** (2.7-C bench-host run) | **pending** | **pending** | pending | prod | **pending** — 2.7-C added the rackup; bench-host SSH was unavailable during the doc pass, so the cross-server row is filed as a follow-up rerun (see [SSE row](#sse-streaming)). |
+| 6b | SSE 1000×50 B (`bench/sse_generic.ru`, `wrk -t1 -c1`) — **generic Rack 3 chunked rackup, no sentinel** | **510** | 133 | **+281%** (3.8×) | 2.42 ms / 9.64 ms (4× lower) | prod | **VERIFIED 2026-05-01 (post 2.7 + fresh-host).** Honest cross-server comparison. Puma DOES serve SSE (vs the prior misclaim from row 6); Hyperion is 3.8× faster on rps with 4× lower p99. |
 | 7 | PG-bound 50ms wait (Hyp `--async-io -t 5 -w 1` pool=200 vs Puma `-t 100:100`) | **2,189** (originally; see verification rerun: median **~2,567** at matched-WAN-PG) | 458 | **originally +378%** (4.78×) — **honest matched-config ratio is uncalibrated**; see [Row 7 verification](#row-7-verification-rerun-2026-04-29-2145-utc) | 597 ms / 566 ms | prod | YES (architecturally; magnitude indicative only) |
 | 8 | PG realistic transactional (Hyp `--async-io` pool=64 vs Puma `-t 30`) | **1,216** | 268 | **+354%** (4.54×) — **same apples-to-oranges caveat as row 7**: Hyperion against WAN PG max_conn=500, Puma against local PG max_conn=100. Magnitude indicative only. | 5.96 s / 7.18 s | prod | YES (architecturally; magnitude indicative only) |
 | 9 | TLS h1 hello (Hyp `-t 64 -w 1` vs Puma `-t 5:64`) | **3,425** | 2,142 | **+59.9%** | 78.17 ms / 37.06 ms | bench-only | YES (only if you terminate TLS at Hyperion) |
