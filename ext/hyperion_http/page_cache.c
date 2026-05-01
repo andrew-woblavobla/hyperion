@@ -100,9 +100,14 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <dirent.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
 
 /* Shared identifiers / refs.  parser.c and sendfile.c each register their
  * own copies of Hyperion / Hyperion::Http (lazy-define if missing); we
@@ -1061,6 +1066,787 @@ static VALUE rb_pc_auto_threshold(VALUE self) {
     return INT2NUM(HYP_PC_AUTO_THRESHOLD);
 }
 
+/* ============================================================
+ * 2.12-C — Connection lifecycle in C.
+ *
+ * `run_static_accept_loop(listen_fd, idle_max_ms)` runs an accept ->
+ * read-headers -> route-lookup -> write loop ENTIRELY in C for a
+ * designated listening socket. Ruby is re-entered ONLY for:
+ *
+ *   1. Lifecycle hooks (when `lifecycle_hooks_active?` is true; gated
+ *      by a single `int` test so the no-hook hot path stays branch-
+ *      free) — one `rb_funcall` per request via the registered
+ *      `lifecycle_callback`.
+ *
+ *   2. Handoff: when the accepted connection's first request doesn't
+ *      match a `StaticEntry` (or the request is malformed / has a
+ *      body / is HTTP/1.0 close / requests an upgrade), the C loop
+ *      invokes the registered `handoff_callback` with `(fd_int,
+ *      partial_buffer_or_nil)` and continues to the next accept.
+ *      Ruby owns the fd from that point on.
+ *
+ *   3. Stop: when the listening fd returns EBADF / ECONNABORTED in a
+ *      way that suggests `Server#stop` closed it, the loop returns
+ *      the served-request count cleanly.
+ *
+ * Per-connection cost on a hit:
+ *   * 1 `accept` syscall (GVL released).
+ *   * 1 `setsockopt(TCP_NODELAY)` (mirrors 2.10-G; Nagle off so small
+ *     responses aren't waiting on the peer's delayed-ACK timer).
+ *   * 1 `recv` syscall to read the request headers (GVL released).
+ *   * 1 `write` syscall for the prebuilt response (GVL released).
+ *   * 0 Ruby allocations on the hot path past the served-count
+ *     accumulator (a Fixnum in the Ruby-visible return value).
+ *
+ * Wire format expectations:
+ *   * The request must be HTTP/1.1 (HTTP/1.0 is handed back to Ruby —
+ *     keep-alive defaulting differs and the existing connection.rb
+ *     already implements this correctly).
+ *   * No request body (`Content-Length` / `Transfer-Encoding` headers
+ *     trigger handoff). The whole point of `handle_static` is GETs/
+ *     HEADs without a body; anything else is operator misuse and the
+ *     Ruby path can produce a more diagnostic error.
+ *   * Method must be GET or HEAD (matches `serve_request`'s gate).
+ *
+ * Concurrency: this function MUST be called on a Ruby thread that
+ * owns the GVL. The loop releases the GVL during the blocking
+ * syscalls and re-acquires it for the lifecycle / handoff
+ * callbacks; the C-side PageCache lock (`hyp_pc_lock`) is taken
+ * only for the lookup snapshot and released before the write
+ * (the same pattern `serve_request` already uses).
+ * ============================================================ */
+
+/* Per-process state for the lifecycle / handoff callbacks. The
+ * callbacks themselves are mark-protected via `rb_gc_register_mark_object`
+ * so they survive across the GC even though they're stored in
+ * static globals. */
+static VALUE  hyp_cl_lifecycle_callback = Qnil;
+static VALUE  hyp_cl_handoff_callback   = Qnil;
+static int    hyp_cl_lifecycle_active   = 0;
+
+/* Stop flag — flipped from Ruby via `stop_accept_loop` when the
+ * listener should drop out of the loop voluntarily (graceful
+ * shutdown). The accept syscall is still blocking; the operator's
+ * `Server#stop` close()s the listener, which races us out via
+ * `accept` returning EBADF / EINVAL. The flag is the secondary
+ * signal: between two requests on a keep-alive connection we
+ * check it before the next read. */
+static volatile sig_atomic_t hyp_cl_stop = 0;
+
+/* Header-section size cap. Anything bigger is rejected: the request
+ * is malformed or hostile, and either way Ruby's full parser is
+ * the right place to produce an error response. Mirrors
+ * `Connection::MAX_HEADER_BYTES` (64 KiB). */
+#define HYP_CL_MAX_HEADER_BYTES 65536
+/* Read chunk for header accumulation. 8 KiB matches the Ruby-side
+ * `INBUF_INITIAL_CAPACITY` so a typical request fits in one recv. */
+#define HYP_CL_READ_CHUNK 8192
+
+/* ---- accept ---- */
+typedef struct {
+    int listen_fd;
+    int client_fd;
+    int err;
+} hyp_cl_accept_args_t;
+
+static void *hyp_cl_accept_blocking(void *raw) {
+    hyp_cl_accept_args_t *a = (hyp_cl_accept_args_t *)raw;
+    a->client_fd = -1;
+    a->err = 0;
+    for (;;) {
+        struct sockaddr_storage ss;
+        socklen_t slen = (socklen_t)sizeof(ss);
+        int fd = accept(a->listen_fd, (struct sockaddr *)&ss, &slen);
+        if (fd >= 0) {
+            a->client_fd = fd;
+            return NULL;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* Listener fd was non-blocking despite our F_SETFL clear
+             * (or someone else flipped it back). Park on select() so
+             * we don't busy-loop. The stop flag is checked by the
+             * outer Ruby caller between accepts. */
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(a->listen_fd, &rfds);
+            struct timeval tv;
+            tv.tv_sec  = 1;
+            tv.tv_usec = 0;
+            int s = select(a->listen_fd + 1, &rfds, NULL, NULL, &tv);
+            if (s < 0 && errno == EINTR) {
+                continue;
+            }
+            /* On timeout, return so the caller can check the stop
+             * flag and re-enter. */
+            if (s == 0) {
+                a->err = EAGAIN;
+                return NULL;
+            }
+            continue;
+        }
+        a->err = errno;
+        return NULL;
+    }
+}
+
+/* ---- recv ---- */
+typedef struct {
+    int    fd;
+    char  *buf;
+    size_t cap;
+    size_t off;
+    int    err;
+    /* Set by the caller; signals that we should bail out of recv on
+     * the first EAGAIN/EWOULDBLOCK rather than retrying. Used between
+     * keep-alive requests so an idle conn doesn't stall the worker. */
+    int    nonblock_first;
+} hyp_cl_recv_args_t;
+
+static void *hyp_cl_recv_blocking(void *raw) {
+    hyp_cl_recv_args_t *a = (hyp_cl_recv_args_t *)raw;
+    a->err = 0;
+    for (;;) {
+        if (a->off >= a->cap) {
+            a->err = E2BIG;
+            return NULL;
+        }
+        ssize_t n = recv(a->fd, a->buf + a->off, a->cap - a->off, 0);
+        if (n > 0) {
+            a->off += (size_t)n;
+            /* Look for end-of-headers (\r\n\r\n). Bounded scan over
+             * what we've buffered so far. */
+            if (a->off >= 4) {
+                /* Fast scan of the just-read window first; fall back to
+                 * a full scan if a CRLFCRLF straddled a recv boundary. */
+                const char *base = a->buf;
+                size_t scan_end = a->off;
+                size_t i = (a->off - (size_t)n >= 3) ? a->off - (size_t)n - 3 : 0;
+                while (i + 3 < scan_end) {
+                    if (base[i]   == '\r' && base[i+1] == '\n' &&
+                        base[i+2] == '\r' && base[i+3] == '\n') {
+                        return NULL;
+                    }
+                    i++;
+                }
+            }
+            continue;
+        }
+        if (n == 0) {
+            /* Peer closed cleanly. */
+            a->err = ECONNRESET;
+            return NULL;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* The fd was unexpectedly non-blocking (Darwin's accept(2)
+             * doesn't propagate O_NONBLOCK from the listener, but the
+             * defensive branch keeps us correct on hosts where it
+             * does — or where someone flipped the flag on the
+             * accepted socket via setsockopt). Park on select(). */
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(a->fd, &rfds);
+            struct timeval tv;
+            tv.tv_sec  = 30; /* generous; matches Connection's read timeout */
+            tv.tv_usec = 0;
+            int s = select(a->fd + 1, &rfds, NULL, NULL, &tv);
+            if (s < 0 && errno == EINTR) {
+                continue;
+            }
+            if (s == 0) {
+                a->err = ETIMEDOUT;
+                return NULL;
+            }
+            continue;
+        }
+        a->err = errno;
+        return NULL;
+    }
+}
+
+/* Find end-of-headers in `buf` of length `len`. Returns the byte
+ * offset PAST the trailing CRLFCRLF (i.e. where the body, if any,
+ * would start), or -1 if not found. */
+static long hyp_cl_find_eoh(const char *buf, size_t len) {
+    if (len < 4) {
+        return -1;
+    }
+    for (size_t i = 0; i + 3 < len; i++) {
+        if (buf[i]   == '\r' && buf[i+1] == '\n' &&
+            buf[i+2] == '\r' && buf[i+3] == '\n') {
+            return (long)(i + 4);
+        }
+    }
+    return -1;
+}
+
+/* Parse the request line out of the headers section. On success,
+ * fills *m_off, *m_len, *p_off, *p_len with the offsets/lengths of
+ * METHOD and PATH inside `buf`, and returns the length of the
+ * request line including the trailing CRLF. On malformed input
+ * returns -1. The version (HTTP/1.1) is checked here too — anything
+ * other than HTTP/1.1 returns -1 so the caller hands off to Ruby. */
+static long hyp_cl_parse_request_line(const char *buf, size_t len,
+                                      size_t *m_off, size_t *m_len,
+                                      size_t *p_off, size_t *p_len) {
+    /* Find first SP — separates METHOD from PATH. */
+    size_t i = 0;
+    while (i < len && buf[i] != ' ' && buf[i] != '\r' && buf[i] != '\n') {
+        i++;
+    }
+    if (i == 0 || i >= len || buf[i] != ' ') {
+        return -1;
+    }
+    *m_off = 0;
+    *m_len = i;
+    i++;
+    size_t p_start = i;
+    while (i < len && buf[i] != ' ' && buf[i] != '\r' && buf[i] != '\n') {
+        i++;
+    }
+    if (i >= len || buf[i] != ' ' || i == p_start) {
+        return -1;
+    }
+    *p_off = p_start;
+    *p_len = i - p_start;
+    i++;
+    /* Version: must be exactly "HTTP/1.1" followed by CRLF for the
+     * C path. HTTP/1.0 has different keep-alive defaults; let Ruby
+     * handle it. */
+    if (i + 10 > len) {
+        return -1;
+    }
+    if (memcmp(buf + i, "HTTP/1.1\r\n", 10) != 0) {
+        return -1;
+    }
+    return (long)(i + 10);
+}
+
+/* Case-insensitive byte compare for header names. */
+static int hyp_cl_iequals(const char *a, size_t alen, const char *b, size_t blen) {
+    if (alen != blen) {
+        return 0;
+    }
+    for (size_t i = 0; i < alen; i++) {
+        char ca = a[i];
+        char cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
+        if (ca != cb) return 0;
+    }
+    return 1;
+}
+
+/* Inspect the header block (between request-line end and CRLFCRLF)
+ * and report:
+ *   *connection_close: 1 if Connection: close was seen, 0 otherwise.
+ *   *has_body:         1 if Content-Length>0 or Transfer-Encoding
+ *                      was seen (anything but CL:0).
+ *   *upgrade_seen:     1 if Upgrade or h2 settings header was seen.
+ *
+ * Returns 0 on success, -1 on malformed framing. */
+static int hyp_cl_scan_headers(const char *buf, size_t start, size_t end,
+                               int *connection_close, int *has_body,
+                               int *upgrade_seen) {
+    *connection_close = 0;
+    *has_body = 0;
+    *upgrade_seen = 0;
+    /* `end` points just past the closing CRLFCRLF; the last meaningful
+     * header byte is at `end - 5` (the CR of the final header's CRLF
+     * followed by the empty CRLF). The terminator we look for is
+     * `\r\n` at positions [end-4, end-3]. */
+    size_t i = start;
+    while (i + 2 <= end) {
+        if (i + 1 < end && buf[i] == '\r' && buf[i+1] == '\n') {
+            /* Empty line — end of headers reached. */
+            return 0;
+        }
+        size_t name_start = i;
+        while (i < end && buf[i] != ':' && buf[i] != '\r') {
+            i++;
+        }
+        if (i >= end || buf[i] != ':') {
+            return -1;
+        }
+        size_t name_end = i;
+        i++; /* past ':' */
+        while (i < end && (buf[i] == ' ' || buf[i] == '\t')) {
+            i++;
+        }
+        size_t val_start = i;
+        while (i < end && buf[i] != '\r') {
+            i++;
+        }
+        if (i + 1 >= end || buf[i+1] != '\n') {
+            return -1;
+        }
+        size_t val_end = i;
+        i += 2; /* past CRLF */
+
+        size_t nlen = name_end - name_start;
+        size_t vlen = val_end - val_start;
+        const char *nptr = buf + name_start;
+        const char *vptr = buf + val_start;
+
+        if (hyp_cl_iequals(nptr, nlen, "connection", 10)) {
+            /* Trim trailing whitespace. */
+            while (vlen > 0 && (vptr[vlen - 1] == ' ' || vptr[vlen - 1] == '\t')) {
+                vlen--;
+            }
+            if (hyp_cl_iequals(vptr, vlen, "close", 5)) {
+                *connection_close = 1;
+            } else if (hyp_cl_iequals(vptr, vlen, "upgrade", 7)) {
+                *upgrade_seen = 1;
+            }
+        } else if (hyp_cl_iequals(nptr, nlen, "content-length", 14)) {
+            /* Trim leading/trailing whitespace then parse. */
+            while (vlen > 0 && (vptr[0] == ' ' || vptr[0] == '\t')) {
+                vptr++; vlen--;
+            }
+            while (vlen > 0 && (vptr[vlen - 1] == ' ' || vptr[vlen - 1] == '\t')) {
+                vlen--;
+            }
+            int cl_zero = (vlen == 1 && vptr[0] == '0');
+            if (!cl_zero) {
+                *has_body = 1;
+            }
+        } else if (hyp_cl_iequals(nptr, nlen, "transfer-encoding", 17)) {
+            *has_body = 1;
+        } else if (hyp_cl_iequals(nptr, nlen, "upgrade", 7)) {
+            *upgrade_seen = 1;
+        } else if (hyp_cl_iequals(nptr, nlen, "http2-settings", 14)) {
+            *upgrade_seen = 1;
+        }
+    }
+    return -1;
+}
+
+/* Lifecycle fire helper: rb_funcall into the registered callback
+ * with (method_str, path_str). Wrapped in rb_protect so a misbehaving
+ * Ruby hook can't take down the C loop. */
+typedef struct {
+    VALUE callback;
+    VALUE method_str;
+    VALUE path_str;
+} hyp_cl_hook_args_t;
+
+static VALUE hyp_cl_hook_invoke(VALUE raw) {
+    hyp_cl_hook_args_t *a = (hyp_cl_hook_args_t *)raw;
+    return rb_funcall(a->callback, rb_intern("call"), 2,
+                      a->method_str, a->path_str);
+}
+
+static void hyp_cl_fire_lifecycle(const char *method, size_t mlen,
+                                  const char *path, size_t plen) {
+    if (!hyp_cl_lifecycle_active || NIL_P(hyp_cl_lifecycle_callback)) {
+        return;
+    }
+    hyp_cl_hook_args_t a;
+    a.callback   = hyp_cl_lifecycle_callback;
+    a.method_str = rb_str_new(method, (long)mlen);
+    a.path_str   = rb_str_new(path, (long)plen);
+    int state = 0;
+    rb_protect(hyp_cl_hook_invoke, (VALUE)&a, &state);
+    /* Swallow the exception state — same contract as `Runtime#fire_*`:
+     * a misbehaving observer must not break dispatch. The Ruby-side
+     * callback already wraps individual hooks in their own rescues
+     * and logs failures; this protect is belt-and-suspenders so the
+     * C loop can't crash on a hook error either. */
+    if (state) {
+        rb_set_errinfo(Qnil);
+    }
+}
+
+/* Handoff: invoke the Ruby callback with (fd, partial_buffer_str_or_nil).
+ * Ruby owns the fd from that point on — C must not close it. */
+typedef struct {
+    VALUE callback;
+    VALUE fd_int;
+    VALUE buffer_str;
+} hyp_cl_handoff_args_t;
+
+static VALUE hyp_cl_handoff_invoke(VALUE raw) {
+    hyp_cl_handoff_args_t *a = (hyp_cl_handoff_args_t *)raw;
+    return rb_funcall(a->callback, rb_intern("call"), 2,
+                      a->fd_int, a->buffer_str);
+}
+
+static void hyp_cl_handoff(int client_fd, const char *partial, size_t partial_len) {
+    if (NIL_P(hyp_cl_handoff_callback)) {
+        /* No callback registered — close the fd ourselves rather than
+         * leaking it. This branch is paranoia; the Ruby side always
+         * registers a handoff callback before starting the loop. */
+        close(client_fd);
+        return;
+    }
+    hyp_cl_handoff_args_t a;
+    a.callback   = hyp_cl_handoff_callback;
+    a.fd_int     = INT2NUM(client_fd);
+    a.buffer_str = (partial_len > 0) ? rb_str_new(partial, (long)partial_len) : Qnil;
+    int state = 0;
+    rb_protect(hyp_cl_handoff_invoke, (VALUE)&a, &state);
+    if (state) {
+        /* Handoff failed — swallow and close the fd; better to drop
+         * one connection than crash the whole loop. */
+        rb_set_errinfo(Qnil);
+        close(client_fd);
+    }
+}
+
+/* Apply TCP_NODELAY to the accepted connection. Mirrors 2.10-G — Nagle
+ * off so small responses aren't held by the peer's delayed-ACK timer.
+ * Best-effort; failures are swallowed (some socket types don't honour
+ * the option, or it was already set). */
+static void hyp_cl_apply_tcp_nodelay(int fd) {
+    int one = 1;
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+}
+
+/* Pre-built `404 Not Found` response, written to the socket when the
+ * C loop sees a method/path it can answer with a definite negative
+ * BUT can't hand off to Ruby (because the rest of the request looks
+ * like a normal static request — peer expects an HTTP response, not
+ * a TCP RST). Used only when handoff_callback is nil; otherwise we
+ * always prefer to hand off to let Ruby produce the response.
+ *
+ * Currently unused — kept for future "C-only mode" where Ruby is
+ * never re-entered. */
+/* static const char hyp_cl_404[] =
+ *     "HTTP/1.1 404 Not Found\r\n"
+ *     "content-type: text/plain\r\n"
+ *     "content-length: 9\r\n"
+ *     "connection: close\r\n"
+ *     "\r\n"
+ *     "not found"; */
+
+/* Serve one connection on `client_fd`. Returns the count of requests
+ * served on this connection; -1 if the connection ended in a way
+ * that should not increment the served counter (handoff, peer
+ * disconnect mid-request). The `*handed_off` flag distinguishes
+ * "Ruby took ownership of this fd" (we must NOT close it) from
+ * "peer closed and we should close" (we close locally).
+ *
+ * The full headers buffer is kept stack-local — at 8 KiB it fits
+ * comfortably and we avoid per-connection malloc traffic. */
+static long hyp_cl_serve_connection(int client_fd, int *handed_off) {
+    *handed_off = 0;
+    long served = 0;
+    char buf[HYP_CL_MAX_HEADER_BYTES];
+    size_t buf_len = 0;
+
+    /* Apply TCP_NODELAY once per connection — it sticks for the
+     * lifetime of the fd. */
+    hyp_cl_apply_tcp_nodelay(client_fd);
+
+    for (;;) {
+        if (hyp_cl_stop) {
+            close(client_fd);
+            return served;
+        }
+
+        /* If we have leftover bytes from the previous request (pipelined
+         * input), they're already at the start of `buf`. Read more
+         * until we have a full header section. */
+        long eoh = hyp_cl_find_eoh(buf, buf_len);
+        while (eoh < 0) {
+            hyp_cl_recv_args_t r;
+            r.fd  = client_fd;
+            r.buf = buf;
+            r.cap = sizeof(buf);
+            r.off = buf_len;
+            r.err = 0;
+            r.nonblock_first = 0;
+            rb_thread_call_without_gvl(hyp_cl_recv_blocking, &r,
+                                       RUBY_UBF_IO, NULL);
+            buf_len = r.off;
+            if (r.err == ECONNRESET || r.err == ECONNABORTED) {
+                /* Peer hung up. Close locally; not a request. */
+                close(client_fd);
+                return served;
+            }
+            if (r.err != 0 && r.err != EINTR) {
+                /* Unexpected read error — close locally. */
+                close(client_fd);
+                return served;
+            }
+            eoh = hyp_cl_find_eoh(buf, buf_len);
+            if (eoh < 0 && buf_len >= sizeof(buf)) {
+                /* Header section exceeds our cap — hand off to Ruby
+                 * (its parser produces a 400 with the right shape). */
+                hyp_cl_handoff(client_fd, buf, buf_len);
+                *handed_off = 1;
+                return served;
+            }
+        }
+
+        size_t method_off, method_len, path_off, path_len;
+        long req_line_end = hyp_cl_parse_request_line(
+            buf, (size_t)eoh, &method_off, &method_len, &path_off, &path_len);
+        if (req_line_end < 0) {
+            /* Malformed or HTTP/1.0 — let Ruby handle the response. */
+            hyp_cl_handoff(client_fd, buf, buf_len);
+            *handed_off = 1;
+            return served;
+        }
+
+        int connection_close = 0;
+        int has_body         = 0;
+        int upgrade_seen     = 0;
+        int hdr_ok = hyp_cl_scan_headers(buf, (size_t)req_line_end, (size_t)eoh,
+                                         &connection_close, &has_body, &upgrade_seen);
+        if (hdr_ok != 0 || has_body || upgrade_seen) {
+            hyp_cl_handoff(client_fd, buf, buf_len);
+            *handed_off = 1;
+            return served;
+        }
+
+        /* Method + path lookup against the page cache. Reuse the
+         * existing classify + lookup helpers so the C-side cache state
+         * is the single source of truth — `Server.handle_static`
+         * registers entries via `register_prebuilt`, this loop reads
+         * them via `lookup_locked`. */
+        hyp_pc_method_t kind = hyp_pc_classify_method(buf + method_off, method_len);
+        if (kind == HYP_PC_METHOD_OTHER) {
+            hyp_cl_handoff(client_fd, buf, buf_len);
+            *handed_off = 1;
+            return served;
+        }
+
+        pthread_mutex_lock(&hyp_pc_lock);
+        int was_stale = 0;
+        hyp_page_slot_t *slot = hyp_pc_lookup_locked(buf + path_off, path_len, &was_stale);
+        if (slot == NULL) {
+            pthread_mutex_unlock(&hyp_pc_lock);
+            hyp_cl_handoff(client_fd, buf, buf_len);
+            *handed_off = 1;
+            return served;
+        }
+        size_t write_len = (kind == HYP_PC_METHOD_HEAD)
+                               ? slot->page->headers_len
+                               : slot->page->response_len;
+        char *snapshot = (char *)malloc(write_len);
+        if (snapshot == NULL) {
+            pthread_mutex_unlock(&hyp_pc_lock);
+            /* OOM mid-loop — hand off so Ruby can return 500. */
+            hyp_cl_handoff(client_fd, buf, buf_len);
+            *handed_off = 1;
+            return served;
+        }
+        memcpy(snapshot, slot->page->response_buf, write_len);
+        pthread_mutex_unlock(&hyp_pc_lock);
+
+        hyp_pc_write_args_t wargs;
+        wargs.fd    = client_fd;
+        wargs.buf   = snapshot;
+        wargs.len   = write_len;
+        wargs.total = 0;
+        wargs.err   = 0;
+        rb_thread_call_without_gvl(hyp_pc_write_blocking, &wargs,
+                                   RUBY_UBF_IO, NULL);
+        free(snapshot);
+
+        if (wargs.err != 0 && wargs.total == 0) {
+            /* Write failed — peer most likely gone. Close and exit. */
+            close(client_fd);
+            return served;
+        }
+
+        served++;
+
+        /* Lifecycle hooks fire AFTER the wire write so observers see a
+         * completed request. Keep this off the no-hook hot path via
+         * the integer flag. */
+        if (hyp_cl_lifecycle_active) {
+            hyp_cl_fire_lifecycle(buf + method_off, method_len,
+                                  buf + path_off, path_len);
+        }
+
+        /* Carry pipelined bytes forward into the same buffer. */
+        size_t consumed = (size_t)eoh;
+        if (consumed < buf_len) {
+            memmove(buf, buf + consumed, buf_len - consumed);
+            buf_len -= consumed;
+        } else {
+            buf_len = 0;
+        }
+
+        if (connection_close) {
+            /* Half-close, then briefly drain any inbound bytes so the
+             * close() doesn't trigger an RST. Some platforms (notably
+             * macOS) deliver RST when close() is called on a socket
+             * with unread bytes in the receive queue — even the peer's
+             * normal FIN-empty packet can race the close and surface
+             * as ECONNRESET to the peer's last read(2). The drain is
+             * bounded to a small absolute deadline so a misbehaving
+             * peer can't stall us. */
+            shutdown(client_fd, SHUT_WR);
+            char drain[1024];
+            for (int i = 0; i < 4; i++) {
+                ssize_t n = recv(client_fd, drain, sizeof(drain), MSG_DONTWAIT);
+                if (n <= 0) break;
+            }
+            close(client_fd);
+            return served;
+        }
+        /* Keep-alive: loop back and read the next request. */
+    }
+}
+
+/* Args passed into the no-GVL blocking accept wrapper. */
+typedef struct {
+    int listen_fd;
+    /* On return: the served-request count for this loop invocation,
+     * or -1 if the listener returned EBADF (graceful close). */
+    long served_count;
+} hyp_cl_loop_args_t;
+
+/* PageCache.run_static_accept_loop(listen_fd) -> Integer | :crashed
+ *
+ * Drives the accept-and-serve loop. Returns the count of requests
+ * served when the loop exits cleanly (listener closed, stop flag
+ * raised) or `:crashed` if an unrecoverable accept error happened. */
+static VALUE rb_pc_run_static_accept_loop(VALUE self, VALUE rb_listen_fd) {
+    (void)self;
+    int listen_fd = NUM2INT(rb_listen_fd);
+    if (listen_fd < 0) {
+        rb_raise(rb_eArgError, "listen_fd must be >= 0");
+    }
+    hyp_cl_stop = 0;
+
+    /* Ruby's `TCPServer.new` sets O_NONBLOCK on the listening fd so
+     * `IO.select` + `accept_nonblock` works naturally on the Ruby
+     * side. Our C accept loop wants a BLOCKING fd: we release the
+     * GVL during the accept syscall and want the kernel to park us
+     * there rather than burning CPU on EAGAIN. Clear O_NONBLOCK
+     * unconditionally — the operator's existing accept-loop code
+     * paths don't share this fd with us (we own it for the lifetime
+     * of `run_static_accept_loop`). */
+    int flags = fcntl(listen_fd, F_GETFL, 0);
+    if (flags >= 0 && (flags & O_NONBLOCK)) {
+        (void)fcntl(listen_fd, F_SETFL, flags & ~O_NONBLOCK);
+    }
+
+    long served = 0;
+    for (;;) {
+        if (hyp_cl_stop) {
+            break;
+        }
+        hyp_cl_accept_args_t a;
+        a.listen_fd = listen_fd;
+        a.client_fd = -1;
+        a.err = 0;
+        rb_thread_call_without_gvl(hyp_cl_accept_blocking, &a,
+                                   RUBY_UBF_IO, NULL);
+        if (a.client_fd < 0) {
+            if (a.err == EBADF || a.err == EINVAL) {
+                /* Listener was closed — graceful exit. */
+                break;
+            }
+            if (a.err == ECONNABORTED || a.err == EAGAIN ||
+                a.err == EWOULDBLOCK || a.err == EINTR) {
+                /* Transient — re-check stop flag and re-enter accept. */
+                continue;
+            }
+            /* Unexpected accept error; surface as :crashed so Ruby can
+             * fall back to its own accept loop. */
+            return ID2SYM(rb_intern("crashed"));
+        }
+
+        int handed_off = 0;
+        long n = hyp_cl_serve_connection(a.client_fd, &handed_off);
+        if (n > 0) {
+            served += n;
+        }
+        /* hyp_cl_serve_connection closes the fd itself unless it handed
+         * off to Ruby. Either way our work for this connection is
+         * done. */
+    }
+    return LONG2NUM(served);
+}
+
+/* PageCache.set_lifecycle_callback(callable_or_nil) -> callable_or_nil
+ *
+ * Registers (or clears) the per-request lifecycle callback. Called
+ * once at server boot from `Hyperion::Server`'s accept-loop set-up.
+ * The callback receives (method_str, path_str) once per request the
+ * C loop served; the Ruby implementation builds a Request and fires
+ * `Runtime#fire_request_start` + `fire_request_end`. */
+static VALUE rb_pc_set_lifecycle_callback(VALUE self, VALUE callback) {
+    (void)self;
+    if (!NIL_P(callback) && !rb_respond_to(callback, rb_intern("call"))) {
+        rb_raise(rb_eArgError, "callback must respond to #call");
+    }
+    hyp_cl_lifecycle_callback = callback;
+    return callback;
+}
+
+/* PageCache.set_lifecycle_active(bool) -> bool
+ *
+ * Toggles the integer flag the C loop reads on every request to
+ * decide whether to invoke the lifecycle callback. Decoupled from
+ * the callback registration so Ruby can flip it cheaply when hooks
+ * are added/removed at runtime, without re-registering the
+ * callback object itself. */
+static VALUE rb_pc_set_lifecycle_active(VALUE self, VALUE flag) {
+    (void)self;
+    hyp_cl_lifecycle_active = RTEST(flag) ? 1 : 0;
+    return flag;
+}
+
+/* PageCache.lifecycle_active? -> bool
+ *
+ * Spec/operator helper. */
+static VALUE rb_pc_lifecycle_active_p(VALUE self) {
+    (void)self;
+    return hyp_cl_lifecycle_active ? Qtrue : Qfalse;
+}
+
+/* PageCache.set_handoff_callback(callable) -> callable
+ *
+ * Registers the callback the C loop invokes when a request can't
+ * be served from the static cache. Receives (fd_int, partial_buffer_str_or_nil)
+ * — Ruby owns the fd from that point on. The accept loop continues
+ * to the next connection; a handoff is per-connection, not per-
+ * accept-loop. */
+static VALUE rb_pc_set_handoff_callback(VALUE self, VALUE callback) {
+    (void)self;
+    if (!NIL_P(callback) && !rb_respond_to(callback, rb_intern("call"))) {
+        rb_raise(rb_eArgError, "callback must respond to #call");
+    }
+    hyp_cl_handoff_callback = callback;
+    return callback;
+}
+
+/* PageCache.stop_accept_loop -> nil
+ *
+ * Flips the stop flag. The accept loop checks it between accepts and
+ * (more importantly) between keep-alive requests on the same
+ * connection; the `Server#stop` close()-on-listener is the primary
+ * signal (it races us out via accept returning EBADF). */
+static VALUE rb_pc_stop_accept_loop(VALUE self) {
+    (void)self;
+    hyp_cl_stop = 1;
+    return Qnil;
+}
+
+/* PageCache.handoff_to_ruby(client_fd, _partial_buffer, _partial_len) -> Integer
+ *
+ * Echo helper — exposed for spec parity with the bench-time API
+ * shape called out in the 2.12-C plan. The actual handoff happens
+ * inside the C loop via the registered callback; this method exists
+ * so callers can introspect the contract without engaging the
+ * accept loop. */
+static VALUE rb_pc_handoff_to_ruby(VALUE self, VALUE rb_fd, VALUE rb_buf,
+                                   VALUE rb_len) {
+    (void)self; (void)rb_buf; (void)rb_len;
+    return rb_fd;
+}
+
 /* PageCache.max_key_len -> Integer */
 static VALUE rb_pc_max_key_len(VALUE self) {
     (void)self;
@@ -1109,6 +1895,26 @@ void Init_hyperion_page_cache(void) {
                                rb_pc_register_prebuilt, 3);
     rb_define_singleton_method(rb_mHyperionHttpPageCache, "serve_request",
                                rb_pc_serve_request, 3);
+    /* 2.12-C — connection lifecycle in C. */
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "run_static_accept_loop",
+                               rb_pc_run_static_accept_loop, 1);
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "stop_accept_loop",
+                               rb_pc_stop_accept_loop, 0);
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "set_lifecycle_callback",
+                               rb_pc_set_lifecycle_callback, 1);
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "set_lifecycle_active",
+                               rb_pc_set_lifecycle_active, 1);
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "lifecycle_active?",
+                               rb_pc_lifecycle_active_p, 0);
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "set_handoff_callback",
+                               rb_pc_set_handoff_callback, 1);
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "handoff_to_ruby",
+                               rb_pc_handoff_to_ruby, 3);
+
+    /* Mark-protect the lifecycle / handoff callback slots so the GC
+     * doesn't collect them while the C loop is running. */
+    rb_gc_register_address(&hyp_cl_lifecycle_callback);
+    rb_gc_register_address(&hyp_cl_handoff_callback);
 
     id_fileno_pc = rb_intern("fileno");
     id_to_io_pc  = rb_intern("to_io");

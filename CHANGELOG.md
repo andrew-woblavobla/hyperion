@@ -2,6 +2,111 @@
 
 ## [Unreleased] - 2.12.0
 
+### 2.12-C — Connection lifecycle in C
+
+The 2.12-B re-bench made it clear that Hyperion's `handle_static`
+hot path was already doing the **response side** in C
+(`PageCache.serve_request`, 2.10-F), but the **connection
+lifecycle around it** — accept loop, route lookup, per-`Connection`
+ivar init — was still in Ruby. The 2.10-D / 2.10-F bench analysis
+flagged that as the next dominant cost: `accept4` + `clone3`
+(worker thread wakeup) + `futex` (GVL handoff) + Ruby ivar init
+on every connection.
+
+This stream pushes the entire accept→read→route-lookup→write
+loop into C for `handle_static`-routed paths.
+
+**New C exports** on `Hyperion::Http::PageCache`:
+
+  - `run_static_accept_loop(listen_fd) -> Integer | :crashed`
+    drives the accept-and-serve loop. Releases the GVL during
+    `accept(2)`, `recv(2)`, and `write(2)`; re-acquires only for
+    the registered lifecycle / handoff Ruby callbacks. Returns
+    the count of requests served when the listener closes
+    cleanly, or `:crashed` if an unrecoverable accept error
+    happened (Ruby falls back to its own accept loop on this
+    sentinel).
+  - `set_lifecycle_callback(callable)` and
+    `set_lifecycle_active(bool)` — register / gate the per-request
+    lifecycle hook. Decoupled so flipping the gate at runtime
+    doesn't re-allocate the callback. The hot path checks a
+    single `int` flag; the no-hook path stays one syscall (recv
+    or write) per request.
+  - `set_handoff_callback(callable)` — register the callback the
+    C loop invokes when a connection's first request can't be
+    served from the static cache (path miss, malformed request,
+    body present, h2 upgrade requested, HTTP/1.0). Receives
+    `(fd_int, partial_buffer_or_nil)`; Ruby owns the fd from
+    that point on and resumes ownership via the regular
+    `Connection` path.
+  - `stop_accept_loop` and `lifecycle_active?` — operator /
+    spec helpers.
+  - `handoff_to_ruby(client_fd, partial_buffer, partial_len)` —
+    echo helper exposing the 2.12-C contract for spec-time
+    introspection (the actual handoff happens inside
+    `run_static_accept_loop` via the registered callback).
+
+**Wiring.** `Hyperion::Server::ConnectionLoop` (new module) holds
+the engagement check + callback factories. `Server#start_raw_loop`
+engages the C loop when:
+
+  1. The listener is plain TCP (no TLS, no h2 ALPN dance).
+  2. The route table has at least one
+     `RouteTable::StaticEntry` registration.
+  3. The route table has NO non-StaticEntry registrations
+     (any dynamic handler disables the C path; the C loop
+     only knows how to write prebuilt responses).
+  4. The C ext is available (the `Hyperion::Http::PageCache`
+     module responds to `:run_static_accept_loop`) and the
+     `HYPERION_C_ACCEPT_LOOP=0` escape hatch is not set.
+
+A new `:c_accept_loop_h1` `DispatchMode` symbol ships under
+`requests_dispatch_c_accept_loop_h1` (one bump per worker boot
+that engages the path) plus `c_accept_loop_requests` (count of
+requests the C loop served on this worker, bumped at loop exit).
+
+**Lifecycle hooks.** The 2.10-D contract holds: per-request
+`Runtime#fire_request_start` / `#fire_request_end` fire on every
+request the C loop served. `env=nil`, `path=` the matched path
+string — same surface as the Ruby direct-dispatch path. The
+Ruby-side bridge in `ConnectionLoop.build_lifecycle_callback`
+builds a minimal `Hyperion::Request` for the hooks to consume.
+The C-side `lifecycle_active?` flag gates the `rb_funcall`;
+when no hooks are registered, the no-hook hot path is one
+syscall (recv) + one syscall (write) per request, with **zero
+Ruby method invocations**.
+
+**Handoff.** When the C loop sees a request it can't serve from
+the static cache (POST, path miss, malformed framing,
+`Content-Length`, `Transfer-Encoding`, `Upgrade`,
+`HTTP2-Settings`, `Connection: upgrade`, HTTP/1.0), it invokes
+the handoff callback with `(fd_int, partial_buffer_str)` and
+continues to the next accept. Ruby resumes ownership of the fd
+via `dispatch_handed_off`, which wraps the fd in `Socket.for_fd`,
+applies the read timeout (matches the regular Ruby accept
+path), pre-loads the partial buffer onto the Connection's
+`@inbuf` ivar so the parser sees the bytes the C loop already
+consumed, and dispatches through the existing thread-pool /
+inline path.
+
+**Tests.** `spec/hyperion/connection_loop_spec.rb` covers
+smoke (registered route → C loop served-count grows), mixed
+registered + unregistered (C loop hands off to the Ruby callback
+spy with the partial buffer + fd), body-present requests
+(`POST /hello` hands off), lifecycle hooks
+(`set_lifecycle_active(true)` fires the registered callback
+once per served request; `false` is silent — no callback
+invocation, even with one set), GVL release (a slow C-loop
+parked on `accept(2)` doesn't block another Ruby thread doing
+arithmetic), keep-alive on a single connection (two pipelined
+requests on the same socket → two responses), Server-level
+engagement (only-static-routes engages the C loop;
+mixed-with-dynamic-handlers refuses to engage and falls back
+to the regular Ruby loop).
+
+Total: 1112 specs / 0 failures / 11 pending — +10 specs over
+the 2.12-B baseline (1102 / 0 / 11).
+
 ### 2.12-B — Fresh 4-way re-bench (post-2.10/2.11 wins)
 
 The 4-way head-to-head in `docs/BENCH_HYPERION_2_0.md`

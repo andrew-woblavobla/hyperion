@@ -46,8 +46,17 @@ module Hyperion
     #                          escape hatch via `env['hyperion.dispatch_mode']
     #                          = :inline_blocking` for routes the auto-
     #                          detect doesn't catch.
+    # 2.12-C — `:c_accept_loop_h1` is a connection-wide mode (NOT a
+    # per-response override): the entire accept-and-serve loop runs in
+    # C via `Hyperion::Http::PageCache.run_static_accept_loop`. Engaged
+    # only when the operator's route table is composed entirely of
+    # `Server.handle_static`-registered routes AND the listener is
+    # plain TCP. Counted under `:requests_dispatch_c_accept_loop_h1`
+    # at engage time (one bump per worker boot) so operators can see
+    # the path is on without scraping the per-request `:c_accept_loop_requests`
+    # counter.
     MODES = %i[tls_h2 tls_h1_inline async_io_h1_inline threadpool_h1 inline_h1_no_pool
-               inline_blocking].freeze
+               inline_blocking c_accept_loop_h1].freeze
 
     INLINE_MODES = %i[tls_h1_inline async_io_h1_inline inline_h1_no_pool inline_blocking].freeze
 

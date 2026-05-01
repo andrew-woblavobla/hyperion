@@ -6,6 +6,7 @@ require 'async'
 require 'async/scheduler'
 
 require_relative 'server/route_table'
+require_relative 'server/connection_loop'
 
 module Hyperion
   # Phase 2a server: bind a TCPServer, accept connections, schedule each on its
@@ -400,7 +401,16 @@ module Hyperion
     # a worker via the thread pool, or are served inline when no pool is
     # configured (thread_count: 0). Matches the dispatch contract used by
     # the TLS path; just skips the irrelevant h2/ALPN branch.
+    #
+    # 2.12-C — when the route table is composed entirely of `StaticEntry`
+    # registrations (and at least one is present), and the C ext is
+    # available, the entire accept-and-serve loop runs in C via
+    # `Hyperion::Http::PageCache.run_static_accept_loop`. Ruby is only
+    # re-entered for lifecycle hooks (gated by a C-side flag) and for
+    # the handoff path when a request doesn't match any StaticEntry.
     def start_raw_loop
+      return run_c_accept_loop if engage_c_accept_loop?
+
       until @stopped
         socket = accept_or_nil
         next unless socket
@@ -428,6 +438,135 @@ module Hyperion
         end
       end
     end
+
+    # Whether all engagement conditions hold for the C accept loop.
+    def engage_c_accept_loop?
+      return false if @tls
+      return false unless ConnectionLoop.available?
+      return false unless ConnectionLoop.eligible_route_table?(@route_table)
+
+      true
+    end
+    private :engage_c_accept_loop?
+
+    # Hand control of the listening fd to the C loop. Wires up the
+    # lifecycle + handoff callbacks first; on return (clean stop or
+    # `:crashed` sentinel from C), bumps the dispatch metric and
+    # falls through to the regular Ruby accept loop on `:crashed`
+    # so an unrecoverable C-side accept error doesn't leave the
+    # listener idle.
+    def run_c_accept_loop
+      pc = ::Hyperion::Http::PageCache
+      pc.set_lifecycle_callback(ConnectionLoop.build_lifecycle_callback(@runtime))
+      pc.set_lifecycle_active(@runtime.has_request_hooks?)
+      pc.set_handoff_callback(ConnectionLoop.build_handoff_callback(self))
+
+      mode = DispatchMode.new(:c_accept_loop_h1)
+      record_dispatch(mode)
+      runtime_logger.info do
+        { message: 'engaging C accept loop',
+          static_routes: @route_table.size,
+          host: @host,
+          port: @port }
+      end
+      result = pc.run_static_accept_loop(@tcp_server.fileno)
+      if result == :crashed
+        runtime_logger.warn do
+          { message: 'C accept loop crashed; falling back to Ruby accept loop' }
+        end
+        # Fall back to the Ruby loop so the listener doesn't go silent.
+        until @stopped
+          socket = accept_or_nil
+          next unless socket
+
+          apply_timeout(socket)
+          dispatch_one_h1(socket)
+        end
+      else
+        runtime_logger.info do
+          { message: 'C accept loop exited', requests_served: result.to_i }
+        end
+        runtime_metrics.increment(:c_accept_loop_requests, result.to_i)
+      end
+    ensure
+      # Best-effort: clear the lifecycle callback so a subsequent
+      # Server boot in the same process (test harnesses) doesn't see
+      # stale state.
+      pc&.set_lifecycle_active(false) if defined?(pc)
+      pc&.set_lifecycle_callback(nil) if defined?(pc)
+      pc&.set_handoff_callback(nil) if defined?(pc)
+    end
+    private :run_c_accept_loop
+
+    # Dispatch a connection that the C accept loop handed off to Ruby
+    # because it couldn't be served from the static cache (path miss,
+    # malformed request, body present, h2 upgrade requested, etc.).
+    # `partial` is the partial header buffer the C loop already read
+    # off the fd, or nil if the C loop hadn't started reading.
+    #
+    # The fd is owned by Ruby from this point on — the C loop will
+    # not touch it again. We wrap it in a `::Socket` (matches the
+    # `accept_nonblock` path's return type) and dispatch through the
+    # existing thread-pool / inline path.
+    def dispatch_handed_off(fd, partial)
+      require 'socket'
+      socket = ::Socket.for_fd(fd)
+      socket.autoclose = true
+      apply_timeout(socket)
+      if partial && !partial.empty?
+        # Stash the partial bytes on a per-fd map so Connection can
+        # read them as if they were the next chunk the kernel produced.
+        # We attach the buffer as the Connection's `@inbuf` ivar
+        # (pre-loaded with the partial bytes) on the inline path; on
+        # the thread-pool path we stash here and the worker thread
+        # picks it up after `submit_connection` schedules the conn.
+        @c_loop_handoff_buffers ||= {}
+        @c_loop_handoff_buffers[socket.fileno] = partial.dup.b
+      end
+
+      if @thread_pool
+        mode = DispatchMode.new(:threadpool_h1)
+        if @thread_pool.submit_connection(socket, @app,
+                                          max_request_read_seconds: @max_request_read_seconds)
+          record_dispatch(mode)
+        else
+          reject_connection(socket)
+        end
+      else
+        mode = DispatchMode.new(:inline_h1_no_pool)
+        record_dispatch(mode)
+        connection = Connection.new(runtime: @explicit_runtime ? @runtime : nil,
+                                    max_in_flight_per_conn: @max_in_flight_per_conn,
+                                    route_table: @route_table)
+        if @c_loop_handoff_buffers && (carry = @c_loop_handoff_buffers.delete(socket.fileno))
+          connection.instance_variable_set(:@inbuf, +carry.b)
+        end
+        connection.serve(socket, @app,
+                         max_request_read_seconds: @max_request_read_seconds)
+      end
+    end
+    private :dispatch_handed_off
+
+    def dispatch_one_h1(socket)
+      if @thread_pool
+        mode = DispatchMode.new(:threadpool_h1)
+        if @thread_pool.submit_connection(socket, @app,
+                                          max_request_read_seconds: @max_request_read_seconds)
+          record_dispatch(mode)
+        else
+          reject_connection(socket)
+        end
+      else
+        mode = DispatchMode.new(:inline_h1_no_pool)
+        record_dispatch(mode)
+        Connection.new(runtime: @explicit_runtime ? @runtime : nil,
+                       max_in_flight_per_conn: @max_in_flight_per_conn,
+                       route_table: @route_table).serve(
+                         socket, @app, max_request_read_seconds: @max_request_read_seconds
+                       )
+      end
+    end
+    private :dispatch_one_h1
 
     # TLS / h2-capable accept loop. The Async wrapper is required because
     # h2 streams (inside Http2Handler) and the ALPN handshake yield
