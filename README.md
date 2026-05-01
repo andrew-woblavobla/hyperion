@@ -11,6 +11,18 @@ gem install hyperion-rb
 bundle exec hyperion config.ru
 ```
 
+## What's new in 2.5.0
+
+**Native HPACK ON by default + autobahn 100% conformance + request
+hooks.** The Rust HPACK encoder (added in 2.0.0, opt-in until 2.4.x)
+flips ON by default in 2.5.0 — verified **+18% rps on Rails-shape h2
+workloads** (25-header responses, the bench harness lives at
+`bench/h2_rails_shape.ru` + `bench/h2_rails_shape.sh`). RFC 6455
+WebSocket conformance hit **463/463 autobahn-testsuite cases passing**
+(2.5-A, host openclaw-vm). Request lifecycle hooks
+(`Runtime#on_request_start` / `on_request_end`) shipped in 2.5-C —
+recipes in [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md).
+
 ## What's new in 2.4.0
 
 **Production observability.** The `/-/metrics` endpoint now exposes
@@ -49,13 +61,43 @@ See [`docs/WEBSOCKETS.md`](docs/WEBSOCKETS.md).
 
 ## Benchmarks
 
-All numbers are real wrk runs against published Hyperion configs. Hyperion ships **with default-ON structured access logs**; Puma comparisons use Puma defaults (no per-request log emission). Each section is stamped with the Hyperion version it was measured against — newer versions (1.3.0+ `--async-io`, 1.4.0+ TLS h1 inline, 1.4.1+ Metrics fiber-key fix, 1.6.0+ HTTP/2 writer fiber + 3 C-ext additions) preserve or improve these numbers; we re-run the headline configs each release and have not seen regressions on these workloads.
+All numbers are real wrk runs against published Hyperion configs. Hyperion ships **with default-ON structured access logs**; Puma comparisons use Puma defaults (no per-request log emission). Each section is stamped with the Hyperion version + bench host it was measured against — bench-host drift over time is real (see "Bench-host drift" note below).
 
-> **Comprehensive matrix for 1.6.0 + hyperion-async-pg 0.5.0 (16-vCPU Linux, 9 workloads × 25+ configs)**: see [`docs/BENCH_2026_04_27.md`](docs/BENCH_2026_04_27.md). Headline: 98,818 r/s on hello `-w 16`, 21,215 r/s `-w 4` at p99 < 2 ms, 2,180 r/s on a 50 ms-waiting PG workload (4.1× the best Puma), 1,667 req/s HTTP/2 multiplexed at 0 errors, 155 MB RSS for 10k idle keep-alive connections.
+**Headline doc**: the most recent comprehensive sweep is
+[`docs/BENCH_HYPERION_2_0.md`](docs/BENCH_HYPERION_2_0.md) (Hyperion
+2.0.0 vs Puma 8.0.1, 16-vCPU Ubuntu 24.04, 12 workloads). The 1.6.0
+matrix at [`docs/BENCH_2026_04_27.md`](docs/BENCH_2026_04_27.md) covers
+9 workloads × 25+ configs against hyperion-async-pg 0.5.0; both docs
+include caveats and per-row reproduction commands.
+
+> **Bench-host drift note (2026-05-01).** A spot-check rerun on
+> `openclaw-vm` 5 days after the 2.0.0 sweep showed Puma 8.0.1 and
+> Hyperion 2.0.0 baseline numbers had drifted 14-32% downward from the
+> 2026-04-29 sweep with no code changes — the bench host runs other
+> workloads in the background and is a single VM (KVM CPU). Numbers in
+> this README and BENCH docs are snapshots; expect ±10-30% absolute
+> drift between sweep dates. **The relative position (Hyperion vs Puma
+> at matched config) is the durable signal**; e.g. Hyperion `-w 16 -t 5`
+> hello-world today is 76,593 r/s vs Puma 8.0.1 `-w 16 -t 5:5` at 55,609
+> r/s, **+37.7% over Puma** — wider than the 2.0.0 sweep's +27.8% even
+> though absolute rps is lower. Reproduce: `bundle exec bin/hyperion
+> -p 9501 -w 16 -t 5 bench/hello.ru` then `wrk -t4 -c200 -d20s
+> http://127.0.0.1:9501/`.
+
+> **Topology relevance.** Hyperion is built to run **fronted by nginx
+> or an L7 load balancer** in most production deployments — plaintext
+> HTTP/1.1 upstream, TLS terminated at the LB. The benches in this
+> README that match that topology are: hello-world, CPU JSON, static,
+> SSE, PG, WebSocket. Benches that are **bench-only for nginx-fronted
+> ops** (the LB → upstream hop is plaintext h1 regardless): TLS h1,
+> HTTP/2, kTLS_TX. Those rows still ship for operators who terminate
+> TLS / h2 at Hyperion directly (small static fleets, edge boxes), but
+> don't chase the +60% TLS-h1 win unless you actually terminate TLS at
+> Hyperion.
 
 ### Hello-world Rack app
 
-`bench/hello.ru`, single worker, parity threads (`-t 5` vs Puma `-t 5:5`), 4 wrk threads / 100 connections / 15s, macOS arm64 / Ruby 3.3.3, Hyperion 1.2.0:
+`bench/hello.ru`, single worker, parity threads (`-t 5` vs Puma `-t 5:5`), 4 wrk threads / 100 connections / 15s, macOS arm64 / Ruby 3.3.3, Hyperion 1.2.0. **macOS dev numbers; the headline Linux 2.0.0 bench is in [`docs/BENCH_HYPERION_2_0.md`](docs/BENCH_HYPERION_2_0.md)**:
 
 | | r/s | p99 | tail vs Hyperion |
 |---|---:|---:|---:|
@@ -93,7 +135,7 @@ Bench is **wait-bound** — ~3-4 ms median is the PG + Redis round-trip, dwarfin
 
 Ubuntu 24.04 / 16 vCPU / Ruby 3.3.3, Postgres 17 over WAN, `wrk -t4 -c200 -d20s`. Single worker (`-w 1`) unless noted. All configs returned 0 non-2xx and 0 timeouts. RSS sampled mid-run via `ps -o rss`.
 
-**Wait-bound workload** (`bench/pg_concurrent.ru`: `SELECT pg_sleep(0.05)` + tiny JSON):
+**Wait-bound workload** (`pg_concurrent.ru`: `SELECT pg_sleep(0.05)` + tiny JSON; rackup lives in the [hyperion-async-pg companion repo](https://github.com/andrew-woblavobla/hyperion-async-pg) and on the bench host at `~/bench/pg_concurrent.ru`, not in this repo):
 
 | | r/s | p99 | RSS | vs Puma `-t 5` |
 |---|---:|---:|---:|---:|
@@ -107,7 +149,7 @@ Ubuntu 24.04 / 16 vCPU / Ruby 3.3.3, Postgres 17 over WAN, `wrk -t4 -c200 -d20s`
 | Hyperion `--async-io -w 4 -t 5` pool=64 | 1937.5 | 4.84 s | 416 MB | 34.3× (cold-start p99 — see note) |
 | Falcon 0.55.3 `--count 1` pool=128 | 1665.7 | 516 ms | 141 MB | 29.5× |
 
-**Mixed CPU+wait** (`bench/pg_mixed.ru`: same query + 50-key JSON serialization, ~5 ms CPU):
+**Mixed CPU+wait** (`pg_mixed.ru`: same query + 50-key JSON serialization, ~5 ms CPU; rackup lives in hyperion-async-pg + on the bench host at `~/bench/pg_mixed.ru`, not in this repo):
 
 | | r/s | p99 | RSS | vs Puma `-t 30` |
 |---|---:|---:|---:|---:|
@@ -118,11 +160,12 @@ Ubuntu 24.04 / 16 vCPU / Ruby 3.3.3, Postgres 17 over WAN, `wrk -t4 -c200 -d20s`
 | Falcon `--count 1` pool=128 | 1642.1 | 531 ms | 213 MB | 4.7× |
 
 **Takeaways:**
-1. **Linear scaling with pool size** under `--async-io` — `r/s ≈ pool × 12` on this WAN bench. Single-worker pool=200 hits 2381 r/s, **42× Puma `-t 5`** and **5.9× Puma's best** (`-t 30`).
+1. **Linear scaling with pool size** under `--async-io` — `r/s ≈ pool × 12` on this WAN bench. Single-worker pool=200 hits 2381 r/s. The "**42× Puma `-t 5`**" and "**5.9× Puma's best**" framings above use Puma's pool=5 (timeout-floor) and pool=30 (mid-tier) rows respectively — fair comparisons on the *same* bench fixture, but a Puma operator who sizes their pool to match (`-t 100 pool=100` row above) lands at 1,067 r/s, so the **honest "Puma at its own best vs Hyperion at its own best" ratio is 2,381 / 1,067 ≈ 2.2×**, not 42×. The architectural win — fiber-pool grows to pool=200 without OS-thread cost — is real; the 42× headline is a configuration-difference effect, not a steady-state gap on matched configs.
 2. **Mixed workload doesn't kill the win** — Hyperion `--async-io` pool=128 actually goes *up* on mixed (1740 vs 1344 r/s) because CPU work overlaps other fibers' PG-wait windows. This is the honest "what happens to a real Rails handler" answer.
 3. **Hyperion ≈ Falcon within 3-7%** across pool sizes; both fiber-native architectures extract similar value from `hyperion-async-pg`.
 4. **RSS at single-worker scale isn't the architectural moat** — Linux thread stacks are demand-paged; PG connection buffers dominate RSS at pool sizes ≤ 200. The architectural win is **handler concurrency under load**, not idle memory: Hyperion's fiber path runs thousands of in-flight handler invocations per OS thread, so wait-bound handlers don't queue at `max_threads`. See [Concurrency at scale](#concurrency-at-scale-architectural-advantages) for both the throughput-under-load row and a measured 10k-idle-keepalive RSS sweep against Puma and Falcon.
 5. **`-w 4` cold-start caveat** — multi-worker p99 inflates because the bench rackup uses lazy per-process pool init (each worker pays full pool fill on its first request). Production apps avoid this with `on_worker_boot { Hyperion::AsyncPg::FiberPool.new(...).fill }`.
+6. **Apples-to-apples PG note**: the row above uses `pg.wobla.space` WAN PG with `max_connections=500`. Earlier sweeps that compared Hyperion (WAN, max_conn=500) against Puma (local, max_conn=100) overstated the ratio because the Puma side timed out at the local pool ceiling. The 2.0.0 bench doc carries this caveat in the row 7 verification section; treat any "Hyperion 4× Puma on PG" headline as **indicative**, not precisely calibrated, until rerun against matched-pool PG.
 
 Three things must all be true to get this win:
 1. **`async_io: true`** in your Hyperion config (or `--async-io` CLI flag). Default is off to keep 1.2.0's raw-loop perf for fiber-unaware apps.
@@ -229,18 +272,50 @@ Hyperion fans 100 in-flight streams across separate fibers within a single TCP c
 
 > **1.6.0 outbound write path** — `Http2Handler` no longer serializes every framer write through one `Mutex#synchronize { socket.write(...) }`. HPACK encoding (microseconds, in-memory) still serializes on a fast encode mutex, but the actual `socket.write` is owned by a dedicated per-connection writer fiber draining a queue. On per-connection multi-stream workloads where the kernel send buffer or peer reads are slow, encode work for ready streams overlaps the writer's flush of earlier chunks, instead of stacking up behind it. See `bench/h2_streams.sh` (`h2load -c 1 -m 100 -n 5000`) for a recipe to compare 1.5.0 vs 1.6.0 on a workload of your choice.
 
-### Reproduce
+### Reproducing the benchmarks
+
+Every number in this README and `docs/BENCH_HYPERION_2_0.md` is reproducible. Operators who don't trust headline numbers (and you shouldn't trust *any* benchmark numbers without independent verification) can rerun the workloads on their own host and get their own honest measurements. Per-row reproduction commands:
 
 ```sh
-# hello-world
-bundle exec ruby bench/compare.rb
-HYPERION_WORKERS=4 PUMA_WORKERS=4 FALCON_COUNT=4 bundle exec ruby bench/compare.rb
+# Setup (once)
+bundle install
+bundle exec rake compile
+
+# Hello-world (rps + p99 ceiling, no I/O)
+bundle exec bin/hyperion -p 9292 -w 16 -t 5 bench/hello.ru &
+wrk -t4 -c200 -d20s --latency http://127.0.0.1:9292/
+
+# CPU-bound JSON (per-request CPU savings visible)
+bundle exec bin/hyperion -p 9292 -w 4 -t 5 bench/work.ru &
+wrk -t4 -c200 -d15s --latency http://127.0.0.1:9292/
+
+# Static 1 MiB sendfile path
+ruby -e 'File.binwrite("/tmp/hyperion_bench_asset_1m.bin", "x" * (1024*1024))'
+bundle exec bin/hyperion -p 9292 -w 1 -t 5 bench/static.ru &
+wrk -t4 -c100 -d15s --latency http://127.0.0.1:9292/hyperion_bench_asset_1m.bin
+
+# SSE streaming (Hyperion-shaped rackup with explicit flush sentinel — see caveat in BENCH doc)
+bundle exec bin/hyperion -p 9292 -w 1 -t 5 bench/sse.ru &
+wrk -t1 -c1 -d10s http://127.0.0.1:9292/
+
+# WebSocket multi-process throughput
+bundle exec bin/hyperion -p 9888 -w 4 -t 64 bench/ws_echo.ru &
+ruby bench/ws_bench_client_multi.rb --port 9888 --procs 4 --conns 200 --msgs 1000 --bytes 1024 --json
+
+# h2 native HPACK (Rails-shape, 25-header response)
+./bench/h2_rails_shape.sh
 
 # Idle keep-alive RSS sweep (1k / 5k / 10k conns, 30s hold per server)
 ./bench/keepalive_memory.sh
 
-# Real Rails / Grape: see bench/db.ru for the schema
+# Hello-world quick comparator (Hyperion vs Puma vs Falcon)
+bundle exec ruby bench/compare.rb
+HYPERION_WORKERS=4 PUMA_WORKERS=4 FALCON_COUNT=4 bundle exec ruby bench/compare.rb
 ```
+
+PG benches (`pg_concurrent.ru`, `pg_mixed.ru`, `pg_realistic.ru`) live in the [hyperion-async-pg companion repo](https://github.com/andrew-woblavobla/hyperion-async-pg) — they require a running Postgres + the companion gem and are not part of this repo. The 2.0.0 sweep used `~/bench/pg_concurrent.ru` on the bench host; reproduce by cloning hyperion-async-pg and following its README, or `scp` the rackup + DATABASE_URL.
+
+When numbers from your host don't match the published numbers, the most likely explanations (in order): (1) bench-host noise — single-VM benches drift 10-30% over days; (2) Puma version mismatch — the 2.0.0 sweep used Puma 8.0.1 in the `~/bench/Gemfile`, the hyperion repo's own Gemfile pins Puma `~> 6.4`; (3) different kernel / Ruby; (4) different `-t` / `-c` (apples-to-apples requires identical worker count, thread count, wrk concurrency, payload size, kernel, Ruby, TLS cipher).
 
 ## Quick start
 
@@ -356,7 +431,7 @@ Concrete tradeoffs distilled from [`docs/BENCH_2026_04_27.md`](docs/BENCH_2026_0
 |---|---|---|
 | **Pure I/O-bound** (PG / Redis / external HTTP, no significant CPU) | `-w 1` + larger pool | Bench: `-w 1 pool=200` = 87 MB / 2,180 r/s vs `-w 4 pool=64` = 224 MB / 1,680 r/s. **2.6× more memory, 0.77× rps** if you pick multi-worker on a wait-bound workload. |
 | **Pure CPU-bound** (heavy JSON / template render / image processing) | `-w N` matching CPU count | Each worker's accept loop is single-threaded under `--async-io`; multi-worker gives CPU-parallelism. Bench: `-w 16 -t 5` hits 98,818 r/s on a 16-vCPU box, 4.7× a `-w 1` ceiling on the same hardware. |
-| **Mixed** (Rails-shaped: ~5 ms CPU + 50 ms PG wait per request) | `-w N/2` (half cores) + medium pool | Lets CPU work parallelise while keeping per-worker memory tractable. Bench `pg_mixed.ru` at `-w 4 -t 5 pool=128` = 1,740 r/s with no cold-start spike (ForkSafe `prefill_in_child: true`). |
+| **Mixed** (Rails-shaped: ~5 ms CPU + 50 ms PG wait per request) | `-w N/2` (half cores) + medium pool | Lets CPU work parallelise while keeping per-worker memory tractable. Bench `pg_mixed.ru` (in hyperion-async-pg repo / `~/bench/`) at `-w 4 -t 5 pool=128` = 1,740 r/s with no cold-start spike (ForkSafe `prefill_in_child: true`). |
 
 Multi-worker on PG-wait workloads is the **wrong** default for most apps — the headline rps doesn't justify the memory and PG-connection cost. Verify your shape with the bench before scaling out.
 
