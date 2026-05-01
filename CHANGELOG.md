@@ -1,5 +1,79 @@
 # Changelog
 
+## [Unreleased] — 2.13.0
+
+### 2.13-A — Extend C-side wins to generic Rack apps
+
+**Background.** The 2.12 sprint shipped huge wins on the
+`Server.handle_static`-routed traffic shape: 5,502 r/s → 134,084 r/s on
+the static-route `hello` workload (24× over 2.11.0; 7× over Agoo). But
+those wins are gated on the C accept-loop's `route_table.lookup`
+returning a `RouteTable::StaticEntry`. Generic Rack apps — the vast
+majority of real-world deployments (Rails, Sinatra, Roda, Hanami,
+anything calling `body.each` to yield response chunks) — never engage
+the C loop; they go through `Hyperion::Adapter::Rack` + the Ruby
+accept loop + the thread pool. The 2.12-B re-bench confirmed a generic
+Rack `bench/hello.ru` ran at 4,477 r/s — 4.25× behind Agoo, and 30×
+behind the C-loop static path on the same machine. Most of the 2.12
+wins were not available to operators running real apps.
+
+**What 2.13-A targets.** Optimizations that *do* port to the generic
+Rack dispatch path without breaking semantics. Per-request we don't
+get to skip `app.call(env)` (that IS the dispatch) and we can't
+prebuild the response body (it's dynamic), but we can attack:
+syscall coalescing on accept+read, env hash + rack.input recycling,
+metrics-mutex contention under multi-thread workloads, and the
+keepalive-fast-path tail.
+
+### 2.13-A — Per-thread shard for hot-path metrics
+
+Pre-2.13-A, every `observe_histogram` and `increment_labeled_counter`
+took `@hg_mutex.synchronize`. The original commit comment claimed
+those paths were "low-rate", but that's no longer true:
+
+  * `tick_worker_request` is called once per dispatched request
+    (every `Connection#serve` iteration, every h2 stream, every
+    handed-off connection from the C loop).
+  * `observe_histogram` is called once per dispatched request via
+    the per-route request-duration histogram registered in
+    `Connection#register_request_duration_histogram!`.
+
+Under `-t 32` that single mutex serialised 32 worker threads on the
+request-completion tail — every `+= 1` waited behind the previous
+thread's release. That contention was invisible on the C accept loop
+(the loop bypasses Ruby metrics entirely and folds in its atomic
+counter at scrape time), but it was the dominant tail-latency term
+on the generic Rack workload.
+
+The new path keeps per-thread shards (`Thread#thread_variable_set`,
+true thread-local — NOT fiber-local, matching the unlabeled counter
+convention from 2.0.0) for both `@histograms` and `@labeled_counters`.
+Observations and increments hit the per-thread shard with zero
+contention; `histogram_snapshot` and `labeled_counter_snapshot` merge
+across shards under the mutex (a low-rate operation — once per
+`/-/metrics` scrape).
+
+**Public API stays identical.** `observe_histogram`, `register_histogram`,
+`set_gauge`, `histogram_snapshot`, `labeled_counter_snapshot`,
+`increment_labeled_counter` keep the same signatures and semantics.
+Registered-but-never-observed families still surface in the snapshot
+(pre-2.13-A behaviour). `reset!` now also clears the per-thread
+shards so cross-spec leakage stays prevented.
+
+**Edge cases covered by spec:**
+
+  * Multi-thread observe-then-snapshot: 8 threads × 1000 observations
+    on the same `(name, labels)` produce `count == 8000` and
+    cumulative bucket counts that match.
+  * 16 threads × 500 increments × distinct label values produce 16
+    series with count 500 each.
+  * Concurrent observe + 50 mid-run snapshots run without deadlock
+    or torn counts.
+  * Reset clears across threads.
+  * Unregistered observe is a silent no-op.
+  * Registered-but-never-observed families show up in the scrape
+    with an empty `:series` Hash.
+
 ## 2.12.0 — 2026-05-01
 
 ### 2.12-F — gRPC support on h2

@@ -71,4 +71,118 @@ RSpec.describe Hyperion::Metrics do
       expect(metrics.snapshot[:hits]).to eq(210)
     end
   end
+
+  # 2.13-A — per-thread shard for hot-path histogram + labeled-counter
+  # observations. Pre-2.13-A every observe took @hg_mutex; with `-t 32`
+  # that single mutex serialised 32 worker threads on the request-
+  # completion tail. The new path keeps a per-thread shard and merges
+  # at snapshot time. These specs assert the merge stays correct under
+  # concurrency AND that the snapshot still surfaces registered-but-
+  # never-observed families (the pre-seed contract).
+  describe 'per-thread shard aggregation (2.13-A)' do
+    it 'aggregates histogram observations from many threads under one (name, labels)' do
+      metrics.register_histogram(:lat, buckets: [0.001, 0.01, 0.1, 1.0], label_keys: %w[route])
+      threads = 8.times.map do
+        Thread.new do
+          1000.times { metrics.observe_histogram(:lat, 0.005, %w[/]) }
+        end
+      end
+      threads.each(&:join)
+
+      snap = metrics.histogram_snapshot
+      lat = snap.fetch(:lat)
+      series = lat.fetch(:series)
+      key = series.keys.find { |k| k == %w[/] }
+      data = series.fetch(key)
+      expect(data[:count]).to eq(8 * 1000)
+      # 0.005 falls into bucket index 1 (0.01) and beyond — verify
+      # cumulative bucket convention is preserved across the merge.
+      expect(data[:counts][0]).to eq(0)
+      expect(data[:counts][1]).to eq(8 * 1000)
+      expect(data[:counts][2]).to eq(8 * 1000)
+      expect(data[:counts][3]).to eq(8 * 1000)
+      expect(data[:sum]).to be_within(0.0001).of(0.005 * 8 * 1000)
+    end
+
+    it 'aggregates labeled-counter increments from many threads' do
+      metrics.register_labeled_counter(:hits_total, label_keys: %w[worker_id])
+      threads = 16.times.map do |tidx|
+        Thread.new do
+          500.times { metrics.increment_labeled_counter(:hits_total, [tidx.to_s]) }
+        end
+      end
+      threads.each(&:join)
+
+      snap = metrics.labeled_counter_snapshot
+      hits = snap.fetch(:hits_total)
+      series = hits.fetch(:series)
+      expect(series.size).to eq(16)
+      series.each_value { |count| expect(count).to eq(500) }
+    end
+
+    it 'still surfaces registered-but-never-observed histograms in the snapshot' do
+      metrics.register_histogram(:never_observed, buckets: [0.1, 1.0])
+      snap = metrics.histogram_snapshot
+      expect(snap).to have_key(:never_observed)
+      expect(snap[:never_observed][:series]).to eq({})
+    end
+
+    it 'still surfaces registered-but-never-observed labeled counters in the snapshot' do
+      metrics.register_labeled_counter(:never_ticked, label_keys: %w[a])
+      snap = metrics.labeled_counter_snapshot
+      expect(snap).to have_key(:never_ticked)
+      expect(snap[:never_ticked][:series]).to eq({})
+    end
+
+    it 'reset! clears per-thread shards across threads' do
+      metrics.register_histogram(:reset_check, buckets: [0.1])
+      Thread.new { metrics.observe_histogram(:reset_check, 0.05) }.join
+      expect(metrics.histogram_snapshot.dig(:reset_check, :series).values.first[:count]).to eq(1)
+
+      metrics.reset!
+      snap = metrics.histogram_snapshot
+      expect(snap[:reset_check][:series]).to eq({})
+    end
+
+    it 'observe_histogram on an unregistered family is a silent no-op' do
+      expect { metrics.observe_histogram(:not_registered, 0.1) }.not_to raise_error
+      expect(metrics.histogram_snapshot[:not_registered]).to be_nil
+    end
+
+    # Concurrency / contention sanity check: the entire point of the
+    # per-thread shard refactor was that observe_histogram / increment_
+    # labeled_counter are CALLED at request-completion frequency from
+    # every Connection-serving thread, and the previous mutex made
+    # them serialize. We're not measuring time here (CI variance), just
+    # asserting that high-concurrency mixed observations + snapshots
+    # don't deadlock and the final counts add up.
+    it 'allows concurrent observe + snapshot without deadlock or torn counts' do
+      metrics.register_histogram(:race_lat, buckets: [0.1])
+      metrics.register_labeled_counter(:race_hits, label_keys: %w[t])
+      observers = 8.times.map do |tidx|
+        Thread.new do
+          1000.times do
+            metrics.observe_histogram(:race_lat, 0.05)
+            metrics.increment_labeled_counter(:race_hits, [tidx.to_s])
+          end
+        end
+      end
+      # While observers run, take 50 snapshots to exercise the merge
+      # path's mutex sections under live writers.
+      50.times do
+        metrics.histogram_snapshot
+        metrics.labeled_counter_snapshot
+      end
+      observers.each(&:join)
+      stop = true
+      _ = stop
+
+      hist = metrics.histogram_snapshot[:race_lat][:series].values.first
+      expect(hist[:count]).to eq(8 * 1000)
+
+      hits = metrics.labeled_counter_snapshot[:race_hits][:series]
+      expect(hits.size).to eq(8)
+      hits.each_value { |c| expect(c).to eq(1000) }
+    end
+  end
 end

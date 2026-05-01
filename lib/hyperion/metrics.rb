@@ -79,6 +79,30 @@ module Hyperion
       # Snapshot block hooks for gauges whose value is read on demand
       # (ThreadPool queue depth, etc.). `{ name => { labels_tuple => Proc } }`.
       @gauge_blocks    = {}
+
+      # 2.13-A — per-thread shards for the hot-path metrics that USED to
+      # take @hg_mutex on every observe / increment. The pre-2.13-A
+      # comment in `increment_labeled_counter` claimed those paths were
+      # "low-rate" — that turned out to be wrong: `tick_worker_request`
+      # fires once per Rack request, and `observe_histogram` fires once
+      # per request via the per-route duration histogram. Under -t 32
+      # the single mutex serialised every worker thread on the
+      # request-completion tail. Per-thread shards remove the
+      # contention; snapshots merge across threads under the mutex
+      # (snapshot is a low-rate operation — once per /-/metrics scrape).
+      #
+      # Thread-variable storage (NOT Thread.current[]) for the same
+      # reason as the unlabeled counter path: under an Async scheduler
+      # `Thread.current[:k]` is fiber-local, which would let snapshots
+      # miss observations made on a fiber that already exited.
+      @hg_thread_key   = :"__hyperion_metrics_hg_#{object_id}__"
+      @lc_thread_key   = :"__hyperion_metrics_lc_#{object_id}__"
+      # Holds direct references to every per-thread shard ever
+      # allocated through this Metrics instance (mirrors @thread_counters)
+      # so snapshots survive thread death.
+      @thread_histograms = []
+      @thread_labeled_counters = []
+      @hg_thread_mutex         = Mutex.new
     end
 
     # Hot path: one thread-variable lookup + one hash op. No mutex on the
@@ -162,6 +186,12 @@ module Hyperion
     end
 
     # Tests can call .reset! between examples to avoid cross-spec leakage.
+    #
+    # 2.13-A — also clear per-thread histogram and labeled-counter
+    # shards. Without this, an observation made on thread A in spec X
+    # would leak into spec Y's snapshot because the shard hashes are
+    # held alive by `@thread_histograms` / `@thread_labeled_counters`
+    # for the lifetime of the Metrics instance.
     def reset!
       @counters_mutex.synchronize do
         @thread_counters.each(&:clear)
@@ -170,6 +200,10 @@ module Hyperion
         @histograms.each_value(&:clear)
         @gauges.each_value(&:clear)
         @gauge_blocks.each_value(&:clear)
+      end
+      @hg_thread_mutex.synchronize do
+        @thread_histograms.each(&:clear)
+        @thread_labeled_counters.each(&:clear)
       end
     end
 
@@ -197,27 +231,37 @@ module Hyperion
 
     # Observe `value` on a previously-registered histogram. `label_values`
     # MUST be supplied in the same order as `label_keys` at registration.
-    # The hot path: one Hash lookup, one accumulator update under a mutex.
-    # Allocation footprint per observe: zero on the cached-key path
-    # (same labels seen before); one frozen Array on first observation
-    # for a given label-set.
+    #
+    # 2.13-A — Hot-path lock-free shard. Each thread keeps its own
+    # `{ name => { labels => HistogramAccumulator } }` map; observations
+    # never block on `@hg_mutex`. Snapshots merge across threads under
+    # the mutex (low-rate). Allocation footprint per observe: zero on
+    # the cached-key path; one frozen Array + one HistogramAccumulator
+    # on first observation for a given (name, label-set, thread).
+    #
+    # Bench impact (generic Rack hello, -t 32 -c 100):
+    # contention on `@hg_mutex` was the dominant tail latency
+    # contributor — this fires once per request via the per-route
+    # request-duration histogram, multiplied by N worker threads.
     def observe_histogram(name, value, label_values = EMPTY_LABELS)
-      @hg_mutex.synchronize do
-        meta = @histograms_meta[name]
-        return unless meta # silently skip unregistered observations
+      meta = @histograms_meta[name]
+      return unless meta # silently skip unregistered observations
 
-        family = @histograms[name]
-        accum  = family[label_values]
-        unless accum
-          accum = HistogramAccumulator.new(meta[:buckets])
-          # Freeze the label tuple so future identical-content tuples
-          # hash to the same bucket — but we keep the original ref
-          # provided by the caller as the canonical key so subsequent
-          # observes with the same Array bypass the freeze step.
-          family[label_values.frozen? ? label_values : label_values.dup.freeze] = accum
-        end
-        accum.observe(value)
+      thread = Thread.current
+      shard = thread.thread_variable_get(@hg_thread_key)
+      shard = register_thread_histograms(thread) if shard.nil?
+
+      family = (shard[name] ||= {})
+      accum  = family[label_values]
+      unless accum
+        accum = HistogramAccumulator.new(meta[:buckets])
+        # Freeze the label tuple so future identical-content tuples
+        # hash to the same bucket — but we keep the original ref
+        # provided by the caller as the canonical key so subsequent
+        # observes with the same Array bypass the freeze step.
+        family[label_values.frozen? ? label_values : label_values.dup.freeze] = accum
       end
+      accum.observe(value)
     end
 
     # Set a gauge value. `label_values` follows the same convention as
@@ -263,15 +307,40 @@ module Hyperion
 
     # Snapshot helpers — read-only views of the current histogram /
     # gauge state. The exporter uses these to render the scrape body.
+    #
+    # 2.13-A — Histograms merge across the per-thread shards on the
+    # snapshot path. The mutex is held only long enough to copy the
+    # shard list (every shard Hash is owned by one thread, so we can
+    # iterate its current contents safely while merging — torn reads
+    # of in-progress observations show as a slightly stale snapshot,
+    # never as a corrupted Accumulator).
     def histogram_snapshot
       out = {}
+
+      # Pre-seed names from registered families so a histogram with
+      # zero observations still appears in the scrape (matches the
+      # pre-2.13-A behaviour where `register_histogram` populated the
+      # `@histograms[name] = {}` slot eagerly).
       @hg_mutex.synchronize do
-        @histograms.each do |name, family|
-          per_labels = {}
-          family.each { |labels, accum| per_labels[labels] = accum.snapshot }
-          out[name] = { meta: @histograms_meta[name], series: per_labels }
+        @histograms_meta.each_key { |name| out[name] = { meta: @histograms_meta[name], series: {} } }
+      end
+
+      shards = @hg_thread_mutex.synchronize { @thread_histograms.dup }
+      shards.each do |shard|
+        shard.each do |name, family|
+          slot = (out[name] ||= { meta: @histograms_meta[name], series: {} })
+          series = slot[:series]
+          family.each do |labels, accum|
+            existing = series[labels]
+            if existing.nil?
+              series[labels] = accum.snapshot
+            else
+              merge_histogram_snapshot!(existing, accum)
+            end
+          end
         end
       end
+
       out
     end
 
@@ -309,19 +378,33 @@ module Hyperion
 
     # Labeled counter — separate from the legacy thread-local counter
     # surface (which is unlabeled and per-thread for hot-path
-    # contention-free increments). Labeled counters take a mutex per
-    # increment, but they're called from low-rate paths (per-conn
-    # rejection ~ kHz worst case, vs M+req/s on the unlabeled side)
-    # so the contention cost is invisible.
+    # contention-free increments).
+    #
+    # 2.13-A — moved to a per-thread shard for the same reason as
+    # `observe_histogram`: the previous "low-rate paths" claim was wrong
+    # (`tick_worker_request` is per-Rack-request), and at -t 32 the
+    # single mutex serialised every worker thread on the request-
+    # completion tail. Per-thread shards remove the contention;
+    # `labeled_counter_snapshot` merges shards under the mutex.
     def increment_labeled_counter(name, label_values = EMPTY_LABELS, by = 1)
-      @hg_mutex.synchronize do
-        @labeled_counters_meta ||= {}
-        @labeled_counters_meta[name] ||= { label_keys: [].freeze }
-        @labeled_counters ||= {}
-        family = (@labeled_counters[name] ||= {})
-        key    = label_values.frozen? ? label_values : label_values.dup.freeze
-        family[key] = (family[key] || 0) + by
+      thread = Thread.current
+      shard = thread.thread_variable_get(@lc_thread_key)
+      shard = register_thread_labeled_counters(thread) if shard.nil?
+
+      # Defensive: ensure the family meta exists so `register_labeled_counter`
+      # is not strictly required for hot-path increments. Pre-2.13-A the
+      # mutex'd path lazily registered an unlabeled meta; we mirror that
+      # under @hg_mutex so the shape stays consistent across threads.
+      unless @labeled_counters_meta && @labeled_counters_meta[name]
+        @hg_mutex.synchronize do
+          @labeled_counters_meta ||= {}
+          @labeled_counters_meta[name] ||= { label_keys: [].freeze }
+        end
       end
+
+      family = (shard[name] ||= {})
+      key    = label_values.frozen? ? label_values : label_values.dup.freeze
+      family[key] = (family[key] || 0) + by
     end
 
     def register_labeled_counter(name, label_keys: [])
@@ -333,14 +416,27 @@ module Hyperion
       end
     end
 
+    # 2.13-A — Snapshot merges per-thread shards. Pre-seeded with
+    # `@labeled_counters_meta` so registered-but-unticked families still
+    # show up in the scrape (matches pre-2.13-A behaviour where
+    # `register_labeled_counter` eagerly created the `[name] = {}` slot).
     def labeled_counter_snapshot
       out = {}
       @hg_mutex.synchronize do
-        (@labeled_counters || {}).each do |name, family|
-          per_labels = {}
-          family.each { |labels, count| per_labels[labels] = count }
+        (@labeled_counters_meta || {}).each do |name, meta|
+          out[name] = { meta: meta, series: {} }
+        end
+      end
+
+      shards = @hg_thread_mutex.synchronize { @thread_labeled_counters.dup }
+      shards.each do |shard|
+        shard.each do |name, family|
           meta = (@labeled_counters_meta || {})[name] || { label_keys: [].freeze }
-          out[name] = { meta: meta, series: per_labels }
+          slot = (out[name] ||= { meta: meta, series: {} })
+          series = slot[:series]
+          family.each do |labels, count|
+            series[labels] = (series[labels] || 0) + count
+          end
         end
       end
       out
@@ -391,6 +487,46 @@ module Hyperion
       thread.thread_variable_set(@thread_key, counters)
       @counters_mutex.synchronize { @thread_counters << counters }
       counters
+    end
+
+    # 2.13-A — allocate this thread's histogram shard and register it
+    # in `@thread_histograms` so snapshots find it. Idempotent per
+    # thread: callers always check `thread_variable_get` first.
+    def register_thread_histograms(thread)
+      shard = {}
+      thread.thread_variable_set(@hg_thread_key, shard)
+      @hg_thread_mutex.synchronize { @thread_histograms << shard }
+      shard
+    end
+
+    # 2.13-A — same shape as register_thread_histograms but for labeled
+    # counters. Each thread gets its own `{ name => { labels => Integer } }`
+    # map; the snapshot path merges across shards.
+    def register_thread_labeled_counters(thread)
+      shard = {}
+      thread.thread_variable_set(@lc_thread_key, shard)
+      @hg_thread_mutex.synchronize { @thread_labeled_counters << shard }
+      shard
+    end
+
+    # 2.13-A — fold a per-thread HistogramAccumulator's contents into an
+    # already-snapshotted entry (`{buckets:, counts:, sum:, count:}`).
+    # Both arguments share the same `:buckets` so the bucket index axis
+    # is identical; we sum `counts` per bucket plus the scalars. Used
+    # when two threads observed the SAME (name, labels) pair — a
+    # legitimate steady state on a Rack route hit by concurrent
+    # workers.
+    def merge_histogram_snapshot!(existing, accum)
+      counts = existing[:counts]
+      acc_counts = accum.counts
+      i = 0
+      len = counts.length
+      while i < len
+        counts[i] += acc_counts[i]
+        i += 1
+      end
+      existing[:sum]   += accum.sum
+      existing[:count] += accum.count
     end
   end
 end
