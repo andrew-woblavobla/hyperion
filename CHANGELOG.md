@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — 2.13.0
+## 2.13.0 — 2026-05-01
 
 ### 2.13-E — io_uring soak signal + default-ON decision
 

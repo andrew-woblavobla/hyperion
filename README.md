@@ -11,6 +11,55 @@ gem install hyperion-rb
 bundle exec hyperion config.ru
 ```
 
+## What's new in 2.13.0
+
+**Hardening sprint: profile-driven CPU work, durable infrastructure,
+and gRPC streaming.** 2.13 follows up the 2.12 perf jump with the
+work that wasn't structural enough to need its own major release —
+each stream is small but adds up:
+
+- **2.13-A — Generic Rack hot-path wins.** Per-thread shards for
+  hot-path metrics (no more cross-worker mutex on `observe_histogram`),
+  cached `worker_id` label tuple, and a Rack-3 keepalive fast-path.
+  Generic Rack hello bench: **+3.6% on `-c100` no-log**. Honest
+  finding: env-pool + body-coalesce already shipped; the deeper
+  generic-Rack gap to Agoo is single-thread Ruby ceiling that closing
+  needs moving `app.call` into the C accept loop — a 2.14 lift.
+- **2.13-B — Response head builder rewritten in C.** Pre-baked
+  status-line table, `rb_hash_foreach` replacing `rb_funcall(:keys)`,
+  per-key downcase + per-(key, value) full-line caches, custom `itoa`
+  replacing `snprintf`. **+7.7% single-thread synthetic; multi-thread
+  neutral (GVL-bound).** Profile confirms Hyperion's own C-ext code is
+  **<1%** of wall-clock; the rest is libruby + JSON gem.
+- **2.13-C — Spec flake hunt.** Two long-standing flakes fixed:
+  `tls_ktls_spec` macOS skip leak (unconditional `RUBY_PLATFORM`
+  guard), and `connection_loop_spec:79` Linux port-bind flake (root
+  cause: Linux `close()` doesn't wake a parked `accept(2)` — fixed
+  with a `stop_loop_and_wake` helper). 5/5 → 0/10 failure rate;
+  spec-suite runtime 46 s → 1.3 s.
+- **2.13-D — gRPC streaming RPCs.** Server-streaming, client-streaming,
+  and bidirectional RPCs on top of 2.12-F's unary trailers foundation.
+  New `bench/grpc_stream.{proto,ru}` + `grpc_stream_bench.sh` ghz
+  harness for operator-side comparison vs Falcon's `async-grpc`.
+- **2.13-E — io_uring soak harness + CI smoke.** New
+  `bench/io_uring_soak.sh` runs a 24h soak against the 2.12-D
+  io_uring loop with `/proc/$PID` + `/-/metrics` sampling, emits a
+  CSV + verdict (PASS / SOAK FAIL / borderline). New
+  `spec/hyperion/io_uring_soak_smoke_spec.rb` runs a 1000-request
+  mini-soak in CI to catch leak regressions before any 24h run.
+  **`HYPERION_IO_URING_ACCEPT` stays opt-in for 2.13** — operators
+  with their own staging environments can now collect signal; the
+  default-flip decision moves to 2.14.
+
+Plus all previous wins are preserved and verified by the 1183-spec
+suite (2.10-G TCP_NODELAY at accept, 2.10-E preload hooks, 2.10-F
+C-ext fast-path response writer, 2.11-A dispatch pool warmup, 2.11-B
+cglue HPACK default, 2.12-C accept4 connection loop, 2.12-D io_uring
+loop, 2.12-E per-worker request counter, 2.12-F gRPC unary trailers).
+
+Full per-stream details, bench tables, and follow-up items in
+[`CHANGELOG.md`](CHANGELOG.md).
+
 ## What's new in 2.12.0
 
 **The hot path moves into C — and gRPC ships.** The headline win:
