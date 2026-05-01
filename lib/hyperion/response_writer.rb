@@ -318,13 +318,21 @@ module Hyperion
       # extracted-fd attempt.
       return nil unless real_fd_io?(io)
 
-      # Fast skip for any response carrying app-supplied headers we
-      # can't safely bake.  Walks the Hash once; the common
-      # Rack::Files case has 1-2 headers (content-type +
-      # last-modified), so the loop body runs ≤ 2 times.
+      # Fast skip for any response carrying a header that's per-
+      # request or security-sensitive enough that the cache can't
+      # safely bake it.  We deliberately keep this list tight so the
+      # common Rack::Files case (which always emits `last-modified`
+      # + `content-type`) lands on the cache path; the cache
+      # buffer's `Content-Type` header is derived from the file
+      # extension via the same mime map agoo uses and `last-modified`
+      # is dropped (the client either revalidates via `If-None-Match`
+      # — not supported by the bare cache — or trusts
+      # `Cache-Control: max-age` when set, which IS in the skip list
+      # below).  Operators wanting wire-byte parity opt out per route
+      # via `env['hyperion.streaming'] = true`.
       headers.each do |k, _v|
         case k.to_s.downcase
-        when 'set-cookie', 'cache-control', 'etag', 'last-modified',
+        when 'set-cookie', 'cache-control', 'etag',
              'content-encoding', 'content-disposition', 'vary'
           return nil
         end
