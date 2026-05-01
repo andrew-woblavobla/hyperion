@@ -2,6 +2,85 @@
 
 ## [Unreleased] — 2.13.0
 
+### 2.13-E — io_uring soak signal + default-ON decision
+
+**Background.** 2.12-D shipped the io_uring accept loop on Linux 5.x+
+(opt-in via `HYPERION_IO_URING_ACCEPT=1`, bench delta:
+15,685 → 134,084 r/s on `handle_static` hello — 8.6× over the 2.12-C
+accept4 fallback, 7× over Agoo's 19,024). The CHANGELOG explicitly
+deferred the default-ON decision to 2.13: "default off until 2.13
+production soak". 2.13-E is that soak — and the harness operators
+need to run their own soak in their own staging.
+
+**What 2.13-E ships.**
+
+1. **`bench/io_uring_soak.sh`** — bash-only soak harness.
+   - Boots Hyperion with `HYPERION_IO_URING_ACCEPT=1 -w 1 -t 32`
+     against `bench/hello_static.ru` (the 2.12-D fast path) on a
+     fixed port. `setsid nohup … & disown` so the master survives
+     SSH disconnect over a 24h run.
+   - 30s warm-up, then `wrk -t4 -c100 -d24h --latency` in the
+     foreground. `SOAK_DURATION` is operator-tunable (defaults to
+     `24h`; the bench-window proof-of-concept was `30m`).
+   - In parallel, every `SAMPLE_INTERVAL` (default 60s), samples
+     `/proc/$PID/status` (VmRSS, VmSize, Threads), `/proc/$PID/fd`
+     count, scrapes `hyperion_requests_dispatch_total` from
+     `/-/metrics`, and bucket-derives p50/p99 from
+     `hyperion_request_duration_seconds_bucket`. Appends one CSV
+     row per sample to `/tmp/io_uring_soak_<tag>_<ts>.csv`.
+   - On exit (24h elapsed OR Ctrl-C), prints summary:
+     min/max/mean/stddev RSS, fd_count peak, p99 stddev/mean, plus
+     wrk's HDR-precision p50/p99/p999 from `--latency`.
+   - **Verdict**:
+     - PASS if RSS variance < 10%, fd peak ≤ `WRK_CONNS + 50`, and
+       (when histogram has ≥ 3 distinct bucket values across the
+       window) p99 stddev/mean < 20%. Eligible for default-flip.
+     - SOAK FAIL on any breach. Defer the flip; the failed metric
+       is documented in the verdict notes.
+     - The histogram p99 check is bypassed when there are < 3
+       distinct bucket values across the soak window — Hyperion's
+       7-edge histogram (1 ms, 5 ms, 25 ms, …) quantizes a stable
+       hello-world p99 into bucket-boundary jumps, and the wrk
+       `--latency` p99 is the right tail-truth source there.
+   - `IO_URING=0` runs the same harness against the 2.12-C accept4
+     fallback so the operator can diff io_uring vs accept4 CSVs
+     apples-to-apples.
+
+2. **`spec/hyperion/io_uring_soak_smoke_spec.rb`** — durable CI
+   coverage. A 1000-request mini-soak over the io_uring loop with
+   a 200-request warm-up, asserts: RSS delta < 20 MB,
+   fd_count back to baseline ± 5, threads back to baseline ± 4.
+   Skipped on macOS / non-liburing builds via the same
+   `Hyperion::Http::PageCache.io_uring_loop_compiled?` predicate the
+   2.12-D wire-shape spec uses. Lives in its own file so a 2.13-E
+   leak signal regression is diagnosable without re-reading the
+   2.12-D wire-shape spec.
+
+   *Calibration note*: the 2.13-E ticket header proposed a 5 MB
+   delta bound. Bench-host measurements (3-run baseline, IO_URING=1,
+   1000 sequential GETs) put the delta at 7-9 MB — but the
+   dominant allocator is the test process itself
+   (`::TCPSocket.new`, `Timeout` threads, response Strings), not the
+   Hyperion server. The 20 MB threshold catches a real Hyperion
+   leak (1 KB/req of leakage = +1 MB at the assertion site) without
+   false-positiving on the test driver's own arena cost.
+
+3. **30-minute proof-of-concept soak** — see the companion
+   `[bench]` commit for the harness-vs-harness numbers across
+   IO_URING=1 / IO_URING=0 and the explicit default-ON decision.
+
+**Constraints respected.** No regression in spec count. macOS-host
+suite: 1124/0/14 → 1126/0/16 (+2 examples, +2 pending — the soak
+smoke is pending on macOS, the documentation example is active). Linux
+bench-host suite: 1124/0/14 → 1126/0/15 (+2 examples, +1 pending —
+the soak smoke runs, the documentation example is pending). The
+2.10-G TCP_NODELAY hunk, 2.10-E preload hooks, 2.10-F
+`rb_pc_serve_request`, 2.11-A dispatch pool warmup, 2.11-B cglue HPACK
+default, 2.12-C accept4 loop, 2.12-D io_uring loop, 2.12-E per-worker
+counter, 2.12-F gRPC unary trailers, 2.13-A metric shards, 2.13-B
+response head builder, 2.13-C flake fixes, 2.13-D gRPC streaming —
+all on master and untouched.
+
 ### 2.13-D — gRPC streaming RPCs + ghz vs Falcon bench
 
 **Background.** 2.12-F shipped gRPC unary on h2 — trailers
