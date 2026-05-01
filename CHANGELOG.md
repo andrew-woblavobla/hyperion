@@ -1,6 +1,63 @@
 # Changelog
 
-## [Unreleased] - 2.6.0
+## [2.6.0] - 2026-05-01
+
+### Headline
+
+A static-file perf release with a doc accuracy pass. Two perf cuts
+landed (sendfile chunk size + inline_blocking dispatch fix), one was
+reverted (fadvise per-chunk regressed warm-cache), and the README +
+BENCH docs got an honest accuracy review.
+
+| Stream | Result |
+|---|---|
+| 2.6-A — sendfile chunk size 64 KiB → 256 KiB | **+20.7% on static 1 MiB** (1,094 → 1,320 r/s) |
+| 2.6-B — posix_fadvise(SEQUENTIAL) | **REVERTED**: per-chunk call regressed warm-cache -6.6%; cold-cache win unmeasurable. Filed as 2.7 candidate IF hoisted-once approach lands. |
+| 2.6-C — `:inline_blocking` dispatch mode | Puma-style serial-per-thread for static-file routes. Auto-detect on `to_path` bodies. Initial bench surfaced engagement gap fixed in 2.6-D. |
+| 2.6-D — engagement gap + bookkeeping strip | `Fiber.blocking{}` wrap bypasses `Async` scheduler hooks on `IO.select`. **p99 collapses 433 ms → 7.48 ms at c=10** under `--async-io`; +6% rps with 39-72% p99 reduction at c=100. |
+| 2.6-E — doc + bench audit | README + BENCH_HYPERION_2_0 fairness review. PG +378%/4.78× honest matched ratio ~2.2×. HTTP/2 rows relabelled. Topology column added. 4 follow-ups filed for 2.7. |
+
+Spec count: 907 (2.5.0) → **951** (2.6.0). 0 failures, 11 pending.
+
+### Production-relevant takeaway for nginx-fronted operators
+
+Static-file rps on the user's plaintext-h1 topology improved by **+20.7%** via
+2.6-A. The `:inline_blocking` dispatch mode (2.6-C/D) is most relevant
+for operators running with `--async-io` (PG-heavy workloads); the auto-detect
+mechanism kicks in transparently for routes that return `to_path` bodies.
+Default threadpool dispatch (the user's typical config) sees ~no change
+on rps from 2.6-C/D — threadpool already serves static via OS threads
+without fiber yield, so there's nothing to skip.
+
+### Doc accuracy
+
+The 2.6-E audit corrected several misframed wins from prior releases:
+- PG-bound row's `+378% / 4.78×` claim was apples-to-oranges (different
+  PGs, different max_conn budgets); honest matched ratio is ~2.2×.
+- HTTP/2 multiplexing rows are now framed honestly as "Puma 8 lacks
+  native h2 — Falcon comparison owed" rather than "Hyperion wins h2".
+- SSE row's "Puma can't stream" was due to a Hyperion-specific flush
+  sentinel in the rackup; reframed honestly. Generic SSE rackup filed
+  for 2.7.
+- Bench-host drift -14 to -32% absolute since 2.0.0 publication is
+  documented in BENCH addendum; the relative Hyperion vs Puma ratios
+  remain durable.
+- Production-relevance column added to BENCH headline table marking
+  each row "prod" (nginx-fronted h1 / WS upstream) or "bench-only"
+  (TLS termination at Hyperion, h2 multiplexing, kTLS_TX) so operators
+  don't chase wins that don't apply to their topology.
+
+### What didn't ship
+
+- 2.6-B (fadvise SEQUENTIAL) reverted; will revisit in 2.7 if a real
+  cold-cache static workload surfaces.
+
+### Follow-ups for 2.7
+
+1. `bench/sse_generic.ru` — generic SSE rackup without Hyperion sentinel
+2. Matched-config WAN-PG Puma rerun for row 7 (clean ratio)
+3. Falcon h2 head-to-head for the HTTP/2 rows
+4. Static 1 MiB regression bisect (today 1,228 vs 2.0.1's 1,697 — bench drift suspected, verification owed)
 
 ### 2.6-D — `:inline_blocking` engagement-gap fix + Connection bookkeeping strip
 
