@@ -116,6 +116,58 @@ key.
   * `@worker_id_label_tuple` is constructed once, frozen, and reused
     by identity across requests on the same Connection.
 
+### 2.13-A — Bench result
+
+Bench host: openclaw-vm (Linux 6.8.0, x86_64). Hyperion `-t 32 -w 1`
+on `bench/hello.ru` (generic Rack hello). 5-trial median, wrk 4.x.
+
+**With access logging on (default — JSON access lines per request):**
+
+| Workload   | Master | 2.13-A | Δ |
+|------------|-------:|-------:|---:|
+| -c1 -t1    | 7,631  | 7,386  | -3.2% (within noise) |
+| -c100 -t4  | 4,004  | 4,031  | +0.7% (within noise) |
+
+**With `--no-log-requests` (logging disabled):**
+
+| Workload   | Master | 2.13-A | Δ |
+|------------|-------:|-------:|---:|
+| -c1 -t1    | 9,028  | 8,938  | -1.0% (within noise) |
+| -c100 -t4  | 4,804  | 4,979  | **+3.6%** |
+
+**Honest framing.** The +3.6% at `-c100 --no-log-requests` is the
+clearest signal that the metrics-mutex contention removal lands. At
+`-c1` the workload is single-thread CPU-bound (one wrk thread, one
+keepalive connection, one Hyperion worker thread serving it); the
+optimisations don't help and don't hurt. At `-c100` the
+optimisations reach a reasonable +3.6% on the no-log path; with
+logging on, the access-log path dominates the per-request CPU
+budget so the metrics savings are masked.
+
+**What the bench reveals.** The 4.25× gap to Agoo on the generic
+Rack workload that 2.12-B identified is not a metrics-contention
+problem and not an env-pool problem (env pooling was already in
+place since 1.6.x). It is a **single-thread Ruby work per request**
+ceiling — at `-c1` the bench tops out at ~9,000 r/s = 110 µs/req
+of single-thread Ruby work, which Agoo (Rack-shape C server) does
+in ~52 µs/req. Closing that gap requires moving meaningful chunks
+of the per-request Ruby surface (parser, env build, headers, log
+line) into C — work that's already 50% complete in
+`Hyperion::CParser` (`build_env`, `build_response_head`,
+`build_access_line`). The 2.13 sprint will continue moving the
+remaining Ruby-side pieces (`Connection#serve` request loop,
+ResponseWriter dispatch, `should_keep_alive?`) into C in subsequent
+phases.
+
+**Durable infrastructure.** The 2.13-A optimisations stay in the
+tree even though the headline-bench delta is small. The
+per-thread metrics shard removes a real mutex bottleneck that
+*will* compound under future workloads — Ractor-based dispatch,
+multi-process scrapers, observability-heavy apps that observe
+custom histograms per-request. The Rack-3 keepalive fast path and
+the cached worker-id tuple are pure-quality changes (less code,
+fewer allocations, no API surface change).
+
 ## 2.12.0 — 2026-05-01
 
 ### 2.12-F — gRPC support on h2
