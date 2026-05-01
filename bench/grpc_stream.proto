@@ -1,0 +1,24 @@
+// 2.13-D — minimal streaming gRPC service for the ghz bench.
+//
+// Server-streaming variant: one request triggers N response messages.
+// The Hyperion-side Rack app implements the wire framing manually; the
+// proto here is just for ghz / grpcurl to know what to send.
+syntax = "proto3";
+
+package hyperion.bench;
+
+service EchoStream {
+  // Server-streaming: one EchoRequest, N EchoReplies.
+  rpc ServerStream (EchoRequest) returns (stream EchoReply) {}
+  // Unary baseline for overhead comparison.
+  rpc Unary (EchoRequest) returns (EchoReply) {}
+}
+
+message EchoRequest {
+  uint32 count = 1; // ignored by the bench server; server returns a fixed N
+  bytes  payload = 2;
+}
+
+message EchoReply {
+  bytes payload = 1;
+}
