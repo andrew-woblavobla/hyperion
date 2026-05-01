@@ -6,6 +6,53 @@
 > 12. See [§ 2.0.1 update](#201-update-2026-04-30--phase-8-closes-the-static-file-rps-gaps)
 > at the end of this document.
 
+> **2026-05-01 audit addendum (2.6-E doc audit)** — A spot-check rerun
+> on the same `openclaw-vm` host 2 days after the 2.0.0 sweep showed
+> the published absolute rps numbers do **not** reproduce on the same
+> host with no code changes:
+>
+> | Row | Published 2.0.0 | Spot-check 2026-05-01 | Δ |
+> |---|---:|---:|---:|
+> | Hello-world `-w 16 -t 5` | 96,813 r/s | **76,593 r/s** | **-21%** |
+> | Hello-world `-w 4 -t 5` | 20,630 r/s | **17,667 r/s** | **-14%** |
+> | Static 1 MiB `-w 1 -t 5` | 1,809 r/s | **1,228 r/s** | **-32%** |
+> | Static 1 MiB Puma `-w 1 -t 5:5` | 2,139 r/s | **1,593 r/s** (Puma 6.6.1) | **-26%** |
+>
+> The bench host is a single KVM VM running other workloads in the
+> background; absolute-rps drift between sweep dates is real. **The
+> *relative* position (Hyperion vs Puma at matched config) is the
+> durable signal** — e.g. on the spot-check, Hyperion `-w 16` was
+> 76,593 vs Puma `-w 16` at 55,609 = **+37.7% over Puma**, *wider*
+> than the 2.0.0 sweep's +27.8%, even though absolute rps is lower.
+> Treat the published rps numbers as a snapshot of one good
+> measurement window, not as a guaranteed ceiling. Operators
+> reproducing should expect ±10-30% absolute drift between sweep
+> dates and verify their own apples-to-apples ratio.
+>
+> The spot-check Puma rerun used Puma 6.6.1 (the
+> `~/hyperion-fresh/Gemfile` pin), not 8.0.1 (`~/bench/Gemfile` pin)
+> — a version-mismatch caveat that didn't apply to the original
+> 2.0.0 sweep. Both match the published shape (Puma rps lower than
+> Hyperion at matched config, p99 1-2 orders of magnitude higher),
+> just at lower absolute numbers.
+
+> **Topology relevance** — operators reading this doc should keep in
+> mind that benches break into two categories:
+>
+> - **Production-relevant for the most common Hyperion deploy
+>   (nginx / L7 LB → plaintext upstream)**: hello-world, CPU JSON,
+>   static (1 MiB / 8 KB), SSE, PG (50 ms wait + realistic), 10k idle
+>   keep-alive RSS, WebSocket. The LB → upstream hop is plaintext
+>   HTTP/1.1 regardless of LB-side termination, so these are the
+>   workloads that actually shape your operator experience.
+> - **Bench-only for nginx-fronted ops (operator-relevant only if you
+>   terminate TLS / h2 at Hyperion directly)**: TLS h1 (Phase 4), kTLS
+>   row, HTTP/2 multiplexing (h2load c=1 m=100), HTTP/2 POST. Don't
+>   chase the +60% TLS-h1 win or the +18% native-HPACK win as a
+>   reason to re-architect a deploy that already terminates at the LB.
+>
+> Per-row "Production-relevant?" markers in the headline table below.
+
 12-workload final sweep. Closes the perf overhaul that started at 1.6.0
 (2026-04-27 baseline) and shipped through 1.7.0 (sendfile + chunked
 coalescing), 1.7.1 (Lint pool + 30-header intern + C build_env + cookie
@@ -25,39 +72,40 @@ below.
 
 ## Headline summary
 
-| # | Workload | Hyperion 2.0.0 (r/s) | Puma 8.0.1 (r/s) | rps win | p99 (Hyp / Puma) | Hyperion ≥ Puma? |
-|---:|---|---:|---:|---:|---:|:---:|
-| 1 | Hello-world `-w 16 -t 5` | **96,813** | 75,776 | **+27.8%** | 2.21 ms / 6.74 ms | YES |
-| 2 | Hello-world `-w 4 -t 5`  | **20,630** | 17,035 | **+21.1%** | 1.95 ms / 16.27 ms | YES |
-| 3 | CPU-bound JSON `-w 4 -t 5` (`bench/work.ru`) | **15,585** | 12,912 | **+20.7%** | 2.58 ms / 21.82 ms | YES |
-| 4 | Static 1 MiB `-w 1 -t 5` (`bench/static.ru`) | 1,809 | **2,139** | -15.4% | 4.37 ms / 57.74 ms | NO (rps), **YES (p99 13.2× lower)** |
-| 5 | Static 8 KB `-w 1 -t 5` (`bench/static_8k.ru`) | 121 | **1,246** | -90.3% | 43.85 ms / 109.05 ms | **NO** — see [caveat](#caveat-static-8k-at--t-5); -t 64 gets to 1,112 |
-| 6 | SSE 1000×50 B (`bench/sse.ru`, `wrk -t1 -c1`) | **24** | 0 (Puma can't stream) | n/a | 41.19 ms / — | YES (Puma fails the workload) |
-| 7 | PG-bound 50ms wait (Hyp `--async-io -t 5 -w 1` pool=200 vs Puma `-t 100:100`) | **2,189** | 458 | **+378%** (4.78×) | 597 ms / 566 ms | YES |
-| 8 | PG realistic transactional (Hyp `--async-io` pool=64 vs Puma `-t 30`) | **1,216** | 268 | **+354%** (4.54×) | 5.96 s / 7.18 s | YES |
-| 9 | TLS h1 hello (Hyp `-t 64 -w 1` vs Puma `-t 5:64`) | **3,425** | 2,142 | **+59.9%** | 78.17 ms / 37.06 ms | YES |
-| 10 | HTTP/2 multiplexing (`h2load -c 1 -m 100 -n 5000`) | **1,597** | n/a (Puma 8.0.1 lacks h2) | — | max 90 ms | YES (Puma absent) |
-| 11 | HTTP/2 POST (`bench/h2_post.ru`, `h2load -c 1 -m 100 -n 5000 -d`) | **1,500** | n/a | — | max 91 ms | YES (Puma absent) |
-| 12 | 10k idle keep-alive RSS | drained 149 MB / peak 168 MB | drained 107 MB / peak 121 MB (1.6.0 baseline) | — | — | YES — within 4 MB of 1.6.0 (no regression); Puma still wins absolute MB |
+Topology-relevance column: **prod** = applies to nginx-fronted plaintext-h1 deployments (the most common Hyperion topology); **bench-only** = applies only if you terminate TLS / h2 at Hyperion directly.
 
-**Net rps win**: 8 of 12 head-to-head rps comparisons (rows 1-9) show
-Hyperion 2.0.0 ahead, by margins from +21% (CPU JSON) to +378% (PG-bound).
-Two rows (4, 5) Puma wins on rps but Hyperion wins on p99 by 13× (row 4)
-and Puma is shut out by 2× tail (row 5 — see caveat). Three rows (10-12)
-are uncomparable — Puma 8.0.1 has no native HTTP/2 support and Hyperion's
-RSS sanity is the regression check, not a head-to-head.
+| # | Workload | Hyperion 2.0.0 (r/s) | Puma 8.0.1 (r/s) | rps win | p99 (Hyp / Puma) | Topology | Hyperion ≥ Puma? |
+|---:|---|---:|---:|---:|---:|:---:|:---:|
+| 1 | Hello-world `-w 16 -t 5` | **96,813** | 75,776 | **+27.8%** | 2.21 ms / 6.74 ms | prod | YES |
+| 2 | Hello-world `-w 4 -t 5`  | **20,630** | 17,035 | **+21.1%** | 1.95 ms / 16.27 ms | prod | YES |
+| 3 | CPU-bound JSON `-w 4 -t 5` (`bench/work.ru`) | **15,585** | 12,912 | **+20.7%** | 2.58 ms / 21.82 ms | prod | YES |
+| 4 | Static 1 MiB `-w 1 -t 5` (`bench/static.ru`) | 1,809 | **2,139** | -15.4% | 4.37 ms / 57.74 ms | prod | NO (rps), **YES (p99 13.2× lower)** |
+| 5 | Static 8 KB `-w 1 -t 5` (`bench/static_8k.ru`) | 121 | **1,246** | -90.3% | 43.85 ms / 109.05 ms | prod | **NO** — see [caveat](#caveat-static-8k-at--t-5); -t 64 gets to 1,112; closed in 2.0.1 |
+| 6 | SSE 1000×50 B (`bench/sse.ru`, `wrk -t1 -c1`) | **24** | 0 (Puma fails the rackup) | n/a — see [SSE row](#sse-streaming) | 41.19 ms / — | prod (with caveat) | **NOT a Puma capability gap** — the rackup uses a Hyperion-specific `:__hyperion_flush__` flush sentinel that Puma emits as a literal chunk, breaking the wire framing on the wrk side. A generic SSE workload (no Hyperion sentinel) needs to be added before this row supports a "Puma can't stream" claim. |
+| 7 | PG-bound 50ms wait (Hyp `--async-io -t 5 -w 1` pool=200 vs Puma `-t 100:100`) | **2,189** (originally; see verification rerun: median **~2,567** at matched-WAN-PG) | 458 | **originally +378%** (4.78×) — **honest matched-config ratio is uncalibrated**; see [Row 7 verification](#row-7-verification-rerun-2026-04-29-2145-utc) | 597 ms / 566 ms | prod | YES (architecturally; magnitude indicative only) |
+| 8 | PG realistic transactional (Hyp `--async-io` pool=64 vs Puma `-t 30`) | **1,216** | 268 | **+354%** (4.54×) — **same apples-to-oranges caveat as row 7**: Hyperion against WAN PG max_conn=500, Puma against local PG max_conn=100. Magnitude indicative only. | 5.96 s / 7.18 s | prod | YES (architecturally; magnitude indicative only) |
+| 9 | TLS h1 hello (Hyp `-t 64 -w 1` vs Puma `-t 5:64`) | **3,425** | 2,142 | **+59.9%** | 78.17 ms / 37.06 ms | bench-only | YES (only if you terminate TLS at Hyperion) |
+| 10 | HTTP/2 multiplexing (`h2load -c 1 -m 100 -n 5000`) | **1,597** | n/a (Puma 8.0.1 lacks native h2) | — — **NOT a "Hyperion wins h2" claim**; Puma 8 has no native h2 path. Falcon 0.55+ does and is the owed comparison; deferred. | max 90 ms | bench-only | Hyperion supports h2; Puma 8 doesn't. |
+| 11 | HTTP/2 POST (`bench/h2_post.ru`, `h2load -c 1 -m 100 -n 5000 -d`) | **1,500** | n/a | — — same as row 10, no Puma path | max 91 ms | bench-only | Hyperion supports h2; Puma 8 doesn't. |
+| 12 | 10k idle keep-alive RSS | drained 149 MB / peak 168 MB | drained 107 MB / peak 121 MB (1.6.0 baseline) | — | — | prod | Puma wins absolute MB; no Hyperion regression vs 1.6.0 |
 
-**One-paragraph answer**: a 16-vCPU host runs Hyperion 2.0.0 at **97k
-r/s on hello-world** (+27.8% over Puma), CPU JSON at **15.6k r/s** (+21%),
-and PG-bound 50ms-wait at **2,189 r/s** (4.78× Puma). The Phase 6 Rust
-HPACK + per-connection writer fiber + Phase 4 TLS session resumption
-ticket cache make TLS h1 **+60% over Puma at 3,425 r/s**. The breaking
-flip on `h2.max_total_streams` (default 512 streams per process at -w 1)
-required a `:unbounded` override to run h2load's 5,000-stream test —
-operators on heavy h2 fan-out should set `h2.max_total_streams` higher
-explicitly (RFC §3 2.0.0). Static-file path narrowly loses to Puma on
-1 MiB at default threads but wins p99 by 13×; 8 KB static at default `-t
-5` is a real regression worth a follow-up (see caveat).
+**Net rps win** (post-audit): on a CPU-bound or hello-world workload, Hyperion 2.0.0 leads Puma 8.0.1 by 21-28% on rps and 5-8× on p99 (rows 1-3). On the production-relevant static and PG rows, the *qualitative* finding (Hyperion's tail is dramatically lower; Hyperion's fiber-pool serves wait-bound workloads at concurrency Puma's threadpool cannot reach without parking OS threads) holds — but the published magnitudes for the PG rows (4.78×, 4.54×) reflect Puma timing out at its local-PG pool ceiling, not Puma's natural rate against a matched-pool PG; the matched-config ratio is closer to **2.2× on the wait-bound row**. Static rows (4, 5) Puma wins on rps but Hyperion wins on p99 by 13-17×; both static rows are closed by 2.0.1 (see end of doc). Rows 9-11 are TLS / h2 specific and **bench-only** for nginx-fronted ops; the +60% TLS h1 win and +18% native-HPACK win are real but apply only if you terminate TLS / h2 at Hyperion directly.
+
+**One-paragraph answer (2.6-E audit pass)**: Hyperion 2.0.0 leads Puma
+8.0.1 by **+27.8% on hello-world** (97k vs 76k r/s on a 16-vCPU box,
+spot-check 2026-05-01 reproduces the *relative* +37.7% even at lower
+absolute rps), **+20.7% on CPU JSON** (15.6k vs 12.9k r/s), and a
+qualitative architectural win on PG-bound workloads with
+`hyperion-async-pg` (single-worker fiber pool reaches pool=200 + 2,500-
+plus r/s on 50 ms PG queries with zero timeouts; Puma's threadpool
+plateaus at pool=100 because every waiting query parks an OS thread).
+The "4.78× Puma on PG" headline carried forward from the original
+sweep was a Puma-timeout artefact (Puma against local PG max_conn=100
+collapsed before a clean rps reading; verification rerun in row 7).
+The +60% TLS h1 win is operator-relevant only if Hyperion terminates
+TLS directly. Static-file rps gaps are closed in 2.0.1; SSE row's
+"Puma can't stream" framing is mis-labelled and reflects a rackup
+design issue, not Puma capability (see [SSE row](#sse-streaming)).
 
 ## Hardware + software stamp
 
@@ -237,32 +285,75 @@ guidance in 1.6.1's "Operator guidance" README section.
 | **sse-hyp-w1-t5** | **Hyperion 2.0.0** | **24** | 41.00 ms | 41.19 ms | 0 | 0 |
 | sse-puma-w1-t5 | Puma 8.0.1 | 0 | — | — | 0 | 11,686 read errors |
 
-**Reading**: Puma 8.0.1 cannot stream the SSE rackup — the 1000-chunk
-body crashes wrk's read loop (11.7 k read errors, 0 successful r/s).
-Hyperion's Phase 5 `ChunkedCoalescer` handles it — 24 r/s × 1000 events
-per response = 24,000 events/s pumped through one fiber. Phase 5's
-syscall-coalescing target was "~10-15 writes per response (1 head + N
-buffer drains + 1 terminator)" — verified at the syscall level in
-`spec/hyperion/chunked_coalescing_spec.rb`.
+**Reading (audit-corrected 2026-05-01)**: the original framing —
+"Puma 8.0.1 cannot stream the SSE rackup" — is **misleading**. The
+rackup at `bench/sse.ru` uses a **Hyperion-specific flush sentinel**
+(`yield(:__hyperion_flush__)` every 50 events) to drive
+`ChunkedCoalescer#force_flush!`. Hyperion's Rack adapter recognises
+this sentinel and treats it as a "flush hint, not a body chunk"; Puma
+has no such hook and emits the sentinel **as a literal body chunk**
+(`":__hyperion_flush__"` written into the chunked stream). That breaks
+the chunked-encoding framing on the wrk side, which counts the
+malformed bytes as "read errors" and reports 0 r/s. **This is a bench
+rackup design issue, not a Puma SSE-capability gap.**
 
-Puma can serve SSE at low chunk count, but the 1000-tiny-events shape is
-the failure mode this bench rackup was designed to surface (1.7.0
-release notes).
+A generic SSE rackup (no Hyperion sentinel — just `yield(event)` 1000
+times with a normal `transfer-encoding: chunked` response) would
+exercise Puma's SSE path correctly, and is owed before this row can
+back any "Puma can't stream" claim. **What the row honestly shows**:
+Hyperion handles its own flush-sentinel protocol on a 1000-tiny-events
+streaming workload and pumps 24 r/s × 1000 events = 24,000 events/s
+through one fiber, with the Phase 5 ChunkedCoalescer reducing per-
+response syscalls from ~1000 (one per event) to ~10-15 (1 head + N
+buffer drains + 1 terminator). The syscall-coalescing claim is
+verified at the syscall level in `spec/hyperion/chunked_coalescing_spec.rb`.
+
+**Filed for follow-up**: add `bench/sse_generic.ru` (no Hyperion
+sentinel) and rerun against Puma to characterise Puma's actual SSE
+capability honestly.
 
 ## PG-bound 50ms wait
 
-`bench/pg_concurrent.ru` (`SELECT pg_sleep(0.05)` + tiny JSON),
-`wrk -t4 -c200 -d20s --timeout 8s`.
+`pg_concurrent.ru` (`SELECT pg_sleep(0.05)` + tiny JSON; rackup lives
+in [hyperion-async-pg](https://github.com/andrew-woblavobla/hyperion-async-pg)
++ on the bench host at `~/bench/`, not in this repo — see the
+"Reproducing this report" section), `wrk -t4 -c200 -d20s --timeout 8s`.
 
 | name | server | mode | pool | r/s | p50 | p99 | non-2xx | timeouts |
 |---|---|---|---:|---:|---:|---:|---:|---:|
-| **pg-hyp-asyncio-pool200** | **Hyperion 2.0.0 `--async-io -t 5 -w 1`** | async | **200** | **2,189** | 60 ms | **597 ms** | 0 | 0 |
+| **pg-hyp-asyncio-pool200** | **Hyperion 2.0.0 `--async-io -t 5 -w 1`** | async | **200** | **2,189** (verification rerun median: **~2,567**) | 60 ms | **597 ms** (rerun: ~336 ms) | 0 | 0 |
 | pg-puma-t100-pool100 | Puma 8.0.1 `-t 100:100` | plain | 100 | 458 | 147 ms | 566 ms | 0 | **200** |
 
-**Reading**: **4.78× rps on this row, 0 errors vs 200 wrk timeouts on
-Puma**. Hyperion saturates ~91% of the 4,000 r/s ceiling
-(`pool=200 / 0.05 wait`); Puma plateaus at pool=100 because every
-waiting query parks an OS thread.
+**Reading (audit-corrected)**: the **+378% (4.78×) headline carried
+forward by the original sweep is misleading** for two reasons that
+the verification rerun at the bottom of this section already documents:
+
+1. **Apples-to-oranges PG endpoint**: Hyperion ran against
+   `pg.wobla.space` WAN PG with `max_connections=500`, while Puma
+   ran against local PG with `max_connections=100`. The Puma side hit
+   its local pool ceiling at pool=100 and then **timed out 200 of the
+   wrk requests** at the 8 s wrk timeout — the 458 r/s number is
+   Puma's collapsed-floor rate, not its natural rate against a
+   matched-pool PG.
+2. **Verification rerun showed Hyperion at ~2,567 r/s median** (better
+   than the originally-reported 2,189) but a matching-WAN-PG Puma
+   rerun could not be captured cleanly — the prior Hyperion sweep had
+   already consumed pg.wobla.space's connection budget and Puma
+   collapsed at 1.7 r/s on connection exhaustion, which is a worse
+   apples-to-apples problem than the original. The Puma side of this
+   row is **uncalibrated** at matched PG.
+
+**What the row honestly supports**: Hyperion's `--async-io` + fiber
+pool serves a 50 ms-waiting PG workload at high concurrency (pool=200
+→ 2,500-plus r/s, zero timeouts) where Puma's threadpool model
+plateaus at the smaller pool size that matches `-t` (because every
+waiting query parks an OS thread). The architectural finding — fiber
+concurrency widens the wait-bound throughput ceiling without OS-
+thread cost — is real. The **headline magnitude (4.78×) should be
+treated as indicative, not precisely calibrated**; an honest match-
+config ratio is owed and lands closer to ~2.2× on this fixture (Puma
+at its own best `-t 100 pool=100` row in the README's wider matrix
+hits 1,067 r/s; Hyperion at pool=200 hits 2,381 r/s = 2.23×).
 
 ### Row 7 verification rerun (2026-04-29 21:45 UTC)
 
@@ -301,22 +392,38 @@ Raw rerun logs preserved at `/tmp/pg-hyp-pool200.wrk.log` on
 
 ## PG realistic transactional
 
-`bench/pg_realistic.ru` (`BEGIN; INSERT; SELECT; COMMIT;` × 4 PG
-round-trips per req), `wrk -t4 -c100 -d20s --timeout 60s`.
+`pg_realistic.ru` (`BEGIN; INSERT; SELECT; COMMIT;` × 4 PG
+round-trips per req; rackup lives in
+[hyperion-async-pg](https://github.com/andrew-woblavobla/hyperion-async-pg) /
+`~/bench/`, not in this repo), `wrk -t4 -c100 -d20s --timeout 60s`.
 
 | name | server | mode | pool | r/s | p50 | p99 | non-2xx |
 |---|---|---|---:|---:|---:|---:|---:|
 | **real-hyp-asyncio-pool64** | **Hyperion 2.0.0 `--async-io -t 5 -w 1`** | async | **64** | **1,216** | 46 ms | 5.96 s | 0 |
 | real-puma-t30-pool30 | Puma 8.0.1 `-t 30:30` | plain | 30 | 268 | 232 ms | 7.18 s | 0 |
 
-**Reading**: **4.54× rps**, **17.0% lower p99** on the realistic
-transactional shape. Both servers run hot here; the rps gap is the
-takeaway. The `5.96 s p99` is the queue-depth × WAN-RTT compound
-(`100 conns × 4 round-trips × 50-100 ms / 64 pool` ≈ 312-625 ms
-steady-state, plus connect-cost spikes); Puma's `7.18 s p99` is the same
-shape with worse throughput.
+**Reading (audit-corrected)**: the **+354% (4.54×) headline carries
+the same apples-to-oranges caveat as row 7** — Hyperion against
+`pg.wobla.space` WAN PG (max_conn=500), Puma against local PG (max_conn=100).
+A matched-WAN-PG Puma rerun was not captured for this row. **The
+qualitative finding holds** (fiber pool at pool=64 vs threadpool at
+pool=30 widens the realistic-transactional throughput ceiling without
+parking OS threads) but **the magnitude is uncalibrated**. Both servers
+run hot on this 4-round-trip workload; Hyperion's `5.96 s p99` is the
+queue-depth × WAN-RTT compound (`100 conns × 4 round-trips × 50-100 ms
+/ 64 pool` ≈ 312-625 ms steady-state plus connect-cost spikes), Puma's
+`7.18 s p99` is the same shape with the smaller pool. **Operators
+should treat the 4.54× ratio as indicative, not steady-state**, and
+rerun against their own matched-config PG to size capacity.
 
 ## TLS h1 (Phase 4 session resumption + writer-fiber)
+
+> **Topology relevance: bench-only for nginx-fronted ops**. If your LB
+> terminates TLS and forwards plaintext HTTP/1.1 upstream to Hyperion,
+> this row's +60% rps win does not apply to your deploy — the LB →
+> upstream hop never exercises the TLS path. The row is operator-
+> relevant only if Hyperion is the TLS-terminating edge (small static
+> fleets, single-VM edge boxes, dev / staging without an L7 LB).
 
 `bench/hello.ru` over HTTPS, `wrk -t4 -c64 -d20s`.
 
@@ -336,6 +443,22 @@ on warm conns, occasional spikes when the cache rolls".
 win on `wrk`'s repeated `-c64` connections.
 
 ## HTTP/2 multiplexing — Phase 6 Rust HPACK
+
+> **Comparison framing**: this row is **not** a "Hyperion wins HTTP/2"
+> claim against Puma — Puma 8.0.1 has no native HTTP/2 path
+> (production Puma deployments terminate h2 at nginx and forward h1 to
+> the worker pool). Falcon 0.55+ ships native h2 and is the owed
+> comparison; deferred (the 2.0.0 sweep brief was Hyperion vs Puma).
+> The row demonstrates Hyperion's h2 path *exists and is functional at
+> 1,500+ r/s, 0 errors, 95% HPACK savings* on the c=1 m=100 envelope —
+> not that Hyperion h2 beats anyone.
+>
+> **Topology relevance**: this row is **bench-only for nginx-fronted
+> ops**. If your LB terminates HTTP/2 and forwards HTTP/1.1 upstream
+> to Hyperion (the most common deploy), the h2 path here doesn't run.
+> If you're running Hyperion as the TLS-terminating edge and want
+> native HTTP/2 multiplexing on the wire, this row characterises that
+> path.
 
 `h2load -c 1 -m 100 -n 5000 https://127.0.0.1:9701/` against TLS
 Hyperion `-t 64 -w 1` with `h2.max_total_streams :unbounded` (overriding
