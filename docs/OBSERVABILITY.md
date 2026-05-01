@@ -74,8 +74,11 @@ Per-message permessage-deflate compression ratio (`original_bytes /
 compressed_bytes`).
 
 * **Buckets:** `1.5, 2, 5, 10, 20, 50` (× compression).
-* **No labels** — this is a process-wide effectiveness gauge, not a per-route
-  one. WS per-route observability is a separate follow-up.
+* **Labels (2.9-C):** `route` — the WebSocket channel the connection
+  was opened on. See "Per-route deflate ratio (2.9-C)" below for
+  resolution rules and cardinality safety. Pre-2.9-C dashboards that
+  used the unlabeled aggregate keep working: `sum without (route)
+  (rate(...))` recovers the prior process-wide signal.
 * **Sample query:**
   ```promql
   histogram_quantile(0.50,
@@ -86,6 +89,75 @@ compressed_bytes`).
   spent on Zlib is not worth the bandwidth saving — switch
   `websocket.permessage_deflate` to `:off`. Below 1.5× the bucket count drops
   off the bottom, which itself is the signal.
+
+#### Per-route deflate ratio (2.9-C)
+
+Real ActionCable / pubsub apps run multiple channels on the same listener:
+`/cable` (ActionCable broadcasts), `/notifications/:id` (per-user push),
+`/presence`, `/telemetry`. Each channel ships a different payload shape — a
+JSON chat message compresses ~ 20×, a binary telemetry frame may compress
+1.5×. The aggregate histogram buries this per-channel signal.
+
+2.9-C splits the histogram by a `route` label. Resolution per Connection,
+exactly once at construction (not per message — the resolved label is cached
+on the `Connection` so the steady-state observation is allocation-free):
+
+1. **Explicit channel name:** if the Rack app sets
+   `env['hyperion.websocket.route']` before the handshake completes, that
+   string is the `route` label verbatim. Operators name their channels:
+   ```ruby
+   # in your Rack handler, before reading env['hyperion.websocket.handshake']
+   env['hyperion.websocket.route'] = 'chat'    # or 'presence', 'telemetry', …
+   ```
+2. **Auto from PATH_INFO:** otherwise the connection's `PATH_INFO` is
+   templated via `Hyperion::Metrics.default_path_templater`. `/cable` stays
+   as `/cable`; `/notifications/123` becomes `/notifications/:id`. The same
+   templater that bounds `hyperion_request_duration_seconds`'s `path` label
+   bounds this one — operators with high-cardinality dynamic segments stay
+   safe by default.
+3. **Fallback:** connections built without an `env` (specs, library users
+   constructing a `WebSocket::Connection` by hand) land on the literal
+   `route="unrouted"` series so their observations don't disappear silently.
+
+Cardinality is bounded by the templater's LRU (default 1000 entries — same as
+`hyperion_request_duration_seconds`). An app that runs into the LRU cap is
+already on the per-route HTTP histogram and tunes the templater there;
+nothing more to wire here.
+
+* **Per-route p50 query:**
+  ```promql
+  histogram_quantile(0.5,
+    sum by (route, le) (rate(hyperion_websocket_deflate_ratio_bucket[5m]))
+  )
+  ```
+* **Per-route p99:**
+  ```promql
+  histogram_quantile(0.99,
+    sum by (route, le) (rate(hyperion_websocket_deflate_ratio_bucket[5m]))
+  )
+  ```
+* **Operator action:** spot the channel with a p50 < 2× and either turn
+  permessage-deflate off for that route only, or compress at the application
+  layer (e.g. for binary frames that Zlib can't shrink further).
+
+A panel for the existing 2.4-C dashboard
+(`docs/grafana/hyperion-2.4-dashboard.json`) — drop it into the panels array:
+
+```json
+{
+  "id": 9,
+  "title": "Deflate ratio by route (p50)",
+  "type": "timeseries",
+  "datasource": "Prometheus",
+  "gridPos": { "h": 8, "w": 24, "x": 0, "y": 38 },
+  "targets": [
+    {
+      "expr": "histogram_quantile(0.5, sum by (route, le) (rate(hyperion_websocket_deflate_ratio_bucket{job=\"$job\"}[5m])))",
+      "legendFormat": "{{route}}"
+    }
+  ]
+}
+```
 
 ### `hyperion_tls_ktls_active_connections` — gauge
 

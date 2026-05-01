@@ -146,6 +146,32 @@
           "legendFormat": "worker {{worker_id}}"
         }
       ]
+    },
+    {
+      "id": 9,
+      "title": "Deflate ratio by route (p50) — 2.9-C",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (route, le) (rate(hyperion_websocket_deflate_ratio_bucket{job=\"$job\"}[5m])))",
+          "legendFormat": "p50 {{route}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Deflate ratio by route (p99) — 2.9-C",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (route, le) (rate(hyperion_websocket_deflate_ratio_bucket{job=\"$job\"}[5m])))",
+          "legendFormat": "p99 {{route}}"
+        }
+      ]
     }
   ]
 }
