@@ -143,6 +143,33 @@ module Hyperion
     SENDFILE_COALESCE_THRESHOLD = 64 * 1024
 
     def write_sendfile(io, status, headers, body, keep_alive:, dispatch_mode: nil)
+      # 2.6-D — when `:inline_blocking` is engaged, wrap the entire
+      # write path in `Fiber.blocking { ... }` so the calling fiber's
+      # `Fiber.current.blocking?` flag flips to true for the duration
+      # of the response.  Without this wrap, `IO.select` and `io.write`
+      # inside the helpers below silently route through the Async
+      # fiber scheduler under `--async-io` — that was the 2.6-C
+      # engagement gap (resolver set `:inline_blocking`, writer
+      # plumbed it, but every blocking IO call still yielded the
+      # fiber).  With the wrap, the OS thread parks on the kernel
+      # write under the GVL — the whole point of the dispatch mode.
+      #
+      # `Fiber.blocking` is a no-op when no scheduler is current
+      # (default threadpool / inline_h1_no_pool / no-async paths) so
+      # the perf cost is one method-dispatch when this branch is
+      # never the hot path.
+      if dispatch_mode == :inline_blocking
+        return Fiber.blocking do
+          write_sendfile_inner(io, status, headers, body, keep_alive: keep_alive,
+                                                          dispatch_mode: dispatch_mode)
+        end
+      end
+
+      write_sendfile_inner(io, status, headers, body, keep_alive: keep_alive,
+                                                      dispatch_mode: dispatch_mode)
+    end
+
+    def write_sendfile_inner(io, status, headers, body, keep_alive:, dispatch_mode: nil)
       path = body.to_path
       file = File.open(path, 'rb')
       file_size = file.size

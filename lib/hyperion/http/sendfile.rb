@@ -254,6 +254,24 @@ module Hyperion
         def copy_to_socket_blocking(out_io, file_io, offset, len)
           return 0 if len.zero?
 
+          # 2.6-D — defensive `Fiber.blocking` wrap so direct callers
+          # (specs, future code paths) get the no-yield guarantee
+          # even if they didn't already wrap us themselves.  When
+          # the calling fiber is already blocking (the fast path:
+          # `ResponseWriter#write_sendfile` wraps the whole sendfile
+          # path in `Fiber.blocking` for `:inline_blocking`) the
+          # nested wrap is a no-op — `Fiber.blocking` short-circuits
+          # if the current fiber's blocking flag is already set.
+          if ::Fiber.current.blocking?
+            copy_to_socket_blocking_inner(out_io, file_io, offset, len)
+          else
+            ::Fiber.blocking { copy_to_socket_blocking_inner(out_io, file_io, offset, len) }
+          end
+        end
+
+        private
+
+        def copy_to_socket_blocking_inner(out_io, file_io, offset, len)
           kind = fast_path_kind(out_io)
 
           if kind == :native && len <= SMALL_FILE_THRESHOLD &&
@@ -268,8 +286,6 @@ module Hyperion
             userspace_copy_loop(out_io, file_io, offset, len)
           end
         end
-
-        private
 
         def tls_socket?(io)
           defined?(::OpenSSL::SSL::SSLSocket) && io.is_a?(::OpenSSL::SSL::SSLSocket)
@@ -584,6 +600,19 @@ module Hyperion
         # park a worker thread forever.  Tolerate IOs that don't expose
         # `to_io` (StringIO in specs, mock objects) by short-circuiting
         # via `Thread.pass` — same fallback shape as `wait_writable`.
+        #
+        # 2.6-D — ensure the select bypasses the fiber scheduler even
+        # if the caller didn't already wrap us in `Fiber.blocking`.
+        # The 2.6-C path called `IO.select` from a fiber whose
+        # scheduler hook (Async::Reactor#kernel_select) intercepts
+        # the call and yields cooperatively — the OS-thread block
+        # never happened, the fiber kept getting rescheduled, and
+        # the per-chunk yield-resume tax that `:inline_blocking` was
+        # designed to eliminate stayed in place.  Wrapping the
+        # select in `Fiber.blocking { ... }` flips
+        # `Fiber.current.blocking?` to true for the duration; the
+        # scheduler is no longer consulted, and the OS thread
+        # parks on the kernel readiness check.
         def select_writable_blocking(out_io)
           target =
             if out_io.is_a?(::IO)
@@ -596,7 +625,11 @@ module Hyperion
               end
             end
           if target
-            ::IO.select(nil, [target], nil, 5.0)
+            if ::Fiber.current.blocking?
+              ::IO.select(nil, [target], nil, 5.0)
+            else
+              ::Fiber.blocking { ::IO.select(nil, [target], nil, 5.0) }
+            end
           else
             Thread.pass
           end
