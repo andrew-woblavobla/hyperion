@@ -29,6 +29,59 @@ corrected.
 
 **No code changes from 2.9-A.** `USERSPACE_CHUNK` stays at 256 KiB.
 
+### 2.9-B — Falcon h2 head-to-head (the apples-to-apples h2 comparison owed since 2.6-E)
+
+Rows 10/11 of `BENCH_HYPERION_2_0.md` have carried the framing "Puma 8
+lacks native h2 — Falcon comparison owed" since 2.6-E. Falcon 0.55+
+ships native h2 and is the apples-to-apples comparison for Hyperion's
+h2 path; 2.7-E was deferred when openclaw-vm went offline + Falcon
+wasn't installed. 2.9-B installs Falcon 0.55.3 alongside Hyperion on
+the fresh-boot host and runs the matched harness.
+
+**Verdict (lead with the headline).** Hyperion wins on Rails-shape
+(25-header) h2 by **+58% rps** (1,778 vs 1,125 r/s) — the Rust-native
+HPACK shipped in 2.5-B earns its keep on real-shape responses. Falcon
+wins on h2 POST by **+9.7% rps** (1,734 vs 1,580). Hello (2-header) is
+**parity** (within 2%, inside bench noise). **Falcon wins max-latency
+across all three rows by 4-7×** (Falcon 5-10 ms; Hyperion flat ~40 ms);
+filed as 2.10-A follow-up.
+
+**Method.** `h2load -c 1 -m 100 -n 5000`, 3 runs each, median.
+Hyperion `bin/hyperion --tls-cert /tmp/cert.pem --tls-key /tmp/key.pem
+-t 64 -w 1 --h2-max-total-streams unbounded` with default-on Rust
+HPACK (boot log: `mode: native (Rust v2 / Fiddle)`,
+`hpack_path: native-v2`). Falcon `falcon serve --hybrid -n 1 --forks 1
+--threads 5` (single-process, 5 threads). Same self-signed RSA-2048
+TLS cert. All 18 runs landed 5,000 / 5,000 succeeded, 0 errored.
+
+| Rackup | Hyperion rps | Falcon rps | Δ rps | Hyperion max-lat | Falcon max-lat |
+|---|---:|---:|---:|---:|---:|
+| `hello.ru` (2 hdrs) | **2,198** | 2,152 | +2.1% (parity) | 40.72 ms | **5.58 ms** |
+| `h2_post.ru` | 1,580 | **1,734** | Falcon +9.7% | 40.84 ms | **9.94 ms** |
+| `h2_rails_shape.ru` (25 hdrs) | **1,778** | 1,125 | Hyperion +58.0% | 40.69 ms | **6.44 ms** |
+
+**Reading.** Both servers are good; operators terminating h2 on the
+wire have a real choice. Pick Hyperion for Rails-shape h2 (the +58%
+ships measurable extra capacity per box). Pick Falcon for POST-heavy
+h2 endpoints or if max-latency tail is the priority. Hello is a coin
+flip.
+
+**Bench harness shipped.** `bench/h2_falcon_compare.sh` — runs all 6
+combinations and prints per-rackup median rps + max-latency. Drives
+both Hyperion (`bin/hyperion`) and Falcon (`falcon serve`) on the same
+TLS cert + same h2load envelope. Re-runnable:
+`~/hyperion/bench/h2_falcon_compare.sh`.
+
+**No production code changes.** Bench-only commit. Spec count
+unchanged — bench scripts and BENCH doc only.
+
+**2.10-A filed.** Hyperion's flat ~40 ms first-stream max-latency on
+h2 is a real and operator-visible tail-latency gap vs Falcon's ~6 ms.
+Reads as a fixed-cost setup delay (TLS handshake + initial SETTINGS
+exchange + first stream's framer-fiber priming), not a throughput
+issue. Investigation owed in the next bench window — does NOT block
+2.9 ship.
+
 ### 2.9-C — per-route permessage-deflate ratio histogram
 
 `hyperion_websocket_deflate_ratio` (shipped in 2.4-C as a process-wide

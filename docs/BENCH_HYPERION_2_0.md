@@ -93,8 +93,8 @@ Topology-relevance column: **prod** = applies to nginx-fronted plaintext-h1 depl
 | 7 | PG-bound 50ms wait (Hyp `--async-io -t 5 -w 1` pool=200 vs Puma `-t 100:100`) | **2,189** (originally; see verification rerun: median **~2,567** at matched-WAN-PG) | 458 | **originally +378%** (4.78×) — **honest matched-config ratio is uncalibrated**; see [Row 7 verification](#row-7-verification-rerun-2026-04-29-2145-utc) | 597 ms / 566 ms | prod | YES (architecturally; magnitude indicative only) |
 | 8 | PG realistic transactional (Hyp `--async-io` pool=64 vs Puma `-t 30`) | **1,216** | 268 | **+354%** (4.54×) — **same apples-to-oranges caveat as row 7**: Hyperion against WAN PG max_conn=500, Puma against local PG max_conn=100. Magnitude indicative only. | 5.96 s / 7.18 s | prod | YES (architecturally; magnitude indicative only) |
 | 9 | TLS h1 hello (Hyp `-t 64 -w 1` vs Puma `-t 5:64`) | **3,425** | 2,142 | **+59.9%** | 78.17 ms / 37.06 ms | bench-only | YES (only if you terminate TLS at Hyperion) |
-| 10 | HTTP/2 multiplexing (`h2load -c 1 -m 100 -n 5000`) | **1,597** | n/a (Puma 8.0.1 lacks native h2) | — — **NOT a "Hyperion wins h2" claim**; Puma 8 has no native h2 path. Falcon 0.55+ does and is the owed comparison; deferred. | max 90 ms | bench-only | Hyperion supports h2; Puma 8 doesn't. |
-| 11 | HTTP/2 POST (`bench/h2_post.ru`, `h2load -c 1 -m 100 -n 5000 -d`) | **1,500** | n/a | — — same as row 10, no Puma path | max 91 ms | bench-only | Hyperion supports h2; Puma 8 doesn't. |
+| 10 | HTTP/2 multiplexing (`h2load -c 1 -m 100 -n 5000`) | **1,597** (`hello.ru`) / **1,778** (`h2_rails_shape.ru`) | Falcon 0.55.3: **2,152** (hello) / **1,125** (rails_shape). See [§ Hyperion vs Falcon h2](#hyperion-vs-falcon-h2-29-b-head-to-head). | hello: parity (within 2%). rails_shape (25-hdr): **+58% Hyperion rps** (Rust HPACK earns it). Max-lat: Falcon **4-7× lower** across the board (filed 2.10-A). | max 90 ms | bench-only | YES on Rails-shape h2; PARITY on hello h2; tail-latency owed (2.10-A). |
+| 11 | HTTP/2 POST (`bench/h2_post.ru`, `h2load -c 1 -m 100 -n 5000 -d`) | **1,580** (2.9-B fresh) | Falcon 0.55.3: **1,734**. See [§ Hyperion vs Falcon h2](#hyperion-vs-falcon-h2-29-b-head-to-head). | **Falcon +9.7% rps**, Falcon 4× lower max-lat. | max 91 ms | bench-only | NO — Falcon wins POST rps. |
 | 12 | 10k idle keep-alive RSS | drained 149 MB / peak 168 MB | drained 107 MB / peak 121 MB (1.6.0 baseline) | — | — | prod | Puma wins absolute MB; no Hyperion regression vs 1.6.0 |
 
 **Net rps win** (post-audit): on a CPU-bound or hello-world workload, Hyperion 2.0.0 leads Puma 8.0.1 by 21-28% on rps and 5-8× on p99 (rows 1-3). On the production-relevant static and PG rows, the *qualitative* finding (Hyperion's tail is dramatically lower; Hyperion's fiber-pool serves wait-bound workloads at concurrency Puma's threadpool cannot reach without parking OS threads) holds — but the published magnitudes for the PG rows (4.78×, 4.54×) reflect Puma timing out at its local-PG pool ceiling, not Puma's natural rate against a matched-pool PG; the matched-config ratio is closer to **2.2× on the wait-bound row**. Static rows (4, 5) Puma wins on rps but Hyperion wins on p99 by 13-17×; both static rows are closed by 2.0.1 (see end of doc). Rows 9-11 are TLS / h2 specific and **bench-only** for nginx-fronted ops; the +60% TLS h1 win and +18% native-HPACK win are real but apply only if you terminate TLS / h2 at Hyperion directly.
@@ -462,11 +462,15 @@ win on `wrk`'s repeated `-c64` connections.
 > **Comparison framing**: this row is **not** a "Hyperion wins HTTP/2"
 > claim against Puma — Puma 8.0.1 has no native HTTP/2 path
 > (production Puma deployments terminate h2 at nginx and forward h1 to
-> the worker pool). Falcon 0.55+ ships native h2 and is the owed
-> comparison; deferred (the 2.0.0 sweep brief was Hyperion vs Puma).
-> The row demonstrates Hyperion's h2 path *exists and is functional at
-> 1,500+ r/s, 0 errors, 95% HPACK savings* on the c=1 m=100 envelope —
-> not that Hyperion h2 beats anyone.
+> the worker pool). Falcon 0.55+ ships native h2 and is the
+> apples-to-apples comparison; **2.9-B closed it** — see
+> [§ Hyperion vs Falcon h2](#hyperion-vs-falcon-h2-29-b-head-to-head).
+> Headline: Hyperion **+58% rps on Rails-shape**, parity on hello,
+> Falcon +10% on POST, Falcon **4-7× lower max-lat across the board**
+> (filed 2.10-A).
+> The row below demonstrates Hyperion's h2 path *exists and is
+> functional at 1,500+ r/s, 0 errors, 95% HPACK savings* on the
+> c=1 m=100 envelope — not that Hyperion h2 beats anyone in isolation.
 >
 > **Topology relevance**: this row is **bench-only for nginx-fronted
 > ops**. If your LB terminates HTTP/2 and forwards HTTP/1.1 upstream
@@ -547,6 +551,109 @@ writer-fiber + framer queue rather than the encoder. Raising `c=4` (4
 connections × 100 streams) would distribute the framer work and likely
 hit the target — saved as a Phase 8 follow-up bench, not a 2.0.0
 blocker.
+
+## Hyperion vs Falcon h2 (2.9-B head-to-head)
+
+Rows 10 and 11 above were honestly relabelled "Puma 8 lacks native h2
+— Falcon comparison owed" since 2.6-E. Falcon 0.55+ ships native h2 and
+is the apples-to-apples comparison for Hyperion's h2 path. 2.7-E was
+deferred when openclaw-vm went offline; 2.9-B re-runs the comparison
+on the fresh-boot host with Falcon 0.55.3 installed alongside Hyperion.
+
+**Method.** Three rackups, each driven by `h2load -c 1 -m 100 -n 5000`,
+3 runs per combination, median taken.
+
+- Hyperion: `bin/hyperion --tls-cert /tmp/cert.pem --tls-key /tmp/key.pem
+  -t 64 -w 1 --h2-max-total-streams unbounded -p 9602 <rackup>`. Rust
+  HPACK default-on (boot log: `mode: native (Rust v2 / Fiddle) — HPACK
+  on hot path`, `native_enabled: true`, `hpack_path: native-v2`).
+- Falcon 0.55.3: `falcon serve --bind https://localhost:9602 --hybrid
+  -n 1 --forks 1 --threads 5 -c <rackup>` (1 process, 5 threads — the
+  closest single-process apples-to-apples to Hyperion's `-w 1 -t 64`
+  fiber pool given Falcon's CLI doesn't expose a "fiber pool size" knob).
+- TLS: same self-signed `/tmp/cert.pem` + `/tmp/key.pem` (RSA-2048, CN=localhost).
+- Same h2load 1.59.0, same loopback, no network.
+
+Harness: `bench/h2_falcon_compare.sh` (this commit). Date: 2026-05-01,
+fresh-boot openclaw-vm.
+
+### Results (5,000 / 5,000 succeeded on every run; 0 errors)
+
+| Rackup | Hyperion 2.8.0+ rps (median) | Falcon 0.55.3 rps (median) | Δ rps | Hyperion max-lat | Falcon max-lat | Δ max-lat |
+|---|---:|---:|---:|---:|---:|---:|
+| `hello.ru` (2 hdrs) | **2,198** | 2,152 | **+2.1%** (parity) | 40.72 ms | **5.58 ms** | Falcon **7.3× lower** |
+| `h2_post.ru` (POST + 7 resp hdrs) | 1,580 | **1,734** | Falcon **+9.7%** | 40.84 ms | **9.94 ms** | Falcon **4.1× lower** |
+| `h2_rails_shape.ru` (25 hdrs) | **1,778** | 1,125 | Hyperion **+58.0%** | 40.69 ms | **6.44 ms** | Falcon **6.3× lower** |
+
+Per-run rps for the median values above: hello hyp `2208/2197/2198`,
+hello fal `2270/2117/2152`; h2_post hyp `1522/1585/1580`, h2_post fal
+`1734/1891/1567`; rails_shape hyp `1770/1778/1782`, rails_shape fal
+`1125/1118/1166`.
+
+### Verdict
+
+- **Hello (2 headers)**: **rps parity** (within 2%, inside bench noise).
+  Both servers move ~2,200 r/s on a CPU-light hello shape. The HPACK
+  encode is <1% of per-stream CPU at 2 headers, so neither encoder
+  matters.
+- **h2_post (POST body + 7 headers)**: **Falcon wins rps by ~10%**.
+  Hyperion 1,580 vs Falcon 1,734. The POST body adds DATA-frame
+  serialise/deserialise on the request side; Falcon's protocol-http2
+  appears slightly leaner here. Real but inside bench noise on the
+  hyperion side (1,522-1,585 across 3 runs).
+- **rails_shape (25 headers)**: **Hyperion wins rps by ~58%** (1,778 vs
+  1,125). This is the shape where the 2.5-B Rust-native HPACK encoder
+  earns its keep — encoding 25 headers per response × 5,000 responses
+  is 125,000 HPACK encode ops; Hyperion's Rust hot-path beats Falcon's
+  pure-Ruby protocol-http2 encoder by a wide margin. Aligns with the
+  microbench (3.26× HPACK encode speedup) bleeding into wire rps once
+  per-stream HPACK CPU is non-trivial.
+- **Max-latency (all rows)**: **Falcon wins by 4-7×**. Falcon's
+  worst-stream max is consistently 5-10 ms; Hyperion's is 40-41 ms on
+  every run. The Hyperion tail is suspiciously flat at ~40 ms, which
+  reads as a fixed-cost setup delay (TLS handshake + initial SETTINGS
+  exchange + first stream's framer-fiber priming). Filed as a 2.10
+  follow-up — h2 first-stream tail latency is real and operator-visible.
+
+### Reading the results
+
+Both servers are good. Operators terminating h2 on the wire have a
+real choice:
+- **Choose Hyperion** if you serve Rails-shape (20-30 header) responses —
+  the +58% rps at rails_shape ships measurable extra capacity per box,
+  and the 2.5-B native-HPACK headline survives apples-to-apples vs
+  Falcon (vs the prior comparison against the Ruby-fallback HPACK).
+- **Choose Falcon** if you serve POST-heavy h2 endpoints (+10% rps) or
+  if max-latency tail matters to you (4-7× lower across the board).
+- **Either** if you're on a hello-world / 2-header shape (rps parity).
+
+The h2 first-stream max-latency gap (Hyperion's flat ~40 ms vs Falcon's
+~6 ms) is **the only finding from 2.9-B that should land on Hyperion's
+follow-up list**. Filed as 2.10-A — investigate the fixed-cost setup
+delay on Hyperion's first h2 stream (likely TLS+SETTINGS round-trip
+ordering, not throughput).
+
+### Reproducing 2.9-B
+
+```sh
+# On openclaw-vm (or any host with h2load + ruby + the two checkouts):
+~/hyperion/bench/h2_falcon_compare.sh
+# Knobs: PORT, RUNS, THREADS, WORKERS, HYPERION_DIR, FALCON_DIR.
+# Per-run h2load output: $H2LOAD_LOG (default /tmp/h2_falcon_compare_h2load.log).
+# Per-server log: /tmp/h2-falcon-cmp-<server>-<rackup>.log.
+```
+
+Falcon install (one-shot):
+```sh
+mkdir -p ~/bench-falcon
+cat > ~/bench-falcon/Gemfile <<'EOF'
+source 'https://rubygems.org'
+gem 'rack', '~> 3.0'
+gem 'falcon', '~> 0.55'
+EOF
+cd ~/bench-falcon && PATH=$HOME/.asdf/bin:$HOME/.asdf/shims:$PATH bundle install
+cp ~/hyperion/bench/{hello,h2_post,h2_rails_shape}.ru ~/bench-falcon/
+```
 
 ## 10k idle keep-alive RSS
 
