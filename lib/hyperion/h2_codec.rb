@@ -444,9 +444,24 @@ module Hyperion
     def self.candidate_paths
       gem_lib = File.expand_path('../hyperion_h2_codec', __dir__)
       ext_target = File.expand_path('../../ext/hyperion_h2_codec/target/release', __dir__)
-      %w[libhyperion_h2_codec.dylib libhyperion_h2_codec.so].flat_map do |name|
-        [File.join(gem_lib, name), File.join(ext_target, name)]
-      end
+      # 2.11-B fix: order suffixes by host OS. Pre-2.11-B this was a
+      # static `[dylib, so]` order, which broke on Linux hosts that
+      # had a stale macOS `.dylib` on the path (e.g. a developer rsync
+      # leaking the `target/release` artifact across platforms). Fiddle
+      # would try the `.dylib` first, choke on the Mach-O binary with
+      # `ArgumentError: invalid byte sequence in UTF-8` from libffi,
+      # and the rescue in `load!` would silently fall back to the Ruby
+      # HPACK path with no warning visible to bench harnesses.
+      #
+      # Ordering by `host_os` makes Linux pick `.so` first and ignore
+      # any orphan `.dylib`; macOS keeps the `.dylib`-first behavior
+      # for back-compat with existing dev environments.
+      suffixes = if /darwin|mac/i.match?(RbConfig::CONFIG['host_os'])
+                   %w[libhyperion_h2_codec.dylib libhyperion_h2_codec.so]
+                 else
+                   %w[libhyperion_h2_codec.so libhyperion_h2_codec.dylib]
+                 end
+      suffixes.flat_map { |name| [File.join(gem_lib, name), File.join(ext_target, name)] }
     end
 
     # FFI wrappers — kept thin so callers don't see Fiddle::Pointer

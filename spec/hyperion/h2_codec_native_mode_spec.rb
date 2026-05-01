@@ -83,13 +83,52 @@ RSpec.describe 'Http2Handler — HYPERION_H2_NATIVE_HPACK native-mode axis (2.11
     end
   end
 
+  describe 'H2Codec.candidate_paths host-os ordering (2.11-B portability fix)' do
+    # Regression: pre-2.11-B `candidate_paths` returned `[dylib, so]`
+    # in a fixed order. On a Linux bench host that had a stale macOS
+    # `.dylib` sitting in `target/release/` (typical of rsync-based
+    # cross-platform dev workflows), Fiddle.dlopen would pick up the
+    # Mach-O binary first and raise
+    # `ArgumentError: invalid byte sequence in UTF-8` from libffi.
+    # The `load!` rescue would silently fall back to the pure-Ruby
+    # HPACK path with no operator-visible signal beyond a one-line
+    # warning that bench harnesses don't grep for. The 2.11-B bench
+    # rig hit exactly this on the openclaw-vm bench host.
+    it 'orders .so before .dylib on Linux hosts' do
+      stub_const('RbConfig::CONFIG', RbConfig::CONFIG.merge('host_os' => 'linux-gnu'))
+      paths = Hyperion::H2Codec.candidate_paths
+      first_so    = paths.index { |p| p.end_with?('.so') }
+      first_dylib = paths.index { |p| p.end_with?('.dylib') }
+      expect(first_so).not_to be_nil
+      expect(first_so).to be < first_dylib
+    end
+
+    it 'orders .dylib before .so on macOS hosts' do
+      stub_const('RbConfig::CONFIG', RbConfig::CONFIG.merge('host_os' => 'darwin23'))
+      paths = Hyperion::H2Codec.candidate_paths
+      first_so    = paths.index { |p| p.end_with?('.so') }
+      first_dylib = paths.index { |p| p.end_with?('.dylib') }
+      expect(first_dylib).not_to be_nil
+      expect(first_dylib).to be < first_so
+    end
+
+    it 'returns the same total count of candidates on every host (no platform-conditional drop)' do
+      stub_const('RbConfig::CONFIG', RbConfig::CONFIG.merge('host_os' => 'darwin23'))
+      mac_count = Hyperion::H2Codec.candidate_paths.length
+      stub_const('RbConfig::CONFIG', RbConfig::CONFIG.merge('host_os' => 'linux-gnu'))
+      linux_count = Hyperion::H2Codec.candidate_paths.length
+      expect(mac_count).to eq(linux_count)
+      expect(mac_count).to be >= 4 # both gem_lib and ext_target × both suffixes
+    end
+  end
+
   context 'when H2Codec is available (real cdylib loaded)', if: Hyperion::H2Codec.available? do
     after do
       # Restore any test-time override on the cglue gate.
       Hyperion::H2Codec.instance_variable_set(:@cglue_disabled, false)
     end
 
-    describe 'unset env var (default since 2.5-B)' do
+    describe 'unset env var (default since 2.5-B, cglue confirmed default since 2.11-B)' do
       it 'reports hpack_path=native-v3 when cglue is available, native-v2 otherwise' do
         log = boot_handler_and_capture_log(nil)
         entry = parse_codec_log(log)
@@ -97,6 +136,13 @@ RSpec.describe 'Http2Handler — HYPERION_H2_NATIVE_HPACK native-mode axis (2.11
         expect(entry['hpack_path']).to eq(expected)
         expect(entry['native_enabled']).to be(true)
         expect(entry['native_mode']).to eq('auto')
+      end
+
+      it 'mode string advertises cglue as the default since 2.11-B (confirmed by bench)',
+         if: Hyperion::H2Codec.cglue_available? do
+        log = boot_handler_and_capture_log(nil)
+        entry = parse_codec_log(log)
+        expect(entry['mode']).to include('default since 2.11-B')
       end
     end
 

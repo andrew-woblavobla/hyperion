@@ -692,7 +692,12 @@ module Hyperion
       elsif cglue_active && @h2_native_mode == :cglue
         'native (Rust v3 / CGlue, forced) — HPACK on hot path, no Fiddle per call'
       elsif cglue_active
-        'native (Rust v3 / CGlue) — HPACK on hot path, no Fiddle per call'
+        # 2.11-B confirmed cglue as the firm default — the bench-measured
+        # delta vs the v2 (Fiddle) path is +33-43% on Rails-shape h2
+        # responses, which is the actual win the 2.5-B "+18% native vs
+        # ruby" headline was capturing (v2 alone is +1-5%, basically
+        # noise vs the ruby fallback at this header count).
+        'native (Rust v3 / CGlue, default since 2.11-B) — HPACK on hot path, no Fiddle per call'
       elsif @h2_native_mode == :v2
         'native (Rust v2 / Fiddle, forced) — HPACK on hot path, Fiddle marshalling per call'
       elsif cglue_requested_unavailable

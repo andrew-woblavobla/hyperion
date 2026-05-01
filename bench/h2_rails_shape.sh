@@ -113,25 +113,41 @@ start_server() {
   done
 
   # 2.11-B — verify the boot log selected the variant we asked for. The
-  # h2 codec selection is logged once per process; if the operator
-  # accidentally booted with a stale env var (e.g. forgot to `unset`)
-  # the bench would silently compare against the wrong path. The log
-  # line is JSON; we grep for `hpack_path` to surface the actual
-  # selection alongside the requested label.
-  selected=$(grep -m1 'h2 codec selected' /tmp/hyperion-2.11-b.log 2>/dev/null \
-              | sed -n 's/.*"hpack_path":"\([^"]*\)".*/\1/p')
+  # h2 codec selection is logged the first time `Http2Handler.new` is
+  # invoked, which happens lazily on the first connection (not at
+  # `nc -z` socket-bind time). We hit the server with a quick curl
+  # probe so the log line is guaranteed to be present, then grep
+  # `hpack_path` to surface the actual selection alongside the
+  # requested label. If the operator accidentally booted with a stale
+  # env var (e.g. forgot to `unset`) the mismatch is visible here
+  # before the bench burns its h2load run.
+  curl -sk --http2 "https://$HOST:$PORT/" -o /dev/null --max-time 5 || true
+  selected=""
+  for _ in 1 2 3 4 5; do
+    selected=$(grep -m1 'h2 codec selected' /tmp/hyperion-2.11-b.log 2>/dev/null \
+                | sed -n 's/.*"hpack_path":"\([^"]*\)".*/\1/p')
+    [ -n "$selected" ] && break
+    sleep 0.2
+  done
   echo "[2.11-B]   boot-log hpack_path=${selected:-<not-logged>}"
 }
 
 # 2.11-B — `wrk` and `h2load` both follow the same pattern: parse the
 # rps line out of the formatted output. h2load's "finished in N s, RPS
 # req/s" — extract the RPS column.
+#
+# IMPORTANT: only the rps number goes to stdout (the caller does
+# `rps=$(run_h2load ...)`); the chatty status + h2load's full output
+# go to stderr so they don't get captured into the array. This was
+# the pre-2.11-B bug where the median3 inputs looked like
+# "[2.11-B] h2load run ..." — bash's $(...) captures every stdout
+# byte, not just the last line.
 run_h2load() {
   local label=$1
-  echo "[2.11-B] h2load run -- variant=$label  c=$C m=$M n=$N"
+  echo "[2.11-B] h2load run -- variant=$label  c=$C m=$M n=$N" >&2
   raw=$(h2load -c "$C" -m "$M" -n "$N" "https://$HOST:$PORT/" 2>&1)
-  echo "$raw"
-  echo "$raw" | awk '/^finished in/ {for (i=1;i<=NF;i++) if ($i ~ /req\/s/) {print $(i-1); exit}}'
+  printf '%s\n' "$raw" >&2
+  printf '%s\n' "$raw" | awk '/^finished in/ {for (i=1;i<=NF;i++) if ($i ~ /req\/s/) {print $(i-1); exit}}'
 }
 
 median3() {
