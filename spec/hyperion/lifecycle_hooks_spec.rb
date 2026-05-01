@@ -95,8 +95,27 @@ RSpec.describe 'Lifecycle hook order across worker models' do
       response = Net::HTTP.get(URI("http://127.0.0.1:#{port}/"))
       expect(response).to eq('ok')
 
+      # Wait for BOTH workers to fully boot — i.e. each has run its
+      # on_worker_boot hook AND installed its SIGTERM trap (which it does
+      # immediately after the hook in Worker#run). Without this, on slow
+      # CI runners (notably macOS GitHub runners) we can race: master
+      # binds the port → wait_for_port returns → one worker is still in
+      # the boot→trap window when we send TERM → master forwards TERM
+      # → that worker dies via default action with no shutdown hook fire
+      # → spec fails with one shutdown line instead of two. We probe for
+      # 2 boot lines as the readiness signal; the port-listen window is
+      # not enough since on :share the master binds before any worker is
+      # ready.
+      wait_for_log_lines(record_path, /^on_worker_boot:/, 2, 30)
+
       Process.kill('TERM', pid)
-      Timeout.timeout(15) { Process.waitpid(pid) }
+      Timeout.timeout(30) { Process.waitpid(pid) }
+
+      # Master reaps children before exiting, so by the time waitpid(pid)
+      # returns the children have written their shutdown lines. Give the
+      # filesystem a brief poll though — append+fsync ordering across
+      # forks isn't guaranteed instantaneous on macOS APFS.
+      wait_for_log_lines(record_path, /^on_worker_shutdown:/, 2, 10)
 
       lines = File.readlines(record_path).map(&:chomp).reject(&:empty?)
 
@@ -211,8 +230,15 @@ RSpec.describe 'Lifecycle hook order across worker models' do
 
     wait_for_port(port, 5)
 
+    # Same readiness rationale as the cluster spec — wait for the
+    # in-process "worker" to log its boot line before TERMing, so we
+    # don't race the boot→signal-trap window on slow CI runners.
+    wait_for_log_lines(record_path, /^on_worker_boot:/, 1, 30)
+
     Process.kill('TERM', pid)
-    Timeout.timeout(10) { Process.waitpid(pid) }
+    Timeout.timeout(15) { Process.waitpid(pid) }
+
+    wait_for_log_lines(record_path, /^on_worker_shutdown:/, 1, 10)
 
     lines = File.readlines(record_path).map(&:chomp).reject(&:empty?)
 
@@ -259,6 +285,28 @@ RSpec.describe 'Lifecycle hook order across worker models' do
       raise "port #{port} not bound within #{timeout}s" if Time.now > deadline
 
       sleep 0.05
+    end
+  end
+
+  # Poll a recorder log file until at least `expected_count` lines match
+  # `pattern`, or `timeout` seconds elapse. Returns as soon as the count
+  # is reached — does NOT wait the full timeout when the events arrive
+  # quickly. Used to robustly synchronize on lifecycle-hook fire events
+  # without sleeping a fixed budget; macOS GitHub runners are 2-3× slower
+  # than typical dev hardware on fork/exec, so a generous ceiling is fine.
+  def wait_for_log_lines(path, pattern, expected_count, timeout)
+    deadline = Time.now + timeout
+    loop do
+      lines = File.readlines(path).map(&:chomp).reject(&:empty?)
+      matching = lines.grep(pattern)
+      return matching if matching.size >= expected_count
+
+      if Time.now > deadline
+        raise "expected #{expected_count} lines matching #{pattern.inspect} " \
+              "within #{timeout}s; got #{matching.size}: #{lines.inspect}"
+      end
+
+      sleep 0.1
     end
   end
 end

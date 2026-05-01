@@ -1,5 +1,47 @@
 # Changelog
 
+## [Unreleased] - 2.7.0
+
+### 2.7-B — `lifecycle_hooks_spec.rb` `:share` macOS CI flake fix
+
+Spec-only change. `spec/hyperion/lifecycle_hooks_spec.rb`'s
+`:share`-mode example flaked intermittently on macOS GitHub Actions
+runners (visibly: 2.5.0 release CI failed once + recovered, 2.6.0 prep
+CI 3ca92f8 failed outright) — the assertion was always
+`expected two on_worker_shutdown on :share, got [..., on_worker_shutdown:idx=1:pid=...]`
+i.e. only one of the two workers wrote a shutdown line.
+
+**Root cause (real, not just slow CI).** On `:share`, the master binds
+the listening socket BEFORE forking workers, so the spec's
+`wait_for_port` readiness probe returns as soon as the master binds —
+possibly before either worker has reached `Signal.trap('TERM')`.
+`Worker#run` runs the boot hook, then builds/adopts the listener, then
+installs the TERM trap, then `server.start`. If the test sends TERM
+during the post-boot/pre-trap window of a worker, the master forwards
+TERM, the worker dies via SIGTERM's default action, and the
+`on_worker_shutdown` hook never fires. The window is microseconds on
+typical Linux dev hardware (where the bench / Linux CI run). On macOS
+GitHub runners (slower fork+exec, slower scheduling), the window opens
+wide enough to hit reproducibly. **No production user is at risk** —
+nobody runs `:share` worker mode on macOS, and even on Linux the window
+is closed before any operator could TERM the master interactively.
+
+**Fix.** Tightened the readiness probe (Option B from the brief). New
+`wait_for_log_lines(path, pattern, expected_count, timeout)` helper
+polls the recorder log every 100 ms until N matching lines appear, with
+a generous ceiling (30 s pre-TERM, 10 s post-`waitpid`). The pre-TERM
+poll waits for two `on_worker_boot` lines — the boot hook fires
+immediately before the TERM trap installs, so once the line is on disk
+the trap is installed within microseconds. The post-`waitpid` poll
+covers APFS append+fsync ordering on macOS. No production code touched.
+
+**Verification.**
+- Local macOS (Apple silicon, Ruby 3.3.6): spec passed 5 consecutive
+  runs (`for i in 1..5`); typical run time ~1.3 s. Full suite green:
+  951 examples, 0 failures, 11 pending (unchanged).
+- CI: pending — push triggers GitHub Actions; the flake doesn't fire
+  every run, so 3 consecutive green runs are needed to call it fixed.
+
 ## [2.6.0] - 2026-05-01
 
 ### Headline
