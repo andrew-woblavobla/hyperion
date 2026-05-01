@@ -442,6 +442,327 @@ static VALUE cparser_parse(VALUE self, VALUE buffer) {
     return rb_ary_new_from_args(2, request, ULONG2NUM((unsigned long)consumed));
 }
 
+/* 2.13-B — pre-baked status-line table for the most common HTTP status codes.
+ * The full "HTTP/1.1 NNN <reason>\r\n" line is a constant for any (status,
+ * reason) pair the server emits on the hot path, so we sidestep the
+ * per-request `snprintf("HTTP/1.1 %d ", status)` + reason-cat by switching
+ * on `status` and emitting a single literal-bytes cat. A non-cached status
+ * (or a non-default reason — operator override) still falls through to the
+ * generic snprintf path below. The table covers every code in
+ * `Hyperion::ResponseWriter::REASONS`. */
+struct status_line {
+    int status;
+    const char *bytes;
+    long len; /* strlen of bytes (filled at extension load) */
+};
+
+#define STATUS_LINE(code, reason) { (code), "HTTP/1.1 " #code " " reason "\r\n", 0 }
+static struct status_line k_status_lines[] = {
+    STATUS_LINE(200, "OK"),
+    STATUS_LINE(201, "Created"),
+    STATUS_LINE(204, "No Content"),
+    STATUS_LINE(301, "Moved Permanently"),
+    STATUS_LINE(302, "Found"),
+    STATUS_LINE(304, "Not Modified"),
+    STATUS_LINE(400, "Bad Request"),
+    STATUS_LINE(401, "Unauthorized"),
+    STATUS_LINE(403, "Forbidden"),
+    STATUS_LINE(404, "Not Found"),
+    STATUS_LINE(405, "Method Not Allowed"),
+    STATUS_LINE(408, "Request Timeout"),
+    STATUS_LINE(409, "Conflict"),
+    STATUS_LINE(410, "Gone"),
+    STATUS_LINE(413, "Payload Too Large"),
+    STATUS_LINE(414, "URI Too Long"),
+    STATUS_LINE(422, "Unprocessable Entity"),
+    STATUS_LINE(429, "Too Many Requests"),
+    STATUS_LINE(500, "Internal Server Error"),
+    STATUS_LINE(501, "Not Implemented"),
+    STATUS_LINE(502, "Bad Gateway"),
+    STATUS_LINE(503, "Service Unavailable"),
+    STATUS_LINE(504, "Gateway Timeout"),
+    { 0, NULL, 0 }
+};
+#undef STATUS_LINE
+
+/* Lookup a pre-baked status line by (status, reason). Returns NULL if
+ * the status isn't in the table OR the operator passed a custom reason
+ * phrase that doesn't match the table's default — in either case the
+ * caller falls through to the generic snprintf path. The reason match
+ * uses memcmp (NOT case-insensitive) — apps overriding to a different
+ * casing get the safe fallback rather than a wire-string mismatch. */
+static const struct status_line *lookup_status_line(int status,
+                                                    const char *reason_ptr,
+                                                    long reason_len) {
+    for (struct status_line *e = k_status_lines; e->bytes != NULL; e++) {
+        if (e->status != status) continue;
+        /* Format of e->bytes: "HTTP/1.1 NNN <reason>\r\n". The reason
+         * starts at offset 13 (9 bytes "HTTP/1.1 " + 3 bytes status + 1
+         * byte space) and has length e->len - 13 - 2 (strip trailing CRLF). */
+        long table_reason_len = e->len - 13 - 2;
+        if (table_reason_len != reason_len) return NULL;
+        if (memcmp(e->bytes + 13, reason_ptr, reason_len) != 0) return NULL;
+        return e;
+    }
+    return NULL;
+}
+
+/* 2.13-B — hand-rolled positive-integer-to-decimal-ASCII writer. snprintf is
+ * 1 % of CPU on the CPU-JSON workload (per perf -F 199 -g sampling);
+ * `body_size` is always non-negative (bytesize of a buffered body) so the
+ * sign branch + locale logic in vfprintf are pure overhead. Writes the
+ * digits backwards into a 24-byte scratch then returns the offset+length
+ * pair so the caller can rb_str_cat without reordering. */
+static int itoa_positive_decimal(long n, char *out, int out_size) {
+    /* out_size is the buffer; we fill from the right edge. */
+    int i = out_size;
+    if (n == 0) {
+        out[--i] = '0';
+        return i;
+    }
+    while (n > 0 && i > 0) {
+        out[--i] = (char)('0' + (n % 10));
+        n /= 10;
+    }
+    return i;
+}
+
+/* 2.13-B — per-key downcase result cache. Operators overwhelmingly call
+ * `build_response_head` with a fixed set of frozen-literal header keys
+ * (`'content-type'`, `'cache-control'`, etc.) — same String VALUE every
+ * request. Re-running `String#downcase` per call allocates a fresh
+ * lowercase String + crosses the FFI boundary; for `n_headers=4` that's
+ * 4 allocs + 4 method dispatches per response. The cache keys on the
+ * input String's object_id and stores the lowercase VALUE, the
+ * pre-built `lc + ": "` prefix line, and the cached length. Cap at 64
+ * entries so a misbehaving app emitting a unique `x-trace-<uuid>` key
+ * per request can't grow the cache without bound — it just falls
+ * through to the slow path on overflow.
+ *
+ * Pinning: each cached VALUE is anchored in a Ruby Array (`rb_aHeaderKeyCache`)
+ * registered as a global. The cache itself is an `st_table` keyed by
+ * VALUE bits (the input frozen String's id, since it's frozen and safe
+ * to reference forever). */
+#define HEADER_KEY_CACHE_MAX 64
+typedef struct {
+    VALUE key;       /* original frozen input String */
+    VALUE lc;        /* lowercase form (may be == key when already lowercase) */
+    VALUE prefix;    /* "<lc>: " — pre-built byte buffer ready to cat */
+    long  lc_len;
+} header_key_cache_entry_t;
+
+static st_table *g_header_key_cache = NULL;
+static VALUE rb_aHeaderKeyAnchor;     /* keeps cached VALUEs alive */
+
+/* 2.13-B — full header-line cache. When BOTH the key AND the value of a
+ * header are frozen-literal Strings (the overwhelmingly common case for
+ * fixed Rack apps: `'cache-control' => 'no-store'`,
+ * `'content-type' => 'application/json'`), the entire wire line
+ * `"<lc-key>: <value>\r\n"` is identical every request. Cache it keyed
+ * on `(key.object_id, value.object_id)`; on hit the entire emit is one
+ * `rb_str_cat`. Same 64-entry cap + same anchor-Array pinning as the
+ * key cache. The `value` slot pins the original value VALUE so the
+ * frozen literal isn't reclaimed. */
+#define HEADER_LINE_CACHE_MAX 256
+typedef struct {
+    /* Two-word key: input key VALUE bits + value VALUE bits. */
+    VALUE key_v;
+    VALUE val_v;
+    VALUE line;     /* "<lc-key>: <value>\r\n" buffer */
+    long  line_len;
+    int   is_date;  /* 1 if lc-key == "date" — caller skips the date tail */
+} header_line_cache_entry_t;
+
+static st_table *g_header_line_cache = NULL;
+static VALUE rb_aHeaderLineAnchor;
+
+static st_index_t header_line_cache_hash(st_data_t a) {
+    /* Combine the two VALUEs via a simple xor+mul mix. The VALUEs are
+     * pointers to frozen Strings — the low 3 bits are alignment so we
+     * shift before mixing to avoid trivial collisions. */
+    const header_line_cache_entry_t *e = (const header_line_cache_entry_t *)a;
+    st_data_t x = ((st_data_t)e->key_v >> 3) * 0x9E3779B97F4A7C15ULL;
+    st_data_t y = ((st_data_t)e->val_v >> 3) * 0xBF58476D1CE4E5B9ULL;
+    return (st_index_t)(x ^ y);
+}
+static int header_line_cache_cmp(st_data_t a, st_data_t b) {
+    const header_line_cache_entry_t *ea = (const header_line_cache_entry_t *)a;
+    const header_line_cache_entry_t *eb = (const header_line_cache_entry_t *)b;
+    /* st returns 0 on match (same as memcmp). */
+    return !(ea->key_v == eb->key_v && ea->val_v == eb->val_v);
+}
+static const struct st_hash_type header_line_cache_type = {
+    header_line_cache_cmp,
+    header_line_cache_hash
+};
+
+/* Reuse the same cap-and-anchor strategy from the key cache. Look up by
+ * a stack-allocated probe entry; on miss + room, allocate a new entry
+ * and st_insert. */
+static const header_line_cache_entry_t *header_line_cache_lookup(VALUE key, VALUE val) {
+    if (g_header_line_cache == NULL) return NULL;
+    header_line_cache_entry_t probe = { key, val, Qnil, 0, 0 };
+    st_data_t found_data;
+    if (st_lookup(g_header_line_cache, (st_data_t)&probe, &found_data)) {
+        return (const header_line_cache_entry_t *)found_data;
+    }
+    return NULL;
+}
+
+/* Lookup-or-build for the per-key downcase cache. Fast path: st hit, return
+ * the cached entry. Slow path: cap-bound check, freeze + lowercase the key,
+ * build the "<lc>: " prefix String, anchor both in rb_aHeaderKeyAnchor,
+ * st_insert. The anchor Array keeps the VALUEs alive across GC.
+ *
+ * Returns NULL when the cache is full AND the input key isn't already
+ * lowercase + already short — caller falls through to the per-call
+ * downcase path. */
+static const header_key_cache_entry_t *header_key_cache_lookup(VALUE key_v) {
+    if (g_header_key_cache != NULL) {
+        st_data_t found_data;
+        if (st_lookup(g_header_key_cache, (st_data_t)key_v, &found_data)) {
+            return (const header_key_cache_entry_t *)found_data;
+        }
+        if (g_header_key_cache->num_entries >= HEADER_KEY_CACHE_MAX) {
+            return NULL; /* don't grow past cap */
+        }
+    } else {
+        g_header_key_cache = st_init_numtable();
+    }
+
+    /* Build the entry. Coerce to String, downcase, freeze, build prefix. */
+    VALUE k_s = rb_obj_as_string(key_v);
+    VALUE k_lower = rb_funcall(k_s, id_downcase, 0);
+    if (!OBJ_FROZEN(k_lower)) k_lower = rb_obj_freeze(k_lower);
+
+    long lc_len = RSTRING_LEN(k_lower);
+    VALUE prefix = rb_str_buf_new(lc_len + 2);
+    rb_str_cat(prefix, RSTRING_PTR(k_lower), lc_len);
+    rb_str_cat(prefix, ": ", 2);
+    rb_obj_freeze(prefix);
+
+    header_key_cache_entry_t *e = ALLOC(header_key_cache_entry_t);
+    e->key    = key_v;
+    e->lc     = k_lower;
+    e->prefix = prefix;
+    e->lc_len = lc_len;
+
+    /* Pin the VALUEs (key isn't ours to extend lifetime of, but lc/prefix
+     * are; rooting all three in the anchor Array is simplest + safest). */
+    rb_ary_push(rb_aHeaderKeyAnchor, key_v);
+    rb_ary_push(rb_aHeaderKeyAnchor, k_lower);
+    rb_ary_push(rb_aHeaderKeyAnchor, prefix);
+
+    st_insert(g_header_key_cache, (st_data_t)key_v, (st_data_t)e);
+    return e;
+}
+
+/* foreach state for the response-head builder. Threads the response buffer
+ * + framing flags through `rb_hash_foreach`. Errors propagate via
+ * `rb_raise` (longjmp-safe; the foreach unwinds and the buffer's RBasic
+ * pinning lets GC reclaim it). */
+typedef struct {
+    VALUE buf;
+    int has_date;
+} build_head_state_t;
+
+static int build_head_each(VALUE k, VALUE v, VALUE arg) {
+    build_head_state_t *st = (build_head_state_t *)arg;
+
+    /* Full-line cache fast path: BOTH key AND value are frozen-literal
+     * Strings AND the (key, value) pair is already cached. ONE rb_str_cat
+     * consumes the entire prebuilt "<lc-key>: <value>\r\n" line. */
+    if (TYPE(k) == T_STRING && TYPE(v) == T_STRING &&
+        OBJ_FROZEN_RAW(k) && OBJ_FROZEN_RAW(v)) {
+        const header_line_cache_entry_t *line_e = header_line_cache_lookup(k, v);
+        if (line_e != NULL) {
+            rb_str_cat(st->buf, RSTRING_PTR(line_e->line), line_e->line_len);
+            if (line_e->is_date) st->has_date = 1;
+            return ST_CONTINUE;
+        }
+    }
+
+    /* Cached prefix path: lowercase form + "<lc>: " bytes already built. */
+    const header_key_cache_entry_t *e = header_key_cache_lookup(k);
+    VALUE lc;
+    const char *lc_ptr;
+    long lc_len;
+    VALUE prefix; /* always the cached "<lc>: " when e != NULL */
+    if (e != NULL) {
+        lc       = e->lc;
+        lc_ptr   = RSTRING_PTR(lc);
+        lc_len   = e->lc_len;
+        prefix   = e->prefix;
+    } else {
+        /* Cap exceeded: fall through to the per-call downcase. Still
+         * cheaper than the legacy path because we skip the keys-Array
+         * iteration overhead. */
+        VALUE k_s = rb_obj_as_string(k);
+        lc        = rb_funcall(k_s, id_downcase, 0);
+        lc_ptr    = RSTRING_PTR(lc);
+        lc_len    = RSTRING_LEN(lc);
+        prefix    = Qnil;
+    }
+
+    VALUE v_s = rb_obj_as_string(v);
+    const char *v_ptr = RSTRING_PTR(v_s);
+    long v_len        = RSTRING_LEN(v_s);
+
+    /* CRLF injection guard on value. */
+    for (long j = 0; j < v_len; j++) {
+        if (v_ptr[j] == '\r' || v_ptr[j] == '\n') {
+            rb_raise(rb_eArgError, "header %s contains CR/LF",
+                     RSTRING_PTR(rb_inspect(lc)));
+        }
+    }
+
+    /* Drop user-supplied content-length / connection — we always set
+     * these unconditionally below. */
+    if (lc_len == 14 && memcmp(lc_ptr, "content-length", 14) == 0) return ST_CONTINUE;
+    if (lc_len == 10 && memcmp(lc_ptr, "connection", 10) == 0)     return ST_CONTINUE;
+
+    if (lc_len == 4 && memcmp(lc_ptr, "date", 4) == 0) st->has_date = 1;
+
+    if (prefix != Qnil) {
+        rb_str_cat(st->buf, RSTRING_PTR(prefix), lc_len + 2);
+    } else {
+        rb_str_cat(st->buf, lc_ptr, lc_len);
+        rb_str_cat(st->buf, ": ", 2);
+    }
+    rb_str_cat(st->buf, v_ptr, v_len);
+    rb_str_cat(st->buf, "\r\n", 2);
+
+    /* Populate the line cache for next time when both sides are frozen
+     * literals and we have room. */
+    if (g_header_line_cache != NULL &&
+        TYPE(k) == T_STRING && TYPE(v) == T_STRING &&
+        OBJ_FROZEN_RAW(k) && OBJ_FROZEN_RAW(v) &&
+        g_header_line_cache->num_entries < HEADER_LINE_CACHE_MAX) {
+        long line_len = lc_len + 2 + v_len + 2;
+        VALUE line = rb_str_buf_new(line_len);
+        rb_str_cat(line, lc_ptr, lc_len);
+        rb_str_cat(line, ": ", 2);
+        rb_str_cat(line, v_ptr, v_len);
+        rb_str_cat(line, "\r\n", 2);
+        rb_obj_freeze(line);
+
+        header_line_cache_entry_t *ne = ALLOC(header_line_cache_entry_t);
+        ne->key_v    = k;
+        ne->val_v    = v;
+        ne->line     = line;
+        ne->line_len = line_len;
+        ne->is_date  = (lc_len == 4 && memcmp(lc_ptr, "date", 4) == 0) ? 1 : 0;
+
+        rb_ary_push(rb_aHeaderLineAnchor, k);
+        rb_ary_push(rb_aHeaderLineAnchor, v);
+        rb_ary_push(rb_aHeaderLineAnchor, line);
+
+        st_insert(g_header_line_cache, (st_data_t)ne, (st_data_t)ne);
+    }
+
+    return ST_CONTINUE;
+}
+
 /* Hyperion::CParser.build_response_head(status, reason, headers, body_size,
  *                                        keep_alive, date_str) -> String
  *
@@ -459,6 +780,24 @@ static VALUE cparser_parse(VALUE self, VALUE buffer) {
  * Header values containing CR/LF raise ArgumentError (response-splitting
  * guard). Bypasses Ruby Hash#each + per-line String#<< allocation; the
  * status line, framing headers, and join slices live in C buffers.
+ *
+ * 2.13-B — three CPU savings over the rc17 baseline:
+ *   1. Common (status, reason) pairs hit a static table of pre-baked
+ *      "HTTP/1.1 NNN <reason>\r\n" lines — one rb_str_cat replaces the
+ *      per-request snprintf + reason-cat + CRLF-cat triple.
+ *   2. Header iteration uses rb_hash_foreach instead of
+ *      `rb_funcall(:keys)` + per-key `rb_hash_aref` — eliminates the
+ *      keys-Array allocation and the N hash lookups per call.
+ *   3. Per-key downcase result + "<lc>: " prefix is cached on the
+ *      input frozen String's identity (capped at 64 entries; a
+ *      misbehaving app emitting unique keys per request just falls
+ *      back to the slow path on overflow). For the canonical Rack-3
+ *      app emitting `'content-type' / 'cache-control' / ...` from
+ *      frozen literals, every header lookup is a single st hit.
+ *   4. (key, value) full-line cache: both sides are frozen-literal
+ *      Strings (e.g. `'cache-control' => 'no-store'`) — entire
+ *      "<lc-key>: <value>\r\n" line is one rb_str_cat after the first
+ *      request populates the cache. Capped at 256 entries.
  */
 static VALUE cbuild_response_head(VALUE self, VALUE rb_status, VALUE rb_reason,
                                   VALUE rb_headers, VALUE rb_body_size,
@@ -475,59 +814,35 @@ static VALUE cbuild_response_head(VALUE self, VALUE rb_status, VALUE rb_reason,
     /* Most heads fit in 1 KiB; rb_str_cat grows on demand. */
     VALUE buf = rb_str_buf_new(1024);
 
-    /* Status line: "HTTP/1.1 <status> <reason>\r\n" */
-    char status_line[48];
-    int n = snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d ", status);
-    rb_str_cat(buf, status_line, n);
-    rb_str_cat(buf, RSTRING_PTR(rb_reason), RSTRING_LEN(rb_reason));
-    rb_str_cat(buf, "\r\n", 2);
-
-    /* Iterate user headers — lowercase key, validate value, skip framing. */
-    int has_date = 0;
-
-    VALUE keys = rb_funcall(rb_headers, rb_intern("keys"), 0);
-    long n_keys = RARRAY_LEN(keys);
-    for (long i = 0; i < n_keys; i++) {
-        VALUE k = rb_ary_entry(keys, i);
-        VALUE v = rb_hash_aref(rb_headers, k);
-
-        VALUE k_s     = rb_obj_as_string(k);
-        VALUE v_s     = rb_obj_as_string(v);
-        VALUE k_lower = rb_funcall(k_s, id_downcase, 0);
-
-        const char *k_ptr = RSTRING_PTR(k_lower);
-        long k_len        = RSTRING_LEN(k_lower);
-        const char *v_ptr = RSTRING_PTR(v_s);
-        long v_len        = RSTRING_LEN(v_s);
-
-        /* CRLF injection guard on value. */
-        for (long j = 0; j < v_len; j++) {
-            if (v_ptr[j] == '\r' || v_ptr[j] == '\n') {
-                rb_raise(rb_eArgError, "header %s contains CR/LF",
-                         RSTRING_PTR(rb_inspect(k_lower)));
-            }
-        }
-
-        /* Drop user-supplied content-length / connection — we always set
-         * these unconditionally below (matches rc16 Ruby behaviour where
-         * the normalized hash overwrites in place). */
-        if (k_len == 14 && memcmp(k_ptr, "content-length", 14) == 0) continue;
-        if (k_len == 10 && memcmp(k_ptr, "connection", 10) == 0)     continue;
-
-        if (k_len == 4 && memcmp(k_ptr, "date", 4) == 0) {
-            has_date = 1;
-        }
-
-        rb_str_cat(buf, k_ptr, k_len);
-        rb_str_cat(buf, ": ", 2);
-        rb_str_cat(buf, v_ptr, v_len);
+    /* Status line: pre-baked when (status, reason) is one of the well-known
+     * pairs in `Hyperion::ResponseWriter::REASONS`; falls back to
+     * `snprintf("HTTP/1.1 %d ", status)` + reason-cat for unknowns. */
+    const struct status_line *sline =
+        lookup_status_line(status, RSTRING_PTR(rb_reason), RSTRING_LEN(rb_reason));
+    if (sline != NULL) {
+        rb_str_cat(buf, sline->bytes, sline->len);
+    } else {
+        char status_line_buf[48];
+        int n = snprintf(status_line_buf, sizeof(status_line_buf), "HTTP/1.1 %d ", status);
+        rb_str_cat(buf, status_line_buf, n);
+        rb_str_cat(buf, RSTRING_PTR(rb_reason), RSTRING_LEN(rb_reason));
         rb_str_cat(buf, "\r\n", 2);
     }
 
-    /* Framing headers — always emitted. */
-    char cl_buf[48];
-    n = snprintf(cl_buf, sizeof(cl_buf), "content-length: %ld\r\n", body_size);
-    rb_str_cat(buf, cl_buf, n);
+    /* Iterate user headers — lowercase key, validate value, skip framing.
+     * Threaded through rb_hash_foreach so we can reuse the per-key
+     * downcase cache and skip the per-call `keys` Array allocation. */
+    build_head_state_t state = { buf, 0 };
+    rb_hash_foreach(rb_headers, build_head_each, (VALUE)&state);
+
+    /* Framing headers — always emitted. content-length uses a hand-rolled
+     * itoa rather than snprintf (vfprintf was 1 % of CPU on the
+     * CPU-JSON profile). */
+    char itoa_scratch[24];
+    int cl_off = itoa_positive_decimal(body_size, itoa_scratch, (int)sizeof(itoa_scratch));
+    rb_str_cat(buf, "content-length: ", 16);
+    rb_str_cat(buf, itoa_scratch + cl_off, sizeof(itoa_scratch) - cl_off);
+    rb_str_cat(buf, "\r\n", 2);
 
     if (keep_alive) {
         rb_str_cat(buf, "connection: keep-alive\r\n", 24);
@@ -535,7 +850,7 @@ static VALUE cbuild_response_head(VALUE self, VALUE rb_status, VALUE rb_reason,
         rb_str_cat(buf, "connection: close\r\n", 19);
     }
 
-    if (!has_date) {
+    if (!state.has_date) {
         rb_str_cat(buf, "date: ", 6);
         rb_str_cat(buf, RSTRING_PTR(rb_date), RSTRING_LEN(rb_date));
         rb_str_cat(buf, "\r\n", 2);
@@ -1286,6 +1601,22 @@ void Init_hyperion_http(void) {
     }
     rb_obj_freeze(rb_aHeaderTable);
     rb_define_const(rb_cCParser, "PREINTERNED_HEADERS", rb_aHeaderTable);
+
+    /* 2.13-B — status-line, header-key, header-line caches used by
+     * cbuild_response_head. The status-line table is fixed-size (no GC
+     * concerns; bytes are .rodata). The two header caches are
+     * GC-aware: their contents pin VALUEs through globally-rooted
+     * Anchor Arrays, while the actual st_table maps live for the
+     * extension lifetime (one per process; never freed). */
+    for (struct status_line *e = k_status_lines; e->bytes != NULL; e++) {
+        e->len = (long)strlen(e->bytes);
+    }
+    rb_aHeaderKeyAnchor  = rb_ary_new();
+    rb_aHeaderLineAnchor = rb_ary_new();
+    rb_global_variable(&rb_aHeaderKeyAnchor);
+    rb_global_variable(&rb_aHeaderLineAnchor);
+    g_header_key_cache  = st_init_numtable();
+    g_header_line_cache = st_init_table(&header_line_cache_type);
 
     /* Phase 1 (1.7.0) — sibling C unit owns Hyperion::Http::Sendfile.
      * Defined in sendfile.c; both objects link into the same .bundle/.so

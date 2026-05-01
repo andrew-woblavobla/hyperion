@@ -2,6 +2,123 @@
 
 ## [Unreleased] — 2.13.0
 
+### 2.13-B — CPU JSON gap
+
+**Background.** The 2.12-B re-bench surfaced one row that got *worse*
+relative to Agoo across the 2.10/2.11/2.12 streams: `bench/work.ru`
+(50-key JSON serialised per-request, no `handle_static` because the
+response varies per request). 2.10-B had Hyperion 3,450 / Agoo 6,374
+(1.85× behind); the 2.12-B re-bench had Hyperion 3,659 / Agoo 7,489
+(2.05× behind). Hyperion +6.0%, Agoo +17.5% over the same window —
+the gap *widened*. None of the 2.10/2.11/2.12 work touched this row,
+so it was the obvious 2.13 follow-on.
+
+**Profile.** `perf record -F 199 -g` on the worker pid while
+`wrk -t4 -c100 -d15s` ran (CPU-JSON workload, default config
+`-t 5 -w 1` = bench harness canonical):
+
+```
+13.15%  vm_exec_core                   (Ruby VM dispatch)
+13.01%  _raw_spin_unlock_irqrestore    (kernel; ~6% inside TCP write softirq)
+ 4.56%  raw_generate_json_string       (JSON.generate — app's own work)
+ 2.28%  generate_json_general          (ditto)
+ 1.75%  vm_call_cfunc_with_frame
+ 1.34%  rb_class_of
+ 1.24%  json_object_i                  (ditto)
+ 1.11%  rb_vm_opt_getconstant_path
+ 1.01%  BSD_vfprintf                   (sprintf — content-length builder + JSON floats)
+ 0.94%  generate_json_float            (ditto)
+ 0.70%  hash_foreach_call              (header iteration)
+ 0.57%  llhttp__internal__run          (Hyperion C ext request parser)
+```
+
+The honest read: ~10 % of CPU is `JSON.generate` (the app's per-request
+work — not removable from inside Hyperion); ~13 % is kernel TCP write
+softirq (one `write(2)` per response — already minimal); ~13 % is the
+Ruby VM dispatch loop, of which the adapter + writer Ruby path is a
+fraction. **The dominant tail is GVL serialisation under `-t 5 -w 1`**
+— a concurrency sweep shows c=1 → 5,800 r/s, c=5 → 3,563 r/s, c=100 →
+3,665 r/s. Hyperion's per-thread workload SCALES DOWN with concurrency
+because every request holds the GVL through `app.call` + `JSON.generate`
+(Ruby code, no I/O wait). Agoo (pure-C HTTP core) scales UP with
+concurrency: c=1 → 4,384 → c=5 → 6,182 → c=100 → 6,519. That structural
+gap cannot close inside Hyperion — `app.call(env)` IS Ruby. What 2.13-B
+*can* do is shrink Hyperion's GVL hold time per request so the ratio
+of "GVL held by Hyperion" to "GVL held by app.call" drops, leaving
+more room for the worker pool to interleave.
+
+### 2.13-B — CPU savings in `cbuild_response_head`
+
+The C-side response-head builder (called once per Rack response) had
+four removable per-request costs:
+
+  1. **Status line `snprintf`.** Every request ran
+     `snprintf("HTTP/1.1 %d ", status)` + `rb_str_cat(reason)` +
+     `rb_str_cat("\r\n", 2)` to build "HTTP/1.1 200 OK\r\n". The 23
+     status codes in `ResponseWriter::REASONS` are a fixed set with
+     fixed reason phrases — the entire status line is a constant per
+     `(status, reason)` pair. The 2.13-B builder switches on `status`
+     and emits the pre-baked line in ONE `rb_str_cat` when the reason
+     phrase matches; falls back to the snprintf path for unknown
+     statuses or operator-overridden reason phrases.
+
+  2. **Header iteration via `rb_funcall(:keys)`.** The legacy iterator
+     called `rb_funcall(rb_headers, :keys, 0)` to materialise a fresh
+     keys Array per request, then `rb_ary_entry(keys, i)` +
+     `rb_hash_aref(rb_headers, key)` per header. The 2.13-B builder
+     uses `rb_hash_foreach`, which walks the hash table directly with
+     no intermediate Array allocation and no per-key hash lookup.
+
+  3. **Per-key `String#downcase` allocation.** Header keys are nearly
+     always frozen-literal Strings in Rack apps (`'content-type'`,
+     `'cache-control'`, …) — same `VALUE` every request. The legacy
+     builder ran `rb_funcall(:downcase)` per key per call, allocating
+     a fresh lowercase String + crossing the FFI boundary. 2.13-B
+     keys an `st_table` on the input String's identity and stores
+     the cached lowercase form + the pre-built `"<lc>: "` prefix
+     buffer; the second-and-later requests for the same frozen-literal
+     key get one st-table hit. Capped at 64 entries — a misbehaving
+     app emitting `x-trace-<uuid>` per request can't grow the cache
+     without bound, just falls back to the per-call downcase.
+
+  4. **Per-(key, value) full-line cache.** When BOTH the key AND the
+     value are frozen-literal Strings (`'cache-control' => 'no-store'`
+     in `bench/work.ru`, `'content-type' => 'application/json'`),
+     the entire wire line `"<lc-key>: <value>\r\n"` is identical
+     every request. 2.13-B caches the prebuilt line keyed on
+     `(key.object_id, value.object_id)`; on hit the entire emit is
+     ONE `rb_str_cat`. Capped at 256 entries with the same fall-back
+     semantics. The CRLF-injection guard always re-runs (the cache
+     stores only validated lines; new (k, v) pairs go through the
+     full validator before the line populates).
+
+  5. **`itoa_positive_decimal` for content-length.** `snprintf("content-
+     length: %ld\r\n", body_size)` was 1 % of CPU on the profile.
+     `body_size` is always non-negative (bytesize of a buffered body)
+     so the sign branch + locale logic in `vfprintf` are pure
+     overhead. 2.13-B writes the digits backwards into a 24-byte
+     stack scratch then `rb_str_cat`s the populated suffix — no
+     heap, no locale, no format-string parser.
+
+**Bench impact.** Single-thread synthetic (a tight loop running
+`Adapter::Rack.call → ResponseWriter#write` against a `StringIO`-like
+sink, no socket): **18,400 r/s → 20,001 r/s = +8.7 %**. Multi-thread
+loopback bench (`-t 5 -w 1`, `wrk -t4 -c100 -d20s --latency`,
+3-trial median): inside bench-host noise (3,640 r/s → 3,611 r/s).
+The Ruby-side GVL contention dominates wall-clock at the canonical
+bench config; the per-request CPU savings DO compound when the
+worker count goes up (`-t 5 -w 4` SO_REUSEPORT cluster: 14,222 r/s
+sustained, 2× over Agoo 7,489 single-process). **Honest assessment:
+the 2.05× gap to Agoo on the canonical `-t 5 -w 1` row is a
+GVL-architecture gap, not a per-request CPU gap — Agoo's pure-C HTTP
+core lets 5 worker threads truly run in parallel; Hyperion's
+adapter + writer + app.call hold the GVL together.** 2.13-B closes
+the gap on Hyperion's portion of that hold (the only thing inside
+Hyperion's control); operators who need the multi-thread row to
+match Agoo should run `-w 4` SO_REUSEPORT (the 2.12-E cluster
+distribution work) where Hyperion DOES exceed Agoo's single-process
+number by 2×.
+
 ### 2.13-A — Extend C-side wins to generic Rack apps
 
 **Background.** The 2.12 sprint shipped huge wins on the
