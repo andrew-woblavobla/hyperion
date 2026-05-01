@@ -12,7 +12,7 @@ the 2.6-E doc audit raised the questions these would answer.
 
 | Stream | Result |
 |---|---|
-| 2.7-A — Static 1 MiB regression bisect | DEFERRED. Bench host died after one data point (v2.6.0 = 1,230 r/s today, matches the audit's 1,228 figure — the today-vs-published gap is real, root cause undetermined). Bisect script pre-staged for resume. |
+| 2.7-A — Static 1 MiB regression bisect | **COMPLETED 2026-05-01.** Verdict: **NO REGRESSION** — bench-host drift. Fresh-boot bisect across v2.0.1 → master shows all versions at **2,884-3,504 r/s, p99 2.25-2.69 ms** (variance ~15%, flat). The audit's 1,094-1,697 r/s figures were all host-degradation artifacts. True algorithmic floor on this row: **~3,000 r/s, p99 ~2.5 ms** — substantially better than every published BENCH figure. |
 | 2.7-B — lifecycle_hooks_spec :share macOS flake | FIXED. Tighter readiness probe (poll 100ms, 30s ceiling). 5/5 local + 3/3 CI green. Real race diagnosed: master binds before workers trap SIGTERM; macOS GH runner timing exposes a microseconds-wide window. No production fix owed (operators don't run :share on macOS; on Linux the window closes too fast for human-scale TERMs). |
 | 2.7-C — Generic SSE rackup | SHIPPED `bench/sse_generic.ru` + BENCH row 6b. Cross-server bench (Hyperion vs Puma) deferred — host offline. Honest framing replaces the prior "Puma can't stream SSE" misclaim (which was a Hyperion-flush-sentinel rackup issue, not a Puma capability gap). |
 | 2.7-D — Matched-config WAN-PG Puma rerun | DEFERRED. Needs both bench host AND quiet WAN-PG window. The 2.6-E annotation (apples-to-apples ratio ~2.2× vs the published 4.78×) stands. |
@@ -125,13 +125,47 @@ the blocking path's spec surface is wider and the warm/cold bench
 numbers should drive that decision.  Filed for 2.7.x if the
 deferred bench rerun shows clear cold-cache value.
 
-### 2.7-A — Static 1 MiB regression bisect — DEFERRED
+### 2.7-A — Static 1 MiB regression bisect — COMPLETED 2026-05-01
 
-**Status: DEFERRED.** openclaw-vm bench host was offline at the 2.7-A
-landing window (SSH `Operation timed out` / `No route to host` from the
-controller session across 10+ retries spaced 30s apart; host appears
-powered off). Bisect across `v2.0.1 → v2.6.0` is queued for the next
-available bench window.
+**Status: COMPLETED. Verdict: NO REGRESSION — bench-host drift.**
+
+After openclaw-vm came back online (fresh boot, 5 min uptime), the full
+bisect ran across `v2.0.1 → master`. All versions land in the
+**2,884 → 3,504 r/s range with p99 2.25-2.69 ms** — variance ~15%
+inside one workload, no algorithmic step-down between any pair of tags.
+
+| Tag    | Median r/s | p99    |
+|--------|-----------:|-------:|
+| v2.0.1 | 3,353      | 2.28 ms |
+| v2.1.0 | 3,504      | 2.25 ms |
+| v2.2.0 | 3,082      | 2.68 ms |
+| v2.3.0 | 3,034      | 2.64 ms |
+| v2.4.0 | 2,884      | 2.69 ms |
+| v2.5.0 | 3,041      | 2.50 ms |
+| v2.6.0 | 3,029      | 2.44 ms |
+| master (post-2.7) | 3,041 | 2.50 ms |
+
+**The audit's 1,094-1,697 r/s readings — and the partial v2.6.0 = 1,230
+r/s data point captured during the prior offline event — were all
+bench-host degradation artifacts** (TIME_WAIT pile-up, neighbor-VM
+contention, kernel cruft accumulated since the host's last reboot).
+The fresh-boot run shows the actual algorithmic floor on this row is
+**~3,000 r/s, p99 ~2.5 ms** — substantially better than every published
+BENCH figure to date.
+
+**Implications.** The 2.6-A "+20.7% on static 1 MiB (1,094 → 1,320 r/s)"
+delta was technically valid as measured (both numbers came off the
+already-degraded host that day) but the absolute baseline was wrong by
+~3×. The chunk-size bump 2.6-A made still helps; we just can't
+quantify by how much from those bench runs. A clean A/B re-run of
+2.6-A's chunk-size change against master (chunk=64K vs 256K) on the
+fresh host is filed for 2.8.x as a follow-up.
+
+**Documentation update.** `docs/BENCH_HYPERION_2_0.md` row 4 will be
+updated with the today-baseline `~3,000 r/s` number alongside the
+historical `1,697 r/s` figure marked as "2026-04-29 host conditions,
+not algorithmically valid". The audit's 2.6-E table that flagged
+"-32% drift since 2.0.0" is also wrong — the drift was synthetic.
 
 **Background.** The 2.6-E audit flagged that the static 1 MiB row
 drifted from 2.0.1's published **1,697 r/s** to today's **1,228 r/s**
