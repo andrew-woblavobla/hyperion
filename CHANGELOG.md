@@ -1,5 +1,42 @@
 # Changelog
 
+## [2.8.0] - 2026-05-01
+
+### Headline
+
+A measurement-correction release. No new code-path perf work; the 2.8
+sprint resolved the deferred 2.7 bench items now that openclaw-vm is
+back online (fresh boot, clean host).
+
+| Item | Result |
+|---|---|
+| **2.7-A bisect (deferred from 2.7)** | **NO REGRESSION.** Full bisect across v2.0.1 → master shows all versions at **2,884-3,504 r/s, p99 2.25-2.69 ms** on static 1 MiB (variance ~15%, no step-down). The audit's 1,094-1,697 r/s readings were all bench-host degradation artifacts. **True algorithmic floor: ~3,000 r/s, p99 ~2.5 ms** — substantially better than every published BENCH figure. |
+| **2.7-C SSE cross-server (deferred from 2.7)** | Hyperion **510 r/s, p99 2.42 ms** vs Puma **133 r/s, p99 9.64 ms** on `bench/sse_generic.ru`. **+281% rps, 4× lower p99.** Honest cross-server number replaces the prior "Puma can't stream" misclaim (which was a Hyperion-flush-sentinel rackup issue). |
+| **2.7-F warm-cache validation (deferred from 2.7)** | Master HEAD with fadvise hoisted-once: 3,003 / 2,942 / 2,832 r/s median **2,942 r/s, p99 2.7 ms**. Within run-to-run noise of the bisect's master baseline (3,041 r/s). **No warm-cache regression. 2.7-F STAYS.** |
+| **2.7-D matched-PG (deferred from 2.7)** | Still deferred. WAN PG (pg.wobla.space) returned "server closed connection unexpectedly" mid-bench from Puma side; the WAN PG is unreliable for matched comparisons. Needs a quieter PG window. |
+| **2.7-E Falcon h2 (deferred from 2.7)** | Still deferred. Falcon not installed on bench host; staging follow-up for 2.9. |
+
+### What changed in the BENCH doc
+
+- Row 4 (Static 1 MiB): added the fresh-boot **3,041 r/s** measurement alongside the historical 1,809 / degraded-host 1,228 figures. The audit's "-32% drift since 2.0.0" framing was wrong; drift was synthetic.
+- Row 6b (SSE generic): replaced "pending" with the verified Hyperion **+281% / 4× lower p99** numbers.
+- Spot-check addendum widened to a 3-column table (published / degraded / fresh-boot) so future readers can see the host-degradation effect on absolute numbers.
+
+### Implications for prior releases
+
+The 2.6-A "+20.7% on static 1 MiB (1,094 → 1,320 r/s)" headline was technically valid as measured (both numbers came off the degraded host that day) but the absolute baseline was wrong by ~3×. The chunk-size bump (64 KiB → 256 KiB) likely still helps; we just can't quantify the delta from those bench runs. A clean A/B re-run on the fresh host is filed as a 2.9 follow-up.
+
+### What didn't change
+
+No production code changes. Spec count unchanged at 956. CI green.
+
+### Filed for 2.9
+
+1. Falcon h2 head-to-head bench (install Falcon on openclaw-vm + run matched h2load harness)
+2. Matched-config WAN-PG bench in a quiet PG window
+3. 2.6-A chunk-size A/B on the fresh host (quantify the actual delta from chunk=64 KiB vs 256 KiB)
+4. Per-route permessage-deflate ratio histogram (was 2.8-A, deferred when sprint was held)
+
 ## [2.7.0] - 2026-05-01
 
 ### Headline
