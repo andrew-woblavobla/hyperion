@@ -57,7 +57,21 @@ module Hyperion
       #   * nil (default) — no cap; matches 2.2.0 behaviour. Hyperion is
       #                     opt-in by default — the cap is a hardening tool
       #                     that operators turn on, not a default flip.
-      max_in_flight_per_conn: nil
+      max_in_flight_per_conn: nil,
+      # 2.10-E: explicit `preload_static "/path"` DSL entries plus the
+      # CLI's repeatable `--preload-static <dir>` flag accumulate here.
+      # Each element is a `{path: String, immutable: Boolean}` Hash.
+      # `Server#listen` walks the resolved list (which may also include
+      # auto-detected Rails asset paths — see `auto_preload_static_disabled`)
+      # and warms `Hyperion::Http::PageCache` before the accept loop spins.
+      # Default empty so a vanilla Rack app pays nothing.
+      preload_static_dirs: nil,
+      # 2.10-E: when truthy, suppress the Rails-aware auto-detect path
+      # (`Rails.configuration.assets.paths.first(N)`) at boot.  Set by
+      # the `--no-preload-static` CLI flag; lets operators turn off
+      # auto-warming on a Rails app while still keeping the option to
+      # configure explicit dirs via `preload_static`.
+      auto_preload_static_disabled: false
     }.freeze
 
     HOOKS = %i[before_fork on_worker_boot on_worker_shutdown].freeze
@@ -260,6 +274,10 @@ module Hyperion
       @tls           = TlsConfig.new
       @websocket     = WebSocketConfig.new
       @metrics       = MetricsConfig.new
+      # 2.10-E: per-instance Array — DEFAULTS is frozen so we can't share
+      # a literal `[]` across Config instances or every operator's DSL
+      # `preload_static` call would mutate the same backing list.
+      @preload_static_dirs = []
     end
 
     HOOKS.each do |hook|
@@ -346,11 +364,21 @@ module Hyperion
     # are dispatched through `CLI_FLAT_TO_NESTED`. The DSL no longer
     # accepts these names, but the CLI flag surface keeps its 1.x
     # spellings — operators don't have to learn a new flag set.
+    #
+    # 2.10-E: `:preload_static` is special-cased — it's an Array of dir
+    # strings from the repeatable `--preload-static` flag, and we
+    # APPEND each as `{path:, immutable: true}` to the already-populated
+    # `preload_static_dirs` list. Operator config-file entries land
+    # first; CLI flags win by being applied last.
     def merge_cli!(overrides)
       overrides.each do |key, value|
         next if value.nil?
 
-        if (route = CLI_FLAT_TO_NESTED[key])
+        if key == :preload_static
+          Array(value).each do |dir|
+            preload_static_dirs << { path: dir.to_s, immutable: true }
+          end
+        elsif (route = CLI_FLAT_TO_NESTED[key])
           group, nested = route
           public_send(group).public_send(:"#{nested}=", value)
         elsif respond_to?(:"#{key}=")
@@ -358,6 +386,24 @@ module Hyperion
         end
       end
       self
+    end
+
+    # 2.10-E — resolve the operator-supplied preload list, falling
+    # through to Rails auto-detect when no explicit dirs are configured
+    # AND auto-detect is not disabled by the operator. Always returns
+    # an Array of `{path:, immutable:}` Hashes (possibly empty).
+    #
+    # Precedence:
+    #   1. Operator-supplied (DSL `preload_static` or CLI flags) — used verbatim.
+    #   2. Otherwise, Rails-detected paths if auto-detect is enabled.
+    #   3. Otherwise, [] — no preload, 1.x cold-cache behaviour.
+    def resolved_preload_static_dirs
+      return preload_static_dirs.dup unless preload_static_dirs.empty?
+      return [] if auto_preload_static_disabled
+
+      Hyperion::StaticPreload.detect_rails_paths.map do |path|
+        { path: path, immutable: true }
+      end
     end
 
     # DSL receiver. Each method call on the DSL maps to a Config setter or
@@ -429,6 +475,20 @@ module Hyperion
       def tls_key_path(path)
         require 'openssl'
         @config.tls_key = OpenSSL::PKey.read(File.read(path))
+      end
+
+      # 2.10-E — `preload_static "/path", immutable: true` DSL key.
+      # Appends `{path:, immutable:}` onto `preload_static_dirs`. The
+      # `immutable:` kwarg defaults to true — the whole point of preload
+      # is "I promise these don't change without a restart" so the
+      # immutable flag is the operator-friendly default. Multiple calls
+      # accumulate.
+      #
+      # Overrides the auto-generated DEFAULTS-based setter for the
+      # backing field (which would write the entire array via `=`); this
+      # explicit method is the one the DSL actually exposes.
+      def preload_static(path, immutable: true)
+        @config.preload_static_dirs << { path: path.to_s, immutable: immutable }
       end
     end
 

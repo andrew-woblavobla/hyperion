@@ -242,6 +242,22 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
              'or `unlimited` (default).') do |v|
           cli_opts[:tls_handshake_rate_limit] = parse_tls_handshake_rate_limit!(v)
         end
+        # 2.10-E: repeatable preload-at-boot flag. Each occurrence appends
+        # to the cli_opts Array; merge_cli! turns each into a
+        # `{path:, immutable: true}` entry on `Config#preload_static_dirs`.
+        # `--no-preload-static` is the sibling sentinel that disables the
+        # Rails-aware auto-detect path; the operator's explicit dirs (if
+        # any) still take effect.
+        o.on('--preload-static DIR',
+             'Preload static assets from DIR at boot (repeatable). Marks every ' \
+             'cached entry immutable so subsequent serves never re-stat.') do |dir|
+          (cli_opts[:preload_static] ||= []) << dir
+        end
+        o.on('--no-preload-static',
+             'Disable the Rails-aware static-asset auto-detect at boot. ' \
+             'Explicit `--preload-static` dirs still take effect.') do
+          cli_opts[:auto_preload_static_disabled] = true
+        end
         o.on('-h', '--help', 'show help') do
           puts o
           exit 0
@@ -279,7 +295,8 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
                           tls_ktls: config.tls.ktls,
                           io_uring: config.io_uring,
                           max_in_flight_per_conn: config.max_in_flight_per_conn,
-                          tls_handshake_rate_limit: config.tls.handshake_rate_limit)
+                          tls_handshake_rate_limit: config.tls.handshake_rate_limit,
+                          preload_static_dirs: config.resolved_preload_static_dirs)
       warn_c_parser_unavailable
 
       # Pre-allocate Rack env-pool entries and eager-touch lazy constants.

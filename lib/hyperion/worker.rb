@@ -29,7 +29,8 @@ module Hyperion
                    tls_ktls: :auto,
                    io_uring: :off,
                    max_in_flight_per_conn: nil,
-                   tls_handshake_rate_limit: :unlimited)
+                   tls_handshake_rate_limit: :unlimited,
+                   preload_static_dirs: nil)
       @host                     = host
       @port                     = port
       @app                      = app
@@ -55,6 +56,7 @@ module Hyperion
       @io_uring                          = io_uring
       @max_in_flight_per_conn            = max_in_flight_per_conn
       @tls_handshake_rate_limit          = tls_handshake_rate_limit
+      @preload_static_dirs               = preload_static_dirs
     end
 
     def run
@@ -85,7 +87,8 @@ module Hyperion
                           tls_ktls: @tls_ktls,
                           io_uring: @io_uring,
                           max_in_flight_per_conn: @max_in_flight_per_conn,
-                          tls_handshake_rate_limit: @tls_handshake_rate_limit)
+                          tls_handshake_rate_limit: @tls_handshake_rate_limit,
+                          preload_static_dirs: @preload_static_dirs)
 
       # `on_worker_boot` runs in the child after fork, BEFORE the worker
       # adopts/binds its listener and before any accept. App code reconnects

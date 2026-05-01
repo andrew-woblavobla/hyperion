@@ -157,7 +157,8 @@ module Hyperion
                    io_uring: :off,
                    max_in_flight_per_conn: nil,
                    tls_handshake_rate_limit: :unlimited,
-                   route_table: nil)
+                   route_table: nil,
+                   preload_static_dirs: nil)
       validate_async_io!(async_io)
       @host                     = host
       @port                     = port
@@ -216,6 +217,13 @@ module Hyperion
       # singleton).  Tests can inject a fresh table to isolate
       # registrations from other examples.
       @route_table              = route_table || Hyperion::Server.route_table
+      # 2.10-E: list of `{path:, immutable:}` entries the worker warms
+      # into `Hyperion::Http::PageCache` at boot. Resolved by
+      # `Config#resolved_preload_static_dirs` and threaded through
+      # Master → Worker → Server. nil/[] = no preload (1.x cold-cache
+      # behaviour).
+      @preload_static_dirs      = preload_static_dirs
+      @preloaded                = false
     end
 
     # Read-only handle for tests + bench harness introspection.
@@ -300,6 +308,13 @@ module Hyperion
 
     def start
       listen unless @server
+      # 2.10-E: warm the page cache before any request can land. Idempotent
+      # via `@preloaded`, so repeated `start` calls (test harnesses,
+      # Worker#run respawn) don't re-walk the tree. Runs after `listen`
+      # (so `@server` exists for the operator's introspection hooks if any
+      # future runtime fires off boot-side instrumentation) but before the
+      # accept loop fires up — first request hits warm cache.
+      preload_static!
       if @thread_count.positive?
         @thread_pool = ThreadPool.new(size: @thread_count, max_pending: @max_pending,
                                       max_in_flight_per_conn: @max_in_flight_per_conn,
@@ -340,6 +355,24 @@ module Hyperion
       @server&.close
       @server = nil
       @tcp_server = nil
+    end
+
+    # 2.10-E — Walk every configured preload directory, populate
+    # `Hyperion::Http::PageCache`, and mark every entry immutable when
+    # asked.  Called from `start` once per worker.  Idempotent — second
+    # call is a no-op so test harnesses + Worker respawn paths don't
+    # re-walk the tree.
+    #
+    # `logger` is exposed as a kwarg purely for the spec suite; production
+    # callers omit it and the runtime logger is used.
+    def preload_static!(logger: runtime_logger)
+      return 0 if @preloaded
+
+      @preloaded = true
+      entries = @preload_static_dirs
+      return 0 if entries.nil? || entries.empty?
+
+      Hyperion::StaticPreload.run(entries, logger: logger)
     end
 
     private

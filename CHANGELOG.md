@@ -1,5 +1,97 @@
 # Changelog
 
+## 2.10.1 — TBD
+
+### 2.10-E — Static asset preload + immutable flag
+
+Adds a boot-time hook that walks operator-supplied directory trees,
+populates `Hyperion::Http::PageCache` with each regular file, and
+(by default) marks every cached entry immutable so subsequent serves
+never re-stat. Closes the gap between Hyperion 2.10-C's cold-cache
+1,880 r/s on the static-1-KB row and Agoo's "8000× faster static"
+warm-cache claim (their `misc/rails.md`) — Agoo gets that number by
+preloading every Rails-managed asset path at boot. 2.10-E ships the
+same shape so operators don't have to call `PageCache.preload`
+themselves.
+
+**Operator surface — three ways in.**
+
+1. **CLI flag** — repeatable.
+   ```
+   bundle exec hyperion --preload-static /srv/app/public \
+                        --preload-static /srv/app/public/uploads \
+                        config.ru
+   ```
+   Each `--preload-static <dir>` entry is walked recursively at boot;
+   every file becomes a cached page-cache entry marked immutable.
+   `--no-preload-static` is the sibling sentinel that disables the
+   Rails-aware auto-detect (operator-supplied dirs still take effect).
+
+2. **Config DSL key** — accumulates across multiple calls.
+   ```ruby
+   # config/hyperion.rb
+   preload_static '/srv/app/public'                           # immutable: true (default)
+   preload_static '/srv/app/public/uploads', immutable: false  # opt-out per-dir
+   ```
+   The `immutable:` kwarg defaults to `true` — preload's whole point
+   is "I promise these don't change without a restart", and operators
+   wanting per-request mtime polling can opt out per-dir.
+
+3. **Rails auto-detect** — zero-config for Rails apps.
+
+   When the operator has NOT configured `preload_static` and did NOT
+   pass `--no-preload-static`, Hyperion checks for a Rails-shaped boot
+   environment (`defined?(::Rails) && ::Rails.respond_to?(:configuration)`,
+   `Rails.configuration.assets.paths` returns a non-empty Array) and
+   auto-preloads the first 8 entries of `Rails.configuration.assets.paths`.
+   Hyperion never `require`s rails — auto-detect is purely defensive
+   probing, so Hyperion stays a generic Rack server that has a Rails
+   bonus mode.
+
+**Boot-time log line per dir.** One info-level summary line per
+processed directory:
+
+```
+{"message":"static preload complete","dir":"/srv/app/public","files":42,"bytes":2487136,"ms":18.4}
+```
+
+Operators alert on this if files=0 (config typo, missing dir) or ms
+spike (disk regression / NFS storm).
+
+**Where it runs.** `Hyperion::StaticPreload.run` is invoked from
+`Server#preload_static!` inside `Server#start`, after `listen`
+configures the listener but BEFORE the accept loop spins. First
+request lands on warm cache. The preload list flows
+`Config#resolved_preload_static_dirs` → `Master` → `Worker` → `Server`
+in cluster mode and `CLI.run_single` → `Server` in single-mode.
+
+**Files added.**
+
+| File | Purpose |
+|---|---|
+| `lib/hyperion/static_preload.rb` | `Hyperion::StaticPreload.run(entries, logger:)` walks each `{path:, immutable:}` Hash, calls `PageCache.cache_file` + `set_immutable`, emits the summary log line. `.detect_rails_paths(cap: 8)` defensively probes `Rails.configuration.assets.paths` for the auto-detect path. |
+| `spec/hyperion/static_preload_spec.rb` | 11 examples covering walk + cache, immutable-flag behaviour, summary log shape, missing-dir warn, multi-dir accumulation, and the Rails detect branches (operator-overrode, auto-detect-disabled, Rails-undefined, non-Array paths, cap kwarg). |
+| `spec/hyperion/cli_preload_static_spec.rb` | 6 examples covering `--preload-static` repeatable flag, `--no-preload-static` toggle, and the `merge_cli!` routing into `Config#preload_static_dirs`. |
+| `spec/hyperion/config_preload_static_spec.rb` | 6 examples covering DSL accumulation, defaults, and the `resolved_preload_static_dirs` precedence (operator > Rails > none). |
+| `spec/hyperion/server_static_preload_spec.rb` | 3 examples covering `Server#preload_static!` warming the page cache from a configured directory and respecting the immutable flag. |
+
+**Files touched.**
+
+| File | Change |
+|---|---|
+| `lib/hyperion.rb` | Require `hyperion/static_preload` after `hyperion/http/page_cache`. |
+| `lib/hyperion/cli.rb` | Add `--preload-static DIR` (repeatable) and `--no-preload-static` flags. Pass `config.resolved_preload_static_dirs` to `Server.new` in single-worker mode. |
+| `lib/hyperion/config.rb` | Add `preload_static_dirs` (Array of `{path:, immutable:}` Hashes) + `auto_preload_static_disabled` (Boolean) defaults. Add `preload_static "/path", immutable: true` DSL method (accumulates). Special-case `:preload_static` in `merge_cli!` to append each CLI dir. New `Config#resolved_preload_static_dirs` returns operator dirs verbatim, falls through to `StaticPreload.detect_rails_paths` when none are configured AND auto-detect isn't disabled. |
+| `lib/hyperion/server.rb` | New `preload_static_dirs:` kwarg on the constructor (default nil = no preload). New public `Server#preload_static!(logger:)` walks the entries via `StaticPreload.run`, idempotent via `@preloaded` so respawn paths don't re-walk. Invoked once from `Server#start` between `listen` and the accept-loop spin-up. |
+| `lib/hyperion/master.rb` | Pass `@config.resolved_preload_static_dirs` through the worker spawn args so cluster mode also warms each worker's page cache at boot. |
+| `lib/hyperion/worker.rb` | Accept and forward `preload_static_dirs:` to `Server.new`. |
+
+**Spec count: 964 → 1004 (+40).** All 1004 examples green; 11 pending
+(unchanged platform-only kTLS / io_uring branches from the 2.10.0 baseline).
+
+**Bench numbers — see "2.10-E — bench result" subsection below**
+for the static-1-KB row before/after preload on openclaw-vm.
+
 ## 2.10.0 — 2026-05-01
 
 The 2.10 sprint widens the bench comparison from "Hyperion vs Falcon

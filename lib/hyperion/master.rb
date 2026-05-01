@@ -249,7 +249,12 @@ module Hyperion
           io_uring: @config.io_uring,
           # 2.3-B — per-conn fairness cap + TLS handshake CPU throttle.
           max_in_flight_per_conn: @config.max_in_flight_per_conn,
-          tls_handshake_rate_limit: @config.tls.handshake_rate_limit
+          tls_handshake_rate_limit: @config.tls.handshake_rate_limit,
+          # 2.10-E — boot-time static asset preload list (resolved from
+          # operator config + Rails auto-detect at master boot, not in
+          # each child, so the spec/log line for auto-detect appears once
+          # per cluster rather than once per worker).
+          preload_static_dirs: @config.resolved_preload_static_dirs
         }
         # Hand the inherited socket to the worker in :share mode. In
         # :reuseport mode the worker binds its own with SO_REUSEPORT.
