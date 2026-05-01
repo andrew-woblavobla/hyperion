@@ -100,24 +100,39 @@ four removable per-request costs:
      stack scratch then `rb_str_cat`s the populated suffix — no
      heap, no locale, no format-string parser.
 
-**Bench impact.** Single-thread synthetic (a tight loop running
-`Adapter::Rack.call → ResponseWriter#write` against a `StringIO`-like
-sink, no socket): **18,400 r/s → 20,001 r/s = +8.7 %**. Multi-thread
-loopback bench (`-t 5 -w 1`, `wrk -t4 -c100 -d20s --latency`,
-3-trial median): inside bench-host noise (3,640 r/s → 3,611 r/s).
-The Ruby-side GVL contention dominates wall-clock at the canonical
-bench config; the per-request CPU savings DO compound when the
-worker count goes up (`-t 5 -w 4` SO_REUSEPORT cluster: 14,222 r/s
-sustained, 2× over Agoo 7,489 single-process). **Honest assessment:
-the 2.05× gap to Agoo on the canonical `-t 5 -w 1` row is a
-GVL-architecture gap, not a per-request CPU gap — Agoo's pure-C HTTP
-core lets 5 worker threads truly run in parallel; Hyperion's
-adapter + writer + app.call hold the GVL together.** 2.13-B closes
-the gap on Hyperion's portion of that hold (the only thing inside
-Hyperion's control); operators who need the multi-thread row to
-match Agoo should run `-w 4` SO_REUSEPORT (the 2.12-E cluster
-distribution work) where Hyperion DOES exceed Agoo's single-process
-number by 2×.
+**Bench impact.** Same bench host (openclaw-vm, Linux 6.8.0, Ruby
+3.3.3, loopback), each version compiled fresh from source on the
+host before its run.
+
+| Workload | Baseline (master adac63e) | 2.13-B | Δ |
+|---|---:|---:|---|
+| Single-thread synthetic (`Adapter::Rack.call → ResponseWriter#write` against a sink, 50,000 iters; 3-trial median r/s) | 18,018 | **19,404** | **+7.7%** |
+| Multi-thread loopback `wrk -t4 -c100 -d20s --latency`, two batches of 3-trial median r/s | 3,427; 3,550 | 3,440; 3,528 | **−0.1%** |
+| Multi-thread loopback p99 latency | 2.77ms; 2.64ms | 2.74ms; 2.67ms | tied |
+
+The +7.7 % single-thread win is the per-request CPU savings inside
+`cbuild_response_head`. The neutral multi-thread result is the
+GVL-contention floor: at `-t 5 -w 1` Hyperion's worker threads
+serialise on the GVL while running `JSON.generate` + `app.call`,
+so shaving 2-3 µs off Hyperion's slice of the hot path leaves the
+total throughput dominated by `JSON.generate` (~10 % CPU per the
+profile) and the kernel TCP write softirq (~6 %). For comparison
+the same bench host, same Ruby, with Hyperion `-w 4` SO_REUSEPORT
+on `bench/work.ru`: **14,200 r/s** — 2× over Agoo's single-process
+7,489 r/s baseline.
+
+**Honest assessment of the residual gap.** The 2.05× gap to Agoo
+on the canonical `-t 5 -w 1` row is a GVL-architecture gap, not a
+per-request CPU gap. Agoo's pure-C HTTP core lets 5 worker threads
+truly run in parallel; Hyperion's adapter + writer + `app.call`
+hold the GVL together because every step except the `read(2)` /
+`write(2)` syscalls is Ruby. Closing this row to ≥ Agoo would
+require either (a) running `-w 4` SO_REUSEPORT (the 2.12-E
+cluster work — Hyperion DOES exceed Agoo by 2× there), or (b) a
+2.14+ track that moves more of the per-request lifecycle into C
+(e.g. running `cbuild_response_head` from the C accept loop with
+the writer fully C-side). 2.13-B closes Hyperion's portion of the
+GVL hold; the rest is structural.
 
 ### 2.13-A — Extend C-side wins to generic Rack apps
 
