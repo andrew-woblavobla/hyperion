@@ -11,6 +11,65 @@ gem install hyperion-rb
 bundle exec hyperion config.ru
 ```
 
+## What's new in 2.12.0
+
+**The hot path moves into C — and gRPC ships.** The headline win:
+`Server.handle_static` routes now serve from a C accept→read→route→write
+loop with optional **io_uring** (Linux 5.x+) backing it. The `wrk -t4
+-c100 -d20s` hello bench moved from **5,502 r/s** (2.11.0
+`Server.handle_static` via Ruby accept loop) to **15,685 r/s** (2.12-C
+C accept4 loop) to **134,084 r/s** (2.12-D io_uring loop) — that's
+**24× over 2.11.0's `handle_static` and 7× over Agoo 2.15.14's
+19,024 r/s** on the same workload. p99 stays sub-millisecond
+throughout. Plus durable foundation work and one big new feature:
+
+- **2.12-B — Fresh 4-way re-bench.** New
+  [`docs/BENCH_HYPERION_2_11.md`](docs/BENCH_HYPERION_2_11.md) re-runs
+  Hyperion / Puma / Falcon / Agoo on the 6 workloads with all 2.10/2.11
+  wins enabled. Headline shifts: static 1 KB Hyperion `handle_static`
+  flipped from 1.89× behind Agoo to **+127% ahead**; CPU JSON gap
+  widened (the one row 2.10/2.11 didn't touch — flagged for follow-up).
+- **2.12-C — Connection lifecycle in C.** New
+  `Hyperion::Http::PageCache.run_static_accept_loop` does
+  `accept4` + `recv` + path lookup + `write` entirely in a C tight
+  loop, returning to Ruby only on a route miss / TLS / h2 / WebSocket
+  upgrade. GVL released across syscalls. Auto-engages when the listener
+  is plain TCP and the route table contains only `StaticEntry`
+  registrations. **5,502 → 15,685 r/s (+185%, 2.85×) on `handle_static`
+  hello; p99 1.59 ms → 107 µs (15× tighter).** Falls through to the
+  existing Ruby accept loop on miss with no regression.
+- **2.12-D — io_uring accept loop (Linux 5.x+).** A multishot accept +
+  per-conn RECV/WRITE/CLOSE state machine on top of liburing. One
+  `io_uring_enter` per N requests instead of N×3 syscalls. Opt-in via
+  `HYPERION_IO_URING_ACCEPT=1` (default off until 2.13 production
+  soak). **15,685 → 134,084 r/s (+755%, 8.6×) on the same bench.**
+  Compiles out cleanly without liburing — the `accept4` path stays
+  the fallback. macOS keeps using `accept4` (no liburing).
+- **2.12-E — SO_REUSEPORT cluster-mode audit.** New per-worker request
+  metric (`requests_dispatch_total{worker_id="N"}`) ticks under every
+  dispatch mode (Rack, `handle_static`, h2, the C accept loops). New
+  audit harness `bench/cluster_distribution.sh` and a 4-worker, 30s
+  sustained-load bench: under steady state the SO_REUSEPORT hash
+  distributes within **1.004-1.011 max/min ratio** — production-grade,
+  measured. The cold-start swing (1.16× during the first second of
+  fresh boot) is documented as expected `SO_REUSEPORT + keep-alive`
+  behavior and matches what production L4 LBs already exhibit.
+- **2.12-F — gRPC support on h2.** Trailers (the `grpc-status` /
+  `grpc-message` final HEADERS frame), `TE: trailers` handling, h2
+  request half-close semantics. Rack 3 contract: a Rack body that
+  defines `#trailers` triggers the trailers wire shape automatically;
+  bodies that don't are byte-identical to 2.11.x h2. Smoke test against
+  the real `grpc` Ruby gem ships gated by `RUN_GRPC_SMOKE=1`; the
+  durable coverage is 11 unit specs driving real `protocol-http2`
+  framer + HPACK encode/decode + TLS.
+
+The 2.10-G TCP_NODELAY hunk, 2.10-E preload hooks, 2.10-F C-ext
+`rb_pc_serve_request`, 2.11-A dispatch pool warmup, and 2.11-B cglue
+HPACK default all preserved and verified by the 1143-spec suite.
+
+Full per-stream details, bench tables, and follow-up items in
+[`CHANGELOG.md`](CHANGELOG.md).
+
 ## What's new in 2.11.0
 
 **h2 cold-stream latency cut + native HPACK CGlue flipped to default.**

@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] - 2.12.0
+## 2.12.0 — 2026-05-01
 
 ### 2.12-F — gRPC support on h2
 
