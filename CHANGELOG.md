@@ -107,6 +107,27 @@ to the regular Ruby loop).
 Total: 1112 specs / 0 failures / 11 pending — +10 specs over
 the 2.12-B baseline (1102 / 0 / 11).
 
+**Bench (3 trials, median, openclaw-vm 16 vCPU Ubuntu 24.04 Linux 6.8.0,
+wrk -t4 -c100 -d20s, `bench/hello_static.ru`):**
+
+| Variant | r/s (median) | p99 |
+|---|---:|---:|
+| 2.12-B `handle_static` Hyperion (Ruby accept loop + C `serve_request`) | 5,502 | 1.59 ms |
+| **2.12-C `handle_static` Hyperion (C accept loop)** | **15,685** | **107 µs** |
+| Agoo 2.15.14 (reference) | 19,024 | 10.47 ms |
+
+`handle_static` hello: **2.85× over the 2.12-B baseline** (5,502 → 15,685).
+Gap to Agoo's 19,024 r/s closed from **3.46×** to **1.21×** — the
+2.12-C path is now within striking distance of Agoo on this row.
+Tail latency (p99) is now **107 µs**, an **15× improvement** over
+the 2.12-B 1.59 ms p99 and **97× better** than Agoo's 10.47 ms p99.
+
+The Rack-style fallback (`bench/hello.ru`, no `handle_static`) was
+re-checked: 4,648 r/s median (vs 4,477 r/s 2.12-B baseline — within
+bench noise, no regression). The C-loop path is only engaged when
+the operator opts in via `Server.handle_static` registration on
+every route; the regular dynamic-Rack path is unchanged.
+
 ### 2.12-B — Fresh 4-way re-bench (post-2.10/2.11 wins)
 
 The 4-way head-to-head in `docs/BENCH_HYPERION_2_0.md`
