@@ -141,6 +141,18 @@ module Hyperion
       # asked Ruby for the symbol/label). Each Connection lives in
       # exactly one process, so the cache is tight and never stale.
       @worker_id = Process.pid.to_s
+      # 2.13-A — pre-build the frozen single-element label tuple that
+      # `tick_worker_request` would otherwise allocate every request
+      # (`[@worker_id]` per call). Per-Connection caching is safe
+      # because @worker_id is process-constant and the tuple is
+      # frozen so consumers can't mutate the shared instance.
+      @worker_id_label_tuple = [@worker_id].freeze
+      # 2.13-A — register the labeled-counter family ONCE here (used
+      # to fire on every `tick_worker_request` via an `unless`-flag
+      # check; the early-return cost is small but real on the
+      # 8000 r/s -c1 single-thread profile).  After this, the
+      # request loop calls `increment_labeled_counter` directly.
+      @metrics.ensure_worker_request_family_registered!
       # 2.10-D — direct-dispatch route table.  The hot-path lookup
       # is `@route_table&.lookup(method, path)` so the nil-default
       # case (no operator-registered direct routes — the
@@ -320,7 +332,16 @@ module Hyperion
         # via `dispatch_request`, direct dispatch via `dispatch_direct!`,
         # and the StaticEntry fast path via `dispatch_direct_static!`
         # all flow through this point in `serve`.
-        @metrics.tick_worker_request(@worker_id)
+        #
+        # 2.13-A — call `increment_labeled_counter` directly with the
+        # pre-built frozen `[@worker_id]` tuple instead of going
+        # through `tick_worker_request`. The wrapper allocates a
+        # fresh `[label]` array AND calls `worker_id.to_s` per
+        # request; cached tuple skips both. Family registration was
+        # done once in the constructor (idempotent on the Metrics
+        # instance) so the request loop is registration-free.
+        @metrics.increment_labeled_counter(Hyperion::Metrics::REQUESTS_DISPATCH_TOTAL,
+                                           @worker_id_label_tuple)
         # 2.4-C: capture start time for the per-route duration histogram.
         # Same Process.clock_gettime that the access-log path was already
         # paying — at default-ON log_requests the second call here is
@@ -788,10 +809,35 @@ module Hyperion
       )
     end
 
+    # 2.13-A — Rack 3 (the version Hyperion advertises in
+    # `env['rack.version']`) requires response header keys to be
+    # lowercase Strings (Rack 3 spec §6.4 "Headers must be a Hash;
+    # the header keys must be lowercase Strings"). Pre-2.13-A this
+    # method scanned the whole Hash via `headers.find` + per-key
+    # `k.to_s.downcase` to find the Connection header — that's an
+    # O(N) walk + N transient string allocations on EVERY response
+    # (and most responses don't carry a Connection header at all,
+    # so the loop ran to completion every time).
+    #
+    # The new path is a single Hash lookup. Apps that violate the
+    # Rack 3 spec by returning mixed-case keys (some legacy gems
+    # still do; less common in 2026) lose the Connection-close
+    # signal and stay on keep-alive — that's a benign degradation
+    # (the connection is reused; the next request still goes through
+    # request-side `Connection: close` parsing) and the fix is to
+    # update the app to spec.
+    CONNECTION_HEADER_KEY_DOWNCASE = 'connection'
+
     def should_keep_alive?(request, _status, headers)
-      # App-emitted Connection: close wins.
-      conn_response = headers.find { |k, _| k.to_s.downcase == 'connection' }
-      return false if conn_response && conn_response.last.to_s.downcase == 'close'
+      # App-emitted Connection: close wins. Rack-3 fast path: O(1)
+      # Hash lookup; non-Hash headers (Array-of-pairs, etc.) fall
+      # back to a single allocation-free scan.
+      conn_response_value = if headers.is_a?(Hash)
+                              headers[CONNECTION_HEADER_KEY_DOWNCASE]
+                            else
+                              find_connection_header_array(headers)
+                            end
+      return false if conn_response_value && conn_response_value.to_s.downcase == 'close'
 
       # Request-side Connection header.
       conn_request = request.header('connection')&.downcase
@@ -804,6 +850,21 @@ module Hyperion
       else
         false
       end
+    end
+
+    # 2.13-A — non-Hash headers fallback (Array of [key, value] pairs).
+    # Rack 3 mandates Hash, but legacy code occasionally returns an
+    # Array; we walk it case-sensitively because Rack-3 lowercase is
+    # part of the contract for non-Hash returns too. Apps emitting
+    # `'Connection'`-cased keys via Array form fall through to no-
+    # match and stay on keep-alive — same benign degradation as the
+    # Hash branch.
+    def find_connection_header_array(headers)
+      headers.each do |pair|
+        next unless pair.is_a?(Array) && pair.length >= 2
+        return pair[1] if pair[0] == CONNECTION_HEADER_KEY_DOWNCASE
+      end
+      nil
     end
 
     def set_idle_timeout(socket)

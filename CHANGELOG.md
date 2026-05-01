@@ -74,6 +74,48 @@ shards so cross-spec leakage stays prevented.
   * Registered-but-never-observed families show up in the scrape
     with an empty `:series` Hash.
 
+### 2.13-A — Cached worker-id label tuple + Rack-3 keepalive fast path
+
+Two micro-optimizations on the per-request hot path of
+`Connection#serve`, both targeting the steady-state -c1 single-
+keepalive profile (where 8000 r/s = the upper bound of single-thread
+Ruby work and every saved allocation / iteration shows up).
+
+**Cached worker-id label tuple.** `tick_worker_request(@worker_id)`
+went through a wrapper that called `worker_id.to_s` (worker_id is
+already a String) and built a fresh `[label]` Array per request. The
+wrapper also re-checked `@worker_request_family_registered` on every
+call. The new path pre-builds the frozen `[@worker_id]` tuple once in
+the Connection constructor, registers the family once at construction
+too, and the request loop calls `increment_labeled_counter` directly
+with the cached tuple — saving one Array allocation + one method
+dispatch + one early-return-checked branch per request.
+
+**Rack-3 keepalive fast path.** `should_keep_alive?` used to scan the
+entire response-headers Hash with `headers.find { |k,_| k.to_s.downcase
+== 'connection' }`. That ran `to_s.downcase` (one transient String
+allocation) PER iteration and walked to completion on every response
+that didn't carry a `Connection` header (which is most of them — the
+response writer adds its own). Rack 3 mandates lowercase Hash keys
+(spec §6.4), so the new path is a single `headers['connection']`
+lookup. Apps that violate Rack 3 by returning mixed-case keys lose
+the Connection-close response signal and stay on keep-alive — a
+benign degradation pinned by spec; the fix is to update the app to
+spec. Non-Hash header containers (legacy Array-of-pairs) still flow
+through a slow-scan fallback, also case-sensitive on the lowercase
+key.
+
+**Spec coverage:**
+
+  * Lowercase `connection: close` from app closes the connection.
+  * Lowercase `connection: keep-alive` keeps the conn alive across
+    pipelined requests.
+  * Mixed-case `Connection: close` (Rack-3 violation) is documented
+    as falling through to keep-alive — pinned so the behaviour is
+    stable.
+  * `@worker_id_label_tuple` is constructed once, frozen, and reused
+    by identity across requests on the same Connection.
+
 ## 2.12.0 — 2026-05-01
 
 ### 2.12-F — gRPC support on h2

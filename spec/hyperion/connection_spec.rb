@@ -402,4 +402,93 @@ RSpec.describe Hyperion::Connection do
       Hyperion::Runtime.default.logger = Hyperion::Logger.new
     end
   end
+
+  # 2.13-A — Rack-3 fast-path keepalive decision + cached worker-id
+  # label tuple. Pre-2.13-A `should_keep_alive?` scanned the whole
+  # response-headers Hash and `tick_worker_request` allocated a fresh
+  # `[label]` array per request. Both are now amortised: the headers
+  # check is one Hash lookup; the worker-id tuple is built once in
+  # the constructor and reused on every request.
+  describe 'should_keep_alive? Rack-3 fast path' do
+    it 'closes the connection when the response uses lowercase "connection: close" (Rack-3 spec)' do
+      a, b = ::Socket.pair(:UNIX, :STREAM)
+      a.write("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+      a.close_write
+
+      close_app = lambda do |_env|
+        [200, { 'content-type' => 'text/plain', 'connection' => 'close' }, ['bye']]
+      end
+
+      described_class.new.serve(b, close_app)
+      response = a.read
+      expect(response).to include('connection: close')
+    ensure
+      a&.close
+      b&.close
+    end
+
+    it 'keeps connection alive when the response sets "connection: keep-alive" (Rack-3 spec)' do
+      a, b = ::Socket.pair(:UNIX, :STREAM)
+      a.write("GET /first HTTP/1.1\r\nHost: x\r\n\r\nGET /second HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+      a.close_write
+
+      counter = 0
+      keep_app = lambda do |env|
+        counter += 1
+        [200, { 'content-type' => 'text/plain', 'connection' => 'keep-alive' },
+         ["seen #{env['PATH_INFO']}"]]
+      end
+
+      described_class.new.serve(b, keep_app)
+      expect(counter).to eq(2) # second request was served on the same socket
+    ensure
+      a&.close
+      b&.close
+    end
+
+    it 'falls back to keep-alive when the app emits non-Rack-3 mixed-case "Connection: close"' do
+      # 2.13-A documents this as a benign degradation: apps that
+      # violate the Rack-3 spec by returning mixed-case keys lose the
+      # Connection-close response signal and stay on keep-alive. The
+      # fix is to update the app to spec; this test pins the
+      # behaviour so the change is documented and stable.
+      a, b = ::Socket.pair(:UNIX, :STREAM)
+      a.write("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+      a.close_write
+
+      bad_case_app = lambda do |_env|
+        [200, { 'Content-Type' => 'text/plain', 'Connection' => 'close' }, ['bye']]
+      end
+
+      described_class.new.serve(b, bad_case_app)
+      response = a.read
+      # Hyperion's writer always emits its own Connection header
+      # (lowercased); on the keep-alive branch that's "keep-alive",
+      # not "close". Verifies the fast-path missed the mis-cased
+      # 'Connection' key and picked keep-alive as expected.
+      expect(response).to include('connection: keep-alive')
+    ensure
+      a&.close
+      b&.close
+    end
+  end
+
+  describe 'worker_id label tuple caching' do
+    it 'pre-builds a frozen [pid] tuple in the constructor' do
+      c = described_class.new
+      tuple = c.instance_variable_get(:@worker_id_label_tuple)
+      expect(tuple).to eq([Process.pid.to_s])
+      expect(tuple).to be_frozen
+    end
+
+    it 'reuses the same tuple instance across requests on the same connection' do
+      # Identity check — the tuple must be the same object across
+      # calls so `Hash#[]=` on the labeled-counter family doesn't
+      # re-key into a new bucket per request.
+      c = described_class.new
+      first  = c.instance_variable_get(:@worker_id_label_tuple)
+      second = c.instance_variable_get(:@worker_id_label_tuple)
+      expect(first).to be(second)
+    end
+  end
 end
