@@ -1,5 +1,34 @@
 # Changelog
 
+## [Unreleased] - 2.9.0
+
+### 2.9-A — sendfile chunk-size A/B on fresh host (2.6-A delta quantified)
+
+The 2.7-A bisect found that 2.6-A's "+20.7% rps from chunk size 64 KiB
+→ 256 KiB" was measured against a degraded-host baseline; both numbers
+were ~3× lower than the algorithmic floor. 2.9-A re-runs the A/B on
+the fresh-boot host to quantify the actual chunk-size delta.
+
+**Method.** `lib/hyperion/http/sendfile.rb` `USERSPACE_CHUNK` toggled
+between `256 * 1024` (current default) and `64 * 1024` (pre-2.6-A
+value). Same harness: `bin/hyperion -t 5 -w 1`, 1 MiB asset,
+`wrk -t4 -c100 -d20s`, 3 runs each, take median.
+
+| Config | Run 1 | Run 2 | Run 3 | Median |
+|---|---:|---:|---:|---:|
+| 256 KiB (current) | 2,958 | 3,359 | 3,374 | **3,358 r/s** |
+| 64 KiB (pre-2.6-A) | 3,128 | 3,424 | 2,933 | **3,128 r/s** |
+
+**Verdict.** **+7.4% rps for 256 KiB**, p99 essentially identical
+(2.4-2.86 ms across both configs — the chunk-size change does not
+affect tail latency). Real but smaller than the 2.6-A "+20.7%" claim.
+The headline win is preserved (256 KiB matches nginx/Apache defaults,
+4× fewer syscalls per 1 MiB request) and corroborated by the bench;
+the inflated number from 2.6-A's degraded-host baseline is now
+corrected.
+
+**No code changes from 2.9-A.** `USERSPACE_CHUNK` stays at 256 KiB.
+
 ## [2.8.0] - 2026-05-01
 
 ### Headline
