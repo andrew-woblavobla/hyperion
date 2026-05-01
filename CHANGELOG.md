@@ -2,6 +2,83 @@
 
 ## [Unreleased] - 2.7.0
 
+### 2.7-A — Static 1 MiB regression bisect — DEFERRED
+
+**Status: DEFERRED.** openclaw-vm bench host was offline at the 2.7-A
+landing window (SSH `Operation timed out` / `No route to host` from the
+controller session across 10+ retries spaced 30s apart; host appears
+powered off). Bisect across `v2.0.1 → v2.6.0` is queued for the next
+available bench window.
+
+**Background.** The 2.6-E audit flagged that the static 1 MiB row
+drifted from 2.0.1's published **1,697 r/s** to today's **1,228 r/s**
+— a **-28% slide** on the production-relevant row. Three hypotheses
+remain open and the bisect is needed to discriminate between them:
+
+1. **Bench-host degradation** (kernel updates, TIME_WAIT pile-up,
+   contention from other procs on openclaw-vm) — under this hypothesis
+   all v2.x tags would show ~1,200 r/s today and the floor has simply
+   drifted; the published 1,697 r/s number reflected 2026-04-29 host
+   conditions and the relative Hyperion-vs-Puma comparison still holds.
+2. **Genuine Hyperion regression** hidden by misframed numbers — some
+   tag between 2.0.1 and 2.6.0 dropped rps and we never noticed because
+   the bench number we were tracking was wrong.
+3. **Ruby / glibc / wrk version updates** between then and now — the
+   bench-host's toolchain was upgraded under our feet.
+
+**Partial data point captured before the host went offline.** A single
+v2.6.0 sanity run on this same host completed during script
+verification:
+
+| Tag    | Run 1 r/s | Run 2 r/s | Run 3 r/s | Median r/s | p99    |
+|--------|-----------|-----------|-----------|------------|--------|
+| v2.6.0 | 1231.41   | 1230.06   | 1128.41   | **1230.06**| 6.10ms |
+
+That confirms the v2.6.0 / 1,228 r/s figure is reproducible on the
+current host. The other six tags are still unmeasured.
+
+**To resume when openclaw-vm is back.** The bisect script lives at
+`~/bench-bisect-2.7-A/bisect.sh` on openclaw-vm; the wrapper at
+`~/bench-bisect-2.7-A/run_all.sh` walks all seven tags:
+
+```sh
+ssh ubuntu@openclaw-vm
+cd ~/bench-bisect-2.7-A
+nohup setsid bash run_all.sh </dev/null >/dev/null 2>&1 &
+disown
+# wait ~14 min, then:
+grep -E "^  v2\." run_all.log
+```
+
+The script:
+
+1. Checks out each tag in `~/hyperion-fresh` (a separate git checkout —
+   does NOT touch `~/hyperion`, which is the symlink target the live
+   `~/bench/Gemfile` points at).
+2. Rebuilds `ext/hyperion_http` (and `ext/hyperion_h2_codec` if the
+   tag has it) against the tag's source.
+3. Runs three 20s wrk passes per tag (`-t4 -c100`,
+   `http://127.0.0.1:9750/hyperion_bench_1m.bin`, 1 MiB asset).
+4. Logs `rps=… p99=…` per run; the maintainer takes the median of 3.
+
+The wrapper Gemfile lives at `~/bench-bisect-2.7-A/Gemfile` and uses
+`gem "hyperion-rb", path: "/home/ubuntu/hyperion-fresh"` so the bisect
+is fully isolated from `~/bench/Gemfile`'s production path.
+
+**Decision tree (unchanged from 2.7-A spec).**
+
+- **All tags ~1,200 r/s (within ±10%):** bench-host drift; accept the
+  new baseline; document `2026-05-01 floor = ~1,200 r/s` as an
+  addendum on `docs/BENCH_HYPERION_2_0.md`. No fix.
+- **Clean step-down at one tag (e.g. v2.0.1 → v2.1.0 drops 400+ r/s,
+  later tags flat):** real regression. Bisect commits inside that
+  tag's range; suspect files: `lib/hyperion/connection.rb`,
+  `lib/hyperion/adapter/rack.rb`, `lib/hyperion/response_writer.rb`.
+  File the FIX as **2.7-A-followup** (separate commit) — this 2.7-A
+  entry stays doc-only.
+- **Variance > 30% within a single tag:** bench host too noisy for
+  bisect; defer again to a quieter window.
+
 ### 2.7-C — Generic SSE rackup (drops the Hyperion-flush sentinel)
 
 Bench/docs only — no production code.
