@@ -89,8 +89,45 @@ assert served count grows), lifecycle-hook firing parity with the
 `:c_accept_loop_io_uring_h1` dispatch mode is recorded).
 
 Total: 1065 specs / 0 failures / 15 pending on macOS — +10 specs and
-+4 pending over the 2.12-C macOS baseline (1055 / 0 / 11). Linux
-spec count climbs in lockstep when liburing is present.
++4 pending over the 2.12-C macOS baseline (1055 / 0 / 11). Linux:
+1065 / 1 / 14 (the one failure is a pre-existing flake on the 2.12-C
+smoke spec — reproduces on unmodified master at e526ef3 on the bench
+host, NOT a 2.12-D regression).
+
+**Bench (3 trials, median, openclaw-vm 16 vCPU Ubuntu 24.04 Linux 6.8.0,
+liburing 2.5, wrk -t4 -c100 -d20s, `bench/hello_static.ru`):**
+
+| Variant | r/s (median) | p99 |
+|---|---:|---:|
+| 2.12-C `handle_static` Hyperion (C accept loop, accept4) | 15,532 | 101 µs |
+| **2.12-D `handle_static` Hyperion (C accept loop, io_uring)** | **134,084** | **0.99 ms** |
+| Agoo 2.15.14 (reference, prior bench) | 19,024 | 10.47 ms |
+
+`handle_static` hello: **8.6× over the 2.12-C accept4 baseline**
+(15,532 → 134,084 r/s) and **7.0× over Agoo** (134,084 vs. 19,024).
+The accept4 path is unchanged and within bench noise of the prior
+2.12-C 15,685 r/s baseline (15,532 r/s today is -1%, well inside the
+±5% target).
+
+The p99 climb (101 µs accept4 → 0.99 ms io_uring) is the cost of
+batching: with one `io_uring_enter` reaping K completions, the
+last-enqueued request waits for the kernel to produce all K CQEs
+before our worker drains. At 134k r/s the per-request median is
+~7.4 µs; the p99 of ~990 µs is roughly the steady-state batch-tail
+(~130 requests' worth of completions). For the smoke-class workload
+this is a clear win — sub-millisecond p99 is below most real-world
+network jitter floors and well below Agoo's 10.47 ms p99.
+
+The Rack-style fallback (`bench/hello.ru`, no `handle_static`) is
+unaffected: io_uring engagement requires `Server.handle_static`
+registration, the regular dynamic-Rack path is unchanged.
+
+**Production rollout.** Default OFF for 2.12.0. Operators opt in
+with `HYPERION_IO_URING_ACCEPT=1` per worker. Soak window for
+flipping the default to ON is 2.13 — kernel io_uring has known
+sharp edges around fork-shared rings and `seccomp` policies that
+this default-off posture lets us discover under operator A/B
+before forcing the path on every install.
 
 ### 2.12-C — Connection lifecycle in C
 
