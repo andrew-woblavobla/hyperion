@@ -44,6 +44,40 @@ module Hyperion
         env.nil? || !%w[0 off false no].include?(env.downcase)
       end
 
+      # 2.12-D — whether to engage the io_uring accept loop variant
+      # over the 2.12-C `accept4` loop. All four conditions must hold:
+      #
+      #   1. Operator opted in via `HYPERION_IO_URING_ACCEPT=1`. This
+      #      is OFF by default for 2.12.0 — flipping the default to ON
+      #      is a 2.13 decision after production-soak.
+      #   2. The C ext was compiled with `HAVE_LIBURING` (probed at
+      #      gem-install time via `extconf.rb` — needs `liburing-dev`
+      #      headers). Builds without it ship the stub method that
+      #      returns `:unavailable` regardless of the env var.
+      #   3. `Hyperion::Http::PageCache.run_static_io_uring_loop` is
+      #      defined (paranoia: the symbol always exists on builds
+      #      that loaded the C ext, but the check keeps us from
+      #      NameError'ing on partial installs).
+      #   4. A liburing runtime probe — opening a tiny ring with
+      #      `io_uring_queue_init`. The probe lives inside the C
+      #      method itself (`run_static_io_uring_loop` returns
+      #      `:unavailable` if `io_uring_queue_init` fails); we
+      #      don't pre-probe here because that would require holding
+      #      a ring open across the eligibility check, and the
+      #      penalty for "engaged but probe-fail at run time" is
+      #      one cheap fall-through to the `accept4` path.
+      def io_uring_eligible?
+        return false unless available?
+        return false unless ::Hyperion::Http::PageCache.respond_to?(:run_static_io_uring_loop)
+        return false unless ::Hyperion::Http::PageCache.respond_to?(:io_uring_loop_compiled?) &&
+                            ::Hyperion::Http::PageCache.io_uring_loop_compiled?
+
+        env = ENV['HYPERION_IO_URING_ACCEPT']
+        return false unless env
+
+        %w[1 on true yes].include?(env.downcase)
+      end
+
       # Whether the route table is C-loop eligible: only `StaticEntry`
       # handlers, at least one of them, no dynamic handlers anywhere.
       def eligible_route_table?(route_table)

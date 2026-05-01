@@ -461,15 +461,37 @@ module Hyperion
       pc.set_lifecycle_active(@runtime.has_request_hooks?)
       pc.set_handoff_callback(ConnectionLoop.build_handoff_callback(self))
 
-      mode = DispatchMode.new(:c_accept_loop_h1)
+      # 2.12-D — io_uring path takes precedence over accept4 when the
+      # operator opted in AND the runtime probe at boot succeeds. The
+      # C-side `run_static_io_uring_loop` returns `:unavailable` if
+      # `io_uring_queue_init` fails; we treat that as "fall back to
+      # the 2.12-C accept4 path" without operator intervention. A
+      # `:crashed` from io_uring also falls back — the contract
+      # mirrors 2.12-C's `:crashed -> Ruby accept loop`.
+      use_io_uring = ConnectionLoop.io_uring_eligible?
+      mode_name = use_io_uring ? :c_accept_loop_io_uring_h1 : :c_accept_loop_h1
+      mode = DispatchMode.new(mode_name)
       record_dispatch(mode)
       runtime_logger.info do
         { message: 'engaging C accept loop',
+          variant: use_io_uring ? :io_uring : :accept4,
           static_routes: @route_table.size,
           host: @host,
           port: @port }
       end
-      result = pc.run_static_accept_loop(@tcp_server.fileno)
+      result = if use_io_uring
+                 io_uring_result = pc.run_static_io_uring_loop(@tcp_server.fileno)
+                 if io_uring_result == :unavailable
+                   runtime_logger.warn do
+                     { message: 'io_uring runtime probe failed; falling back to accept4 loop' }
+                   end
+                   pc.run_static_accept_loop(@tcp_server.fileno)
+                 else
+                   io_uring_result
+                 end
+               else
+                 pc.run_static_accept_loop(@tcp_server.fileno)
+               end
       if result == :crashed
         runtime_logger.warn do
           { message: 'C accept loop crashed; falling back to Ruby accept loop' }
@@ -484,7 +506,8 @@ module Hyperion
         end
       else
         runtime_logger.info do
-          { message: 'C accept loop exited', requests_served: result.to_i }
+          { message: 'C accept loop exited', requests_served: result.to_i,
+            variant: use_io_uring ? :io_uring : :accept4 }
         end
         runtime_metrics.increment(:c_accept_loop_requests, result.to_i)
       end
@@ -513,7 +536,7 @@ module Hyperion
       socket = ::Socket.for_fd(fd)
       socket.autoclose = true
       apply_timeout(socket)
-      if partial && !partial.empty?
+      if partial.present?
         # Stash the partial bytes on a per-fd map so Connection can
         # read them as if they were the next chunk the kernel produced.
         # We attach the buffer as the Connection's `@inbuf` ivar

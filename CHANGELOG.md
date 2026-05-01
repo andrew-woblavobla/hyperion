@@ -2,6 +2,96 @@
 
 ## [Unreleased] - 2.12.0
 
+### 2.12-D — io_uring accept loop (Linux 5.x)
+
+The 2.12-C `accept4` loop closed most of the gap to Agoo on the
+`handle_static` hello row (5,502 → 15,685 r/s, 1.21× from parity).
+Looking at the remaining cost on Linux: the worker thread does
+**three** syscalls per request — `accept4` + `recv` + `write`. On a
+host that delivers ~150 ns of syscall entry/exit overhead each, that's
+~450 ns of pure kernel-mode bookkeeping per request, before any I/O
+actually happens.
+
+io_uring lets us collapse the train. We submit ACCEPT/RECV/WRITE/CLOSE
+SQEs to a per-worker ring; the worker thread does **one**
+`io_uring_enter` per cycle and reaps N completions in a single
+syscall round-trip. Steady-state cost goes from N×3 syscalls to
+~N÷K × 1 syscall (where K is the burst-batch size the kernel
+naturally delivers).
+
+**New C exports** on `Hyperion::Http::PageCache`:
+
+  - `run_static_io_uring_loop(listen_fd) -> Integer | :crashed | :unavailable`
+    drives the io_uring accept-and-serve loop. Same wire contract as
+    `run_static_accept_loop`: only `handle_static` routes, plain TCP,
+    GET/HEAD without a body, HTTP/1.1 only. Returns `:unavailable` if
+    the C ext was built without `liburing` OR the runtime
+    `io_uring_queue_init` probe failed (seccomp / locked-down
+    container / kernel < 5.5). The Ruby caller treats `:unavailable`
+    as "fall through to the 2.12-C `accept4` path" — operator gets a
+    one-line warn-level log, no surprise downtime.
+  - `io_uring_loop_compiled?` — boolean, true when the C ext was
+    built with `HAVE_LIBURING`. Cheap eligibility check that lets
+    `ConnectionLoop#io_uring_eligible?` skip the env-var read on
+    builds where the path can't engage anyway.
+
+**Build.** `extconf.rb` probes for `liburing` in two passes:
+
+  1. `pkg-config --exists liburing` — picks up Debian/Ubuntu's
+     pkg-config metadata and adds the right `-L`/`-l` flags.
+  2. `have_header('liburing.h')` + `have_library('uring', ...)` —
+     covers the no-pkg-config path.
+
+On success, `-DHAVE_LIBURING` lands and the io_uring loop compiles.
+On failure, the same `io_uring_loop.c` translation unit compiles to
+a thin stub that returns `:unavailable`. Soft-optional dependency:
+hosts without liburing-dev still build cleanly and ship the 2.12-C
+behaviour.
+
+**Wiring.** `Hyperion::Server::ConnectionLoop.io_uring_eligible?`
+returns true when ALL hold:
+
+  1. The C accept-loop path is available
+     (`ConnectionLoop.available?`).
+  2. The C ext was compiled with `HAVE_LIBURING`.
+  3. `HYPERION_IO_URING_ACCEPT=1` is set (default OFF in 2.12 — the
+     soak window before flipping the default to ON is 2.13 or later).
+
+When eligible, `Server#run_c_accept_loop` calls
+`run_static_io_uring_loop` first; on `:unavailable` (runtime probe
+fail) it falls through to `run_static_accept_loop`. A new
+`:c_accept_loop_io_uring_h1` `DispatchMode` symbol counts engagements
+under `requests_dispatch_c_accept_loop_io_uring_h1`.
+
+**Lifecycle hooks.** Same contract as 2.12-C: per-request
+`Runtime#fire_request_start` / `#fire_request_end` fire on every
+request the io_uring loop served. `env=nil`, minimal `Hyperion::Request`
+passed. The C-side `lifecycle_active?` flag gates the GVL re-acquisition
+(`rb_thread_call_with_gvl`); the no-hook hot path stays GVL-free for
+the whole `submit_and_wait` cycle.
+
+**Handoff.** Same set of "send to Ruby" triggers as 2.12-C: HTTP/1.0,
+`Content-Length` / `Transfer-Encoding`, `Upgrade`, `HTTP2-Settings`,
+`Connection: upgrade`, malformed framing, header section >64 KiB,
+unknown method, path miss. Ruby resumes ownership via the same
+`dispatch_handed_off` path the 2.12-C loop already uses.
+
+**TCP_NODELAY.** Applied per-accept via the shared
+`pc_internal_apply_tcp_nodelay` wrapper — preserves the 2.10-G hunk.
+
+**Tests.** `spec/hyperion/io_uring_loop_spec.rb` covers the Ruby
+surface (always exposed), the stub `:unavailable` return on
+non-Linux / no-liburing builds, eligibility-gate semantics
+(`HYPERION_IO_URING_ACCEPT` env var honoured, compile-time flag
+honoured), and — gated on `HAVE_LIBURING` — a smoke test (5 GETs,
+assert served count grows), lifecycle-hook firing parity with the
+2.12-C contract, and Server-level engagement (the
+`:c_accept_loop_io_uring_h1` dispatch mode is recorded).
+
+Total: 1065 specs / 0 failures / 15 pending on macOS — +10 specs and
++4 pending over the 2.12-C macOS baseline (1055 / 0 / 11). Linux
+spec count climbs in lockstep when liburing is present.
+
 ### 2.12-C — Connection lifecycle in C
 
 The 2.12-B re-bench made it clear that Hyperion's `handle_static`

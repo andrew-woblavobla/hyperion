@@ -55,8 +55,17 @@ module Hyperion
     # at engage time (one bump per worker boot) so operators can see
     # the path is on without scraping the per-request `:c_accept_loop_requests`
     # counter.
+    # 2.12-D — `:c_accept_loop_io_uring_h1` is a sibling of
+    # `:c_accept_loop_h1`. Engaged when the operator opts into
+    # `HYPERION_IO_URING_ACCEPT=1` AND the C ext was compiled with
+    # liburing AND the runtime probe succeeded. Same eligibility gates
+    # as `:c_accept_loop_h1` (handle_static-only routes, plain TCP),
+    # different syscall shape (single `io_uring_enter` per N requests
+    # vs. N×3 syscalls). Counted under
+    # `:requests_dispatch_c_accept_loop_io_uring_h1` so operators can
+    # confirm the path is on without scraping logs.
     MODES = %i[tls_h2 tls_h1_inline async_io_h1_inline threadpool_h1 inline_h1_no_pool
-               inline_blocking c_accept_loop_h1].freeze
+               inline_blocking c_accept_loop_h1 c_accept_loop_io_uring_h1].freeze
 
     INLINE_MODES = %i[tls_h1_inline async_io_h1_inline inline_h1_no_pool inline_blocking].freeze
 

@@ -109,6 +109,12 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 
+/* Internal sharing surface — extern wrappers around the static helpers
+ * below, exposed to the 2.12-D io_uring sibling translation unit
+ * (`io_uring_loop.c`). The wrappers are defined in this file (next to
+ * the static helpers they wrap) and declared in `page_cache_internal.h`. */
+#include "page_cache_internal.h"
+
 /* Shared identifiers / refs.  parser.c and sendfile.c each register their
  * own copies of Hyperion / Hyperion::Http (lazy-define if missing); we
  * follow the same pattern so init order doesn't matter. */
@@ -1853,6 +1859,98 @@ static VALUE rb_pc_max_key_len(VALUE self) {
     return INT2NUM(HYP_PC_MAX_KEY_LEN);
 }
 
+/* ============================================================
+ * 2.12-D — sharing surface for io_uring_loop.c.
+ *
+ * Thin extern wrappers around the static helpers above. The io_uring
+ * loop calls these once per request; the indirection cost is one
+ * direct-call jump and is dominated by the syscall savings. Defined
+ * here (rather than promoted-static) so the helpers' signatures stay
+ * file-local and we don't accidentally widen the public surface of
+ * the C ext. */
+
+long pc_internal_find_eoh(const char *buf, size_t len) {
+    return hyp_cl_find_eoh(buf, len);
+}
+
+long pc_internal_parse_request_line(const char *buf, size_t len,
+                                    size_t *m_off, size_t *m_len,
+                                    size_t *p_off, size_t *p_len) {
+    return hyp_cl_parse_request_line(buf, len, m_off, m_len, p_off, p_len);
+}
+
+int pc_internal_scan_headers(const char *buf, size_t start, size_t end,
+                             int *connection_close, int *has_body,
+                             int *upgrade_seen) {
+    return hyp_cl_scan_headers(buf, start, end, connection_close, has_body,
+                               upgrade_seen);
+}
+
+pc_internal_method_t pc_internal_classify_method(const char *m, size_t len) {
+    hyp_pc_method_t k = hyp_pc_classify_method(m, len);
+    switch (k) {
+    case HYP_PC_METHOD_GET:  return PC_INTERNAL_METHOD_GET;
+    case HYP_PC_METHOD_HEAD: return PC_INTERNAL_METHOD_HEAD;
+    default:                 return PC_INTERNAL_METHOD_OTHER;
+    }
+}
+
+char *pc_internal_snapshot_response(const char *path, size_t path_len,
+                                    pc_internal_method_t kind,
+                                    size_t *out_len) {
+    *out_len = 0;
+    if (path_len == 0 || path_len > HYP_PC_MAX_KEY_LEN) {
+        return NULL;
+    }
+    pthread_mutex_lock(&hyp_pc_lock);
+    int was_stale = 0;
+    hyp_page_slot_t *slot = hyp_pc_lookup_locked(path, path_len, &was_stale);
+    if (slot == NULL) {
+        pthread_mutex_unlock(&hyp_pc_lock);
+        return NULL;
+    }
+    size_t write_len = (kind == PC_INTERNAL_METHOD_HEAD)
+                           ? slot->page->headers_len
+                           : slot->page->response_len;
+    char *snapshot = (char *)malloc(write_len);
+    if (snapshot == NULL) {
+        pthread_mutex_unlock(&hyp_pc_lock);
+        return NULL;
+    }
+    memcpy(snapshot, slot->page->response_buf, write_len);
+    pthread_mutex_unlock(&hyp_pc_lock);
+    *out_len = write_len;
+    return snapshot;
+}
+
+void pc_internal_apply_tcp_nodelay(int fd) {
+    hyp_cl_apply_tcp_nodelay(fd);
+}
+
+void pc_internal_fire_lifecycle(const char *method, size_t mlen,
+                                const char *path, size_t plen) {
+    hyp_cl_fire_lifecycle(method, mlen, path, plen);
+}
+
+int pc_internal_lifecycle_active(void) {
+    return hyp_cl_lifecycle_active;
+}
+
+void pc_internal_handoff(int client_fd, const char *partial, size_t partial_len) {
+    hyp_cl_handoff(client_fd, partial, partial_len);
+}
+
+int pc_internal_stop_requested(void) {
+    return hyp_cl_stop ? 1 : 0;
+}
+
+/* Belt-and-suspenders: keep the io_uring sibling's view of the header
+ * cap in sync with this file's. Compile-time check via array sizing
+ * (we deliberately avoid C11 `_Static_assert` for portability with the
+ * older toolchains some linux distros still ship). */
+typedef int pc_internal_header_cap_check_t
+    [(HYP_CL_MAX_HEADER_BYTES == PC_INTERNAL_MAX_HEADER_BYTES) ? 1 : -1];
+
 void Init_hyperion_page_cache(void) {
     rb_mHyperion_pc = rb_const_get(rb_cObject, rb_intern("Hyperion"));
 
@@ -1928,4 +2026,13 @@ void Init_hyperion_page_cache(void) {
     rb_gc_register_mark_object(sym_stale_pc);
     rb_gc_register_mark_object(sym_missing_pc);
     rb_gc_register_mark_object(sym_miss_pc);
+
+    /* 2.12-D — register the io_uring sibling. The init defines the
+     * `run_static_io_uring_loop` Ruby method on the same module
+     * (`Hyperion::Http::PageCache`) and lazy-initialises any per-process
+     * io_uring state. On non-Linux / no-liburing builds the registered
+     * method returns the `:unavailable` symbol so the Ruby caller can
+     * fall through to the 2.12-C accept4 path. */
+    extern void Init_hyperion_io_uring_loop(VALUE mPageCache);
+    Init_hyperion_io_uring_loop(rb_mHyperionHttpPageCache);
 }
