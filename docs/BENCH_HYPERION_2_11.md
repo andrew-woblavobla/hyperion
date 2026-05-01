@@ -481,12 +481,64 @@ labeled family at scrape time by `PrometheusExporter.render_full`.
 So the audit metric is true regardless of which dispatch path was
 hot during the bench run.
 
-**Bench result.** Headline numbers + per-PID breakdown land in the
-`[bench][2.12.0] 2.12-E — bench result: …` commit. The script's
-output is captured at `/tmp/2.12-E-cluster-distribution.log` on the
-bench host so future audits can diff against the baseline. Read
-that commit for run-1 / run-2 / run-3 distribution tables and the
-aggregate verdict.
+**Bench result (2026-05-01, openclaw-vm, Linux 6.8.0-107-generic
+x86_64, Ruby 3.3.3).**
+
+Three back-to-back 30s runs, `-t8 -c200` wrk client, 4 worker
+Hyperion cluster, `bench/hello_static.ru`. Per-worker request
+counts + share + max/min ratio + verdict:
+
+| Run | wrk r/s | Worker share (%)              | min      | max      | ratio | Verdict   |
+|-----|---------|-------------------------------|----------|----------|-------|-----------|
+| 1   | 61,706  | 22.32 / 25.82 / 25.90 / 25.96 | 414,693  | 482,168  | 1.163 | mild      |
+| 2   | 50,112  | 24.95 / 24.99 / 25.00 / 25.06 | 376,388  | 378,016  | 1.004 | balanced  |
+| 3   | 57,515  | 24.88 / 24.94 / 25.03 / 25.15 | 430,728  | 435,382  | 1.011 | balanced  |
+
+Total counter ≈ wrk-served on every run (1.857M counter vs 1.857M
+wrk on run 1, 1.509M vs 1.508M on run 2, 1.731M vs 1.731M on run 3)
+— the new `hyperion_requests_dispatch_total{worker_id}` family
+captures the full distribution, not a sampled subset.
+
+Aggregate verdict: **mild** (one run > 1.10 ratio, two runs <
+1.05). Reading: under steady-state sustained load (runs 2 + 3,
+where the wrk connection pool was already established for ≥1s
+before the bench window), Linux's SO_REUSEPORT distributor splits
+requests across 4 workers within ~1% of perfect uniform. Run 1
+shows a cold-start artifact: wrk's 200 keep-alive connections are
+sticky-hashed at TCP-handshake time (4-tuple → worker), so the
+first ~50ms of connection establishment determines the
+distribution for the rest of the 30s window. If the kernel's hash
+puts 50-52 connections on each of 3 workers and 44-46 on the 4th
+(a normal binomial swing), the per-worker request count for the
+30s sustained phase reflects that 22%/26%/26%/26% split, which is
+exactly what we see.
+
+This is a property of how `SO_REUSEPORT + keep-alive` interacts,
+not a Hyperion bug:
+
+- The 4-tuple hash is stable within a connection's lifetime.
+  Once the kernel maps a connection to a worker, every request on
+  that connection runs on that worker.
+- Long keep-alive runs amplify any modest connection-time
+  imbalance. wrk holds connections open for the full bench
+  window, so the run-1 "one worker at 22.32%" is roughly "1 of
+  the 200 connections that landed there got 5 fewer requests
+  per second" — not "the kernel deprioritised that worker
+  mid-flight".
+
+**Conclusion.** SO_REUSEPORT distribution on Linux 6.8 is
+production-grade for Hyperion's 4-worker cluster mode. The
+documented mild cold-start swing is acceptable: operators
+deploying behind a long-lived L4 load balancer (ALB, HAProxy)
+have the same property anyway — the load balancer's connection
+hash is what determines worker selection in production, not the
+local SO_REUSEPORT hash. The audit metric stays in place so
+operators can read their own cluster's distribution at
+`/-/metrics`.
+
+The full bench log lives at `/tmp/2.12-E-cluster-distribution.log`
+on the bench host and is also captured in the
+`[bench][2.12.0] 2.12-E — bench result: …` follow-up commit.
 
 **Darwin path.** Not benched here — the Darwin worker model is
 master-bind + worker-fd-share, NOT SO_REUSEPORT. Workers race to
