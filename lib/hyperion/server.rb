@@ -704,10 +704,35 @@ module Hyperion
         timeval = [@read_timeout, 0].pack('l_l_')
         target.setsockopt(::Socket::SOL_SOCKET, ::Socket::SO_RCVTIMEO, timeval)
       end
+      apply_tcp_nodelay(target)
     rescue StandardError => e
       runtime_logger.warn do
         { message: 'failed to set read timeout', error: e.message, error_class: e.class.name }
       end
+    end
+
+    # 2.10-G — disable Nagle so HTTP/2 stream responses (and any small-payload
+    # write that doesn't already coalesce head+body via the 2.0.1 Phase 8 path)
+    # don't stall ~40 ms on the client's delayed-ACK timer.
+    #
+    # Symptom that surfaced this: 2.9-B Falcon comparison flagged Hyperion's
+    # h2 max-latency stuck at ~40 ms across all rows; the 2.10-G bench showed
+    # the **min** latency was 40.6 ms (every stream, not just the first).
+    # That's the canonical Linux delayed-ACK + Nagle interaction —
+    # protocol-http2 emits HEADERS and DATA as separate framer writes, the
+    # first arrives at the peer alone, the peer waits 40 ms for an ACK so it
+    # can piggyback, Hyperion's writer fiber waits because Nagle is buffering
+    # the DATA frame until the HEADERS ACK lands. TCP_NODELAY breaks the
+    # cycle — every framer write goes out immediately.
+    #
+    # Cost: a few extra TCP packets for chatty streams. Worth it; Falcon and
+    # Agoo both set TCP_NODELAY.
+    def apply_tcp_nodelay(target)
+      target.setsockopt(::Socket::IPPROTO_TCP, ::Socket::TCP_NODELAY, 1)
+    rescue StandardError
+      # SSLSocket-without-#io, UDPSocket, or platform without TCP_NODELAY
+      # (Windows-on-WSL2 occasionally). Silently skip — the socket still
+      # works; only delayed-ACK behavior is affected.
     end
   end
 end

@@ -374,14 +374,56 @@ stress example.
 +8 from a parallel 2.10-G h2 timing spec landing in this same
 window).  All 1018 green on macOS arm64.
 
-### 2.10-G — Investigate Hyperion h2 max-lat ~40 ms ceiling (instrumentation, fix deferred)
+### 2.10-G — Investigate Hyperion h2 max-lat ~40 ms ceiling (instrumentation + fix)
 
-**Status: instrumentation landed, bench-host re-run deferred to next bench
-window — operator SSH key was rejected from the controller workstation
-during this sprint (the same `Permission denied (publickey)` wall 2.9-E
-documented for subagents, manifest here on the human-driven path).
-Non-blocking; the instrumentation makes the next bench window's
-investigation a single command rather than a code-archaeology dig.**
+**Status: RESOLVED.** Instrumentation landed first (`HYPERION_H2_TIMING=1`
+on `WriterContext`); the bench-host h2load re-run that followed showed
+the latency ceiling was *not* a first-stream-only cost as hypothesized
+— it was paid by **every** stream (`min 40.63 ms, mean 44.01 ms` on
+`-c 1 -m 100 -n 5000`), which is the unmistakable signature of the
+Linux **delayed-ACK 40 ms timer** interacting with Nagle on small h2
+framer writes. Fix: enable **TCP_NODELAY** on every accepted socket
+right after `apply_timeout` runs. Result on the same bench
+(post-handshake handshake stripped, h2load `-c 1 -m 1 -n 200`):
+
+| | Pre-fix | Post-fix | Delta |
+|---|---:|---:|---:|
+| min request time | 40.62 ms | 542 µs | **−98.7%** |
+| mean request time | 41.66 ms | 833 µs | **−98.0%** |
+| max request time | 45.00 ms | 4.71 ms | **−89.5%** |
+| throughput | 23.98 r/s | 1,141.81 r/s | **+47.6×** |
+
+(Latency tail collapses from a tight Gaussian centered on the
+delayed-ACK timer to a sub-millisecond mean — exactly what Falcon and
+Agoo show on the same workload.)
+
+The pre-fix instrumentation stays in place — the env-flag-gated
+`WriterContext` timing slots are durable diagnostic infrastructure for
+any future cold-stream / first-stream regression. The TCP_NODELAY
+single-line fix is in `lib/hyperion/server.rb#apply_tcp_nodelay`,
+called from `apply_timeout` so every accepted connection picks it up
+(both H1 and H2 paths). Errors swallowed silently — UNIX sockets,
+SSLSocket-without-`#io`, and platforms missing TCP_NODELAY all
+gracefully fall through.
+
+**Why this beat both hypotheses.** The instrumentation framing
+expected the cost on the **first** stream of each connection
+(SETTINGS round-trip or fiber pool warm-up). Reality: protocol-http2
+emits HEADERS and DATA as separate framer writes per stream; on
+**every** stream, the server's first packet arrives at the peer
+alone, the peer waits 40 ms for the next packet to piggyback an ACK,
+Hyperion's writer fiber waits because Nagle is buffering the second
+write until that ACK lands. Setting TCP_NODELAY at accept-time breaks
+the cycle for every stream, not just the cold one.
+
+**Filed for 2.11 (no longer the same item).** "h2 first-stream tail
+optimization (TLS handshake parallelization)" — distinct from the
+40 ms ceiling, which is fixed. The instrumentation reads the residual
+cold-stream cost cleanly now that the ACK noise is gone.
+
+---
+
+
 
 **Background (filed by 2.9-B).** The Falcon h2 head-to-head bench
 (`bench/h2_falcon_compare.sh`, `h2load -c 1 -m 100 -n 5000`) found
