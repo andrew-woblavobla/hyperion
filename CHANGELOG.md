@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.10.1 — TBD
+## 2.10.1 — 2026-05-01
 
 ### 2.10-F — C-ext fast-path response writer for prebuilt responses
 

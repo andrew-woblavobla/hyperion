@@ -11,6 +11,47 @@ gem install hyperion-rb
 bundle exec hyperion config.ru
 ```
 
+## What's new in 2.10.1
+
+**Static-asset operator surface (2.10-E) + C-ext fast-path response
+writer (2.10-F).** Two follow-on streams to 2.10's static / direct-route
+work:
+
+- **2.10-E — Static asset preload + immutable flag.** Boot-time hook
+  warms `Hyperion::Http::PageCache` over a tree of files and marks
+  every cached entry immutable. Surface: `--preload-static <dir>` (and
+  `--no-preload-static`) CLI flags, `preload_static "/path", immutable:
+  true` config DSL key, and zero-config Rails auto-detect that pulls
+  `Rails.configuration.assets.paths.first(8)` when present. Hyperion
+  never `require`s Rails — purely defensive `defined?(::Rails)`
+  probing keeps the generic Rack server path clean. **Operator value:
+  predictable first-request latency** (the asset is in cache before
+  the first request arrives) and the `recheck_seconds` mtime poll is
+  skipped on immutable entries. Sustained-load throughput on the
+  static-1-KB bench did *not* move (cold 1,929 r/s vs warm 1,886 r/s,
+  inside trial noise) because `ResponseWriter` already auto-caches
+  Rack::Files responses on the first hit; preload moves that one
+  `cache_file` call from request 1 to boot.
+- **2.10-F — C-ext fast-path response writer for prebuilt responses.**
+  `Server.handle_static`-routed requests now serve from a single
+  C function (`rb_pc_serve_request` in `ext/hyperion_http/page_cache.c`)
+  that does route lookup → header build → `write()` syscall without
+  re-entering Ruby on the response side. GVL is released across the
+  `write()` so slow clients no longer block other Ruby work on the
+  same VM. Automatic HEAD support (HTTP-mandated) lights up on every
+  GET registered via `handle_static` — same buffer, body stripped.
+  Bench (3-trial median, `wrk -t4 -c100 -d20s`): **5,768 r/s vs
+  2.10-D's 5,619 r/s (+2.6% — inside noise) and p99 1.93 → 1.67 ms
+  (−14% — outside noise, reproducible).** The throughput needle didn't
+  move because the per-connection lifecycle (accept4 + clone3 + futex
+  on GVL handoff) dominates at 100 concurrent connections; 2.10-F
+  shrinks the response phase, but the response phase isn't the
+  bottleneck on this profile. Durable infrastructure for 2.11+ when
+  the accept-loop work closes.
+
+Full per-stream details and bench tables in
+[`CHANGELOG.md`](CHANGELOG.md).
+
 ## What's new in 2.10.0
 
 **4-way bench harness, page cache, direct routes, and the h2 40 ms
