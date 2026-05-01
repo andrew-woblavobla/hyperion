@@ -1,5 +1,103 @@
 # Changelog
 
+## [Unreleased] - 2.11.0
+
+### 2.11-A — h2 first-stream TLS handshake parallelization (Bucket 2: pre-spawned dispatch worker pool)
+
+The 2.10-G TCP_NODELAY fix lifted the ~40 ms h2 max-latency ceiling
+that was paid by every stream. With the per-stream Nagle/delayed-ACK
+noise gone, the **first-stream cold cost** became isolatable via the
+2.10-G `HYPERION_H2_TIMING=1` instrumentation. Reading the breakdown
+on `h2load -c 1 -m 100 -n 5000 https://localhost/`:
+
+| Bucket | Master baseline | After 2.11-A |
+|---|---:|---:|
+| `t0_to_t1_ms`    (preface exchange — 0.3-1.7 ms baseline)               | 0.3-1.7 ms | 0.6-1.2 ms |
+| `t1_to_t2_enc_ms` (preface→first stream encoded — **dominant bucket**)   | **12-25 ms** | **m=1: 1.0-1.4 ms**, m=100: 13-18 ms |
+| `t2_enc_to_t2_wire_ms` (first stream encode → first byte on wire)        | -10 to -27 ms\* | -13 to -17 ms\* |
+| `t0_to_t2_wire_ms` (preface bytes on wire)                               | 0.9-3.4 ms | 1.1-1.9 ms |
+
+\* The `t2_enc_to_t2_wire_ms` slot reflects "preface SETTINGS bytes
+on the wire" minus "first stream HEADERS encoded" — the writer
+fiber's `||=` capture lands on the preface bytes (always written
+first), not the response. The negative value is expected and
+documents the preface→response gap at the writer-fiber boundary.
+
+**The dominant bucket was `t1_to_t2_enc_ms`** — preface complete to
+first stream's HEADERS+DATA encoded. On the cold-stream `m=1` path,
+the ~3-13 ms gap is dominated by lazy `task.async {}` fiber spawn
+on the connection-loop fiber's `ready_ids` tick (under the Async
+scheduler, the first `task.async` from a cold fiber pays scheduler
+bookkeeping that warmer paths amortize away).
+
+**Fix.** Pre-spawn a fixed pool of `N` dispatch worker fibers (default
+`4`, configurable via `HYPERION_H2_DISPATCH_POOL`) inside `serve`
+BEFORE `read_connection_preface` returns. Each worker parks on a
+new per-connection `Async::Queue` exposed off `WriterContext#dispatch_queue`.
+When a stream becomes ready, the connection-loop fiber pushes onto
+the queue; a parked worker grabs it and calls `dispatch_stream`.
+
+The first stream is now an enqueue+dequeue handoff (microseconds)
+instead of a `task.async {}` cold spawn. Streams that arrive while
+the queue is non-empty (workers all busy on prior streams) fall
+back to ad-hoc `task.async {}` so concurrency is never artificially
+capped — the operator-facing knob is `h2.max_concurrent_streams`,
+not the pool size.
+
+**Bench delta on openclaw-vm (single-worker, h2load → localhost TLS h2):**
+
+| | Master | 2.11-A | Δ |
+|---|---:|---:|---:|
+| `m=1 -n 50` cold first-run, time-to-1st-byte         | 20.28 ms | **9.28 ms** | **-54%** |
+| `m=1 -n 50` warm avg, time-to-1st-byte               | 5.93 ms  | 7.20 ms     | +21% (within run-to-run noise) |
+| `m=100 -n 5000` 10-run avg, time-to-1st-byte         | 19.6 ms  | 19.1 ms     | parity |
+| `m=100 -n 5000` 10-run avg, throughput               | 2742 r/s | 2893 r/s    | +5.5% |
+| `m=1 -n 50` `t1_to_t2_enc_ms` (instrumented, cold)   | 3.4 ms   | **1.0-1.4 ms** | **-66%** |
+
+**Cold first-stream cost is roughly halved** on `m=1` (the actual
+single-stream cold-connection path). The `m=100` path is dominated
+by sequential client-frame reads on the connection-loop fiber, not
+fiber-spawn cost — the fix doesn't move that needle but doesn't
+regress it either.
+
+**Sub-fixes folded in.**
+* **Pre-resolve `peer_address`** before `read_connection_preface`.
+  The `peeraddr` syscall was previously paid on the hot path between
+  preface read and first dispatch; moving it earlier overlaps with
+  the writer fiber's first-tick scheduling.
+
+**Operator surface.**
+
+* `HYPERION_H2_DISPATCH_POOL=<N>` — set the pre-warmed dispatch
+  worker count per connection. Default `4`. Ceiling `16` (guards
+  against pathological configs spawning hundreds of idle fibers
+  per accepted connection). Invalid / non-positive values fall
+  back to the default rather than crashing the connection — this
+  is a tuning knob, not a spec parameter.
+* `WriterContext#dispatch_queue` — the per-connection
+  `Async::Queue` workers park on; bench harnesses can introspect.
+* `WriterContext#dispatch_worker_count` — live count of workers
+  currently registered (parked or actively dispatching). Useful
+  for diagnostics endpoints that want to surface "this connection's
+  pool is saturated".
+
+**Constraints preserved.**
+* TCP_NODELAY (2.10-G) hunk in `apply_tcp_nodelay` is untouched.
+* Static asset preload + immutable hooks (2.10-E) are untouched.
+* C-ext fast-path response writer (2.10-F) is untouched.
+* `HYPERION_H2_TIMING=1` instrumentation continues to fire and
+  emits the same `'h2 first-stream timing'` log shape (the four
+  deltas + total). Locked by spec.
+
+**Specs.** 12 new examples in `spec/hyperion/http2_dispatch_pool_spec.rb`
+covering the WriterContext extensions (queue + worker count + register/
+unregister), `resolve_dispatch_pool_size` env-var parsing (default,
+override, invalid input, ceiling), the pool warmup contract (workers
+registered, workers process queued items, one bad stream doesn't
+poison the pool), and a TLS+curl end-to-end smoke (the timing log
+shape continues to fire after the warmup hook is added). Spec count
+**1060 → 1072**, 0 failures.
+
 ## 2.10.1 — 2026-05-01
 
 ### 2.10-F — C-ext fast-path response writer for prebuilt responses

@@ -2,6 +2,7 @@
 
 require 'async'
 require 'async/notification'
+require 'async/queue'
 require 'protocol/http2/server'
 require 'protocol/http2/framer'
 require 'protocol/http2/stream'
@@ -133,7 +134,7 @@ module Hyperion
     #
     # Single instance per connection, lives for the lifetime of `serve`.
     class WriterContext
-      attr_reader :encode_mutex
+      attr_reader :encode_mutex, :dispatch_queue
       # 2.10-G — connection-lifecycle timing slots used by the optional h2
       # latency-instrumentation path (gated by `HYPERION_H2_TIMING=1`).
       # Each slot is a single CLOCK_MONOTONIC timestamp captured at most
@@ -149,12 +150,46 @@ module Hyperion
         @pending_bytes_lock = ::Mutex.new
         @max_pending_bytes  = max_pending_bytes
         @writer_done        = false
+        # 2.11-A — pre-spawned dispatch worker pool. The connection-loop
+        # fiber pushes ready streams onto `@dispatch_queue`; workers
+        # parked on `dequeue` grab them and call `dispatch_stream`. The
+        # queue is created here (cheap — wraps a Thread::Queue) so the
+        # WriterContext is fully self-contained and unit-testable without
+        # an Async reactor.
+        @dispatch_queue           = ::Async::Queue.new
+        @dispatch_worker_count    = 0
+        @dispatch_worker_lock     = ::Mutex.new
         # 2.10-G timing slots, all initially nil so capture is a single
         # `||=` write under the encode mutex / writer fiber.
         @t0_serve_entry  = nil
         @t1_preface_done = nil
         @t2_first_encode = nil
         @t2_first_wire   = nil
+      end
+
+      # 2.11-A — bench/diagnostics introspection. Reads the live count
+      # of dispatch worker fibers parked on (or actively pulling from)
+      # `@dispatch_queue`. Reflects pre-spawned workers AND any ad-hoc
+      # workers spawned when the pool was saturated. Exposed as a method
+      # rather than `attr_reader` so the lock guards the counter.
+      def dispatch_worker_count
+        @dispatch_worker_lock.synchronize { @dispatch_worker_count }
+      end
+
+      # Called by a dispatch worker fiber when it enters its run loop.
+      # Pairs with `unregister_dispatch_worker` in an ensure block.
+      def register_dispatch_worker
+        @dispatch_worker_lock.synchronize { @dispatch_worker_count += 1 }
+      end
+
+      # Called by a dispatch worker fiber when it exits (queue closed,
+      # or unrecoverable error). Floors at 0 to defend against a stray
+      # double-unregister — instrumentation must never go negative.
+      def unregister_dispatch_worker
+        @dispatch_worker_lock.synchronize do
+          @dispatch_worker_count -= 1
+          @dispatch_worker_count = 0 if @dispatch_worker_count.negative?
+        end
       end
 
       # Called by SendQueueIO#write on the calling (encoder) fiber. Enforces
@@ -507,7 +542,43 @@ module Hyperion
       # cost when disabled — a single ivar read per stream branch). Used by
       # 2.10-G to root-cause Hyperion's flat ~40 ms first-stream max-latency.
       @h2_timing_enabled = env_flag_enabled?('HYPERION_H2_TIMING')
+      # 2.11-A — resolve the dispatch worker pool size once at handler
+      # construction so every `serve` call uses the same value (instead
+      # of re-parsing ENV per connection on the hot path). Cached as an
+      # ivar; bench/diagnostics can read it via the spec seam.
+      @dispatch_pool_size = resolve_dispatch_pool_size
       record_codec_boot_state
+    end
+
+    # 2.11-A — pre-spawned dispatch worker pool sizing.
+    #
+    # Default `4` workers per connection — enough to absorb the typical
+    # HTTP/2 burst (2-8 concurrent streams) without paying any per-stream
+    # `task.async {}` cost on the hot path. Operators on long-lived
+    # high-fan-out connections (e.g. an aggregator backend that fans
+    # 30+ parallel streams) can bump this with `HYPERION_H2_DISPATCH_POOL`.
+    # Streams that arrive when the pool is saturated still get an ad-hoc
+    # fiber (see `serve` below) so concurrency is never artificially
+    # capped — the operator-facing limit is `h2.max_concurrent_streams`.
+    #
+    # Ceiling at 16 guards against a pathological config that would
+    # spawn hundreds of idle fibers per accepted connection. Anything
+    # malformed / non-positive falls back to the default rather than
+    # crashing the connection — this is a tuning knob, not a spec
+    # parameter.
+    DISPATCH_POOL_DEFAULT = 4
+    DISPATCH_POOL_MAX     = 16
+
+    def resolve_dispatch_pool_size
+      raw = ENV['HYPERION_H2_DISPATCH_POOL']
+      return DISPATCH_POOL_DEFAULT if raw.nil? || raw.strip.empty?
+
+      n = Integer(raw.strip, 10)
+      return DISPATCH_POOL_DEFAULT unless n.positive?
+
+      [n, DISPATCH_POOL_MAX].min
+    rescue ArgumentError, TypeError
+      DISPATCH_POOL_DEFAULT
     end
 
     # Read an env-var flag with the usual truthiness rules (any of
@@ -610,6 +681,14 @@ module Hyperion
 
       task = ::Async::Task.current
 
+      # 2.11-A — extract the peer address BEFORE the preface exchange.
+      # Two wins: (1) the lookup runs in parallel with the writer fiber
+      # picking up the first scheduler slot, and (2) the first stream's
+      # dispatch fiber doesn't pay this `peeraddr` syscall on its hot
+      # path. The address is then captured by the worker closures
+      # below.
+      peer_addr = peer_address(socket)
+
       # Spawn the dedicated writer fiber BEFORE the preface exchange.
       # `Server#read_connection_preface` writes the server's SETTINGS frame
       # via the framer; if the writer isn't running, those bytes sit in the
@@ -618,15 +697,23 @@ module Hyperion
       # waits for our SETTINGS before sending more frames.
       writer_task = task.async { run_writer_loop(socket, writer_ctx) }
 
+      # 2.11-A — pre-spawn the dispatch worker pool BEFORE the preface
+      # exchange. Workers park on `writer_ctx.dispatch_queue.dequeue`;
+      # by the time the first client HEADERS frame arrives the workers
+      # are already in the scheduler's runnable set. The first stream
+      # is just an enqueue + dequeue (microseconds) instead of a
+      # `task.async {}` cold spawn (was the dominant cost in the t1→t2_enc
+      # bucket per the 2.10-G timing breakdown).
+      warmup_dispatch_pool!(task, writer_ctx, peer_addr: peer_addr,
+                                              pool_size: @dispatch_pool_size)
+
       server.read_connection_preface(initial_settings_payload)
       writer_ctx.t1_preface_done = monotonic_now if @h2_timing_enabled
 
-      # Extract once — the same TCP peer drives every stream on this conn.
-      peer_addr = peer_address(socket)
-
-      # Track in-flight per-stream dispatch fibers so we can drain them on
-      # connection close.
-      stream_tasks = []
+      # Track ad-hoc per-stream dispatch fibers (spilled when the pool is
+      # saturated). The pool handles the common case; we only fall back
+      # to `task.async {}` when more streams arrive than warm workers.
+      overflow_tasks = []
 
       until server.closed?
         ready_ids = []
@@ -645,14 +732,35 @@ module Hyperion
           # if subsequent frames (e.g. RST_STREAM races) arrive.
           stream.instance_variable_set(:@hyperion_dispatched, true)
 
-          stream_tasks << task.async do
-            dispatch_stream(stream, writer_ctx, peer_addr)
+          # 2.11-A — hand the stream to a warm worker via the dispatch
+          # queue. We use a simple "queue is empty" probe to decide:
+          #
+          #   * Empty queue ⇒ at least one worker is parked on
+          #     `dequeue`; the enqueue+dequeue handoff is microseconds
+          #     and we avoid a `task.async {}` cold spawn. This is the
+          #     hot path for the FIRST stream of a fresh connection
+          #     (the case 2.11-A is targeting).
+          #   * Non-empty queue ⇒ every parked worker has already
+          #     pulled a stream; another worker won't pick this up
+          #     until one finishes. To avoid head-of-line blocking
+          #     behind the warmup pool, fall back to `task.async {}`.
+          #     The overflow fiber re-uses `dispatch_stream` so the
+          #     dispatch contract is identical between pool and
+          #     overflow paths. Concurrency is never artificially
+          #     capped; the operator-facing knob is
+          #     `h2.max_concurrent_streams`.
+          if writer_ctx.dispatch_queue.size.zero?
+            writer_ctx.dispatch_queue.enqueue(stream)
+          else
+            overflow_tasks << task.async do
+              dispatch_stream(stream, writer_ctx, peer_addr)
+            end
           end
         end
       end
 
       # Drain in-flight stream dispatches before we close the socket.
-      stream_tasks.each do |t|
+      overflow_tasks.each do |t|
         t.wait
       rescue StandardError
         nil
@@ -676,6 +784,18 @@ module Hyperion
       # socket before the writer drains would discard final RST_STREAM /
       # GOAWAY / END_STREAM frames in the queue.
       if writer_ctx
+        # 2.11-A — close the dispatch queue so any pre-spawned workers
+        # parked on `dequeue` fall through (Async::Queue#dequeue returns
+        # nil after close). Do this BEFORE waiting on the writer so
+        # pool workers can drain their in-flight stream dispatches and
+        # release the encode mutex; otherwise the writer might park
+        # waiting for bytes that the dispatch worker never gets to
+        # encode.
+        begin
+          writer_ctx.dispatch_queue.close unless writer_ctx.dispatch_queue.closed?
+        rescue StandardError
+          nil
+        end
         writer_ctx.shutdown!
         begin
           writer_task&.wait
@@ -694,6 +814,63 @@ module Hyperion
     end
 
     private
+
+    # 2.11-A — pre-spawn the per-connection dispatch worker pool.
+    #
+    # Each worker is a fiber that loops:
+    #   1. `dequeue` a stream from the per-connection dispatch queue
+    #      (parks the fiber on the queue's internal notification when
+    #      empty — zero CPU until a stream arrives).
+    #   2. Calls `dispatch_stream` with the stream + writer context +
+    #      pre-resolved peer address.
+    #   3. Loops back to (1). Exits cleanly when `dequeue` returns nil
+    #      (queue closed by `serve`'s ensure block on connection
+    #      teardown).
+    #
+    # Why pre-spawn rather than `task.async {}` per stream:
+    #   * Fiber startup under Async involves a few µs of allocation and
+    #     scheduler bookkeeping. Per-stream that's negligible; on the
+    #     CONNECTION COLD PATH (first request on a fresh TCP/TLS conn)
+    #     it adds up to a measurable share of the t1→t2_enc bucket
+    #     (the 2.10-G timing breakdown showed ~12-25 ms on h2load
+    #     `-c 1 -m 100 -n 5000`).
+    #   * Workers parked on `dequeue` are already in the scheduler's
+    #     ready set; the first stream is just an enqueue + dequeue
+    #     handoff (microseconds).
+    #
+    # Errors inside `dispatch_stream` are already caught + RST_STREAMed
+    # there, so the worker only needs to defend against truly
+    # unexpected failures (queue shutdown races, fiber kill on graceful
+    # shutdown). We swallow those defensively and unregister so the
+    # `dispatch_worker_count` introspection is truthful.
+    def warmup_dispatch_pool!(task, writer_ctx, peer_addr:, pool_size:)
+      pool_size.times do
+        task.async do
+          writer_ctx.register_dispatch_worker
+          begin
+            loop do
+              stream = writer_ctx.dispatch_queue.dequeue
+              break if stream.nil? # queue closed → graceful exit
+
+              begin
+                dispatch_stream(stream, writer_ctx, peer_addr)
+              rescue StandardError => e
+                # `dispatch_stream` already logs + RST_STREAMs internally;
+                # if anything escapes that net we log here and keep the
+                # worker alive — one bad stream must not poison the
+                # connection's worker pool.
+                @logger.error do
+                  { message: 'h2 dispatch worker swallowed error',
+                    error: e.message, error_class: e.class.name }
+                end
+              end
+            end
+          ensure
+            writer_ctx.unregister_dispatch_worker
+          end
+        end
+      end
+    end
 
     # Build the [setting_id, value] pairs that go in the connection-preface
     # SETTINGS frame. protocol-http2's Server#read_connection_preface accepts
