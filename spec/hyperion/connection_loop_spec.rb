@@ -53,6 +53,38 @@ RSpec.describe 'Hyperion::Http::PageCache.run_static_accept_loop (2.12-C)' do
     [server, server.addr[1]]
   end
 
+  # 2.13-C — Tear down the C accept loop hermetically.
+  #
+  # On Linux ≥ 6.x, `close()` on a listener fd from one thread does
+  # NOT interrupt another thread parked in `accept(2)` on that same
+  # fd (the kernel drops the close-during-blocked-accept wake guarantee
+  # the spec previously relied on). Without an extra wake, the C
+  # accept loop stays blocked until the next connection arrives —
+  # which in a test is "never", so `thread.join(5)` hits the timeout
+  # and `result` is left at its initial nil while the worker thread
+  # is still alive.
+  #
+  # The fix is structural: flip the stop flag, then dial one throwaway
+  # TCP connection at the listener so accept(2) returns. The C loop
+  # services that fd (it carries no data, so it falls off as a 0-byte
+  # read) and then re-checks `hyp_cl_stop` between accepts and exits
+  # cleanly. Closing the listener happens last as a belt-and-braces
+  # measure for the case where the wake-connect raced ahead and the
+  # loop was about to re-enter accept anyway.
+  def stop_loop_and_wake(listener, thread, timeout: 5)
+    Hyperion::Http::PageCache.stop_accept_loop
+    port = listener.addr[1] if listener && !listener.closed?
+    if port
+      begin
+        TCPSocket.new('127.0.0.1', port).close
+      rescue StandardError
+        # Listener gone; the close-race already happened.
+      end
+    end
+    listener.close unless listener.closed?
+    thread.join(timeout)
+  end
+
   def http_get(port, path, host: '127.0.0.1', extra_headers: '', read_response: true)
     sock = TCPSocket.new(host, port)
     sock.write("GET #{path} HTTP/1.1\r\nhost: #{host}\r\nconnection: close\r\n#{extra_headers}\r\n")
@@ -91,9 +123,7 @@ RSpec.describe 'Hyperion::Http::PageCache.run_static_accept_loop (2.12-C)' do
         expect(response).to end_with("hello\n")
       end
 
-      Hyperion::Http::PageCache.stop_accept_loop
-      listener.close
-      thread.join(5)
+      stop_loop_and_wake(listener, thread)
 
       expect(result).to be_a(Integer)
       expect(result).to be >= requests
@@ -129,9 +159,7 @@ RSpec.describe 'Hyperion::Http::PageCache.run_static_accept_loop (2.12-C)' do
       # Give the handoff time to fire.
       sleep 0.1
 
-      Hyperion::Http::PageCache.stop_accept_loop
-      listener.close
-      thread.join(5)
+      stop_loop_and_wake(listener, thread)
 
       expect(handed_off.size).to be >= 1
       partial = handed_off.first[:partial]
@@ -168,9 +196,7 @@ RSpec.describe 'Hyperion::Http::PageCache.run_static_accept_loop (2.12-C)' do
       sock.close
 
       sleep 0.1
-      Hyperion::Http::PageCache.stop_accept_loop
-      listener.close
-      thread.join(5)
+      stop_loop_and_wake(listener, thread)
 
       expect(handed_off.size).to be >= 1
       expect(handed_off.first[:partial]).to include('POST /hello')
@@ -194,9 +220,7 @@ RSpec.describe 'Hyperion::Http::PageCache.run_static_accept_loop (2.12-C)' do
 
       3.times { http_get(port, '/hooked') }
 
-      Hyperion::Http::PageCache.stop_accept_loop
-      listener.close
-      thread.join(5)
+      stop_loop_and_wake(listener, thread)
 
       expect(hook_calls.size).to eq(3)
       expect(hook_calls).to all eq(['GET', '/hooked'])
@@ -215,9 +239,7 @@ RSpec.describe 'Hyperion::Http::PageCache.run_static_accept_loop (2.12-C)' do
 
       3.times { http_get(port, '/quiet') }
 
-      Hyperion::Http::PageCache.stop_accept_loop
-      listener.close
-      thread.join(5)
+      stop_loop_and_wake(listener, thread)
 
       expect(hook_calls).to eq(0)
     end
@@ -236,9 +258,7 @@ RSpec.describe 'Hyperion::Http::PageCache.run_static_accept_loop (2.12-C)' do
       expect(response).to include('200 OK')
       expect(response).to end_with("c\n")
 
-      Hyperion::Http::PageCache.stop_accept_loop
-      listener.close
-      thread.join(5)
+      stop_loop_and_wake(listener, thread)
     end
   end
 
@@ -265,9 +285,7 @@ RSpec.describe 'Hyperion::Http::PageCache.run_static_accept_loop (2.12-C)' do
       Timeout.timeout(5) { result = computation_thread.value }
       expect(result).to eq(100_000 * 99_999 / 2)
 
-      Hyperion::Http::PageCache.stop_accept_loop
-      listener.close
-      thread.join(5)
+      stop_loop_and_wake(listener, thread)
     end
   end
 
@@ -298,9 +316,7 @@ RSpec.describe 'Hyperion::Http::PageCache.run_static_accept_loop (2.12-C)' do
       expect(data.scan(%r{HTTP/1\.1 200 OK}).size).to eq(2)
       expect(data.scan("k\n").size).to eq(2)
 
-      Hyperion::Http::PageCache.stop_accept_loop
-      listener.close
-      thread.join(5)
+      stop_loop_and_wake(listener, thread)
     end
   end
 
@@ -326,8 +342,18 @@ RSpec.describe 'Hyperion::Http::PageCache.run_static_accept_loop (2.12-C)' do
       expect(response).to include('200 OK')
       expect(response).to end_with("s\n")
 
-      server.stop
+      # 2.13-C — flip the stop flag, then send one wake-connect so the
+      # parked accept(2) returns; finally close the listener via
+      # server.stop. See `stop_loop_and_wake` for the long-form
+      # rationale; same Linux 6.x close()-doesn't-interrupt-accept
+      # behaviour applies through the Server wrapper.
       Hyperion::Http::PageCache.stop_accept_loop
+      begin
+        TCPSocket.new('127.0.0.1', port).close
+      rescue StandardError
+        nil
+      end
+      server.stop
       thread.join(5)
     end
 
@@ -354,6 +380,52 @@ RSpec.describe 'Hyperion::Http::PageCache.run_static_accept_loop (2.12-C)' do
 
       server.stop
       thread.join(5)
+    end
+  end
+
+  # 2.13-C — Regression: serial accept-loop teardown.
+  #
+  # Catches the original flake (`thread.join(5)` exhausting its timeout
+  # because Linux's `close()`-on-listener didn't wake another thread's
+  # parked `accept(2)`) by spinning the full bring-up + serve + tear-
+  # down cycle multiple times in ONE process. Prior to the
+  # `stop_loop_and_wake` helper this loop would have slept for
+  # 5 × N seconds; with the wake fix each iteration completes in
+  # under 100 ms, so a 3-iteration run finishing inside the 10 s
+  # outer timeout is the meaningful assertion.
+  describe 'teardown is hermetic across repeated bring-ups' do
+    it 'each iteration tears down in well under a second' do
+      iterations = 3
+      total = 0.0
+      iterations.times do
+        Hyperion::Server.handle_static(:GET, '/r', "r\n")
+        listener, port = open_listener
+        thread = Thread.new { Hyperion::Http::PageCache.run_static_accept_loop(listener.fileno) }
+        sleep 0.05
+
+        response = http_get(port, '/r')
+        expect(response).to include('200 OK')
+
+        t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        stop_loop_and_wake(listener, thread)
+        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
+        total += elapsed
+
+        # Each teardown must be fast — anything close to the 5 s
+        # join timeout means the wake-connect didn't reach the
+        # parked accept(2) and the loop sat blocked.
+        expect(elapsed).to be < 1.0
+        expect(thread.alive?).to be(false)
+
+        # Reset between iterations so the next bring-up starts clean.
+        Hyperion::Http::PageCache.set_handoff_callback(nil)
+        Hyperion::Http::PageCache.set_lifecycle_callback(nil)
+        Hyperion::Server.route_table = Hyperion::Server::RouteTable.new
+        Hyperion::Http::PageCache.clear
+      end
+
+      # Sanity: 3 iterations should not approach the 5 s join window.
+      expect(total).to be < (iterations * 1.0)
     end
   end
 end
