@@ -2,6 +2,70 @@
 
 ## [Unreleased] — 2.13.0
 
+### 2.13-C — Spec flake hunt
+
+Two flakes carried over from the 2.11/2.12 release cuts. Both are
+spec-side hermeticity issues — neither indicates a regression in
+`lib/` or `ext/`.
+
+**Flake 1 — `spec/hyperion/tls_ktls_spec.rb`, macOS, seed-dependent.**
+The two examples in the `Linux-only: kTLS engages with default :auto policy`
+describe block previously gated their bodies on
+`unless Hyperion::TLS.ktls_supported?`. That probe consults
+`Etc.uname[:sysname]` and `OpenSSL::OPENSSL_VERSION_NUMBER`. The same
+`Etc.uname` is stubbed elsewhere in the suite (`io_uring_spec`)
+to drive the io_uring platform matrix; under a particular full-
+suite seed those stubs and this spec's `before { reset_ktls_probe! }`
+overlapped in a way that let the probe report `true` on the actual
+Darwin host. The body then ran the kTLS-supported branch and failed.
+
+  *Fix shape:* hard `RUBY_PLATFORM.include?('linux')` guard at the
+  example-body top BEFORE the existing probe-based guard. Runtime
+  platform is unstubbable from another spec and matches the
+  example title's intent. Linux runs unaffected (the second guard
+  still protects Linux + old-OpenSSL hosts).
+
+  *Verification:* 10/10 green on macOS arm64; 1/1 green on the
+  Linux x86_64 bench (openclaw-vm, kernel 6.8); full suite holds
+  the 1175 baseline on macOS / 1118 on bench.
+
+**Flake 2 — `spec/hyperion/connection_loop_spec.rb:79`, Linux, deterministic.**
+Misdiagnosed previously as "port-9292-busy". The actual root cause
+is Linux ≥ 5.x's `close()`-doesn't-wake-other-thread-`accept(2)`
+behaviour: when the spec calls `listener.close` from one thread,
+the C accept loop parked in `accept(2)` on that fd in another thread
+stays blocked until the next connection arrives. The `stop_accept_loop`
+flag is checked BETWEEN accepts, not while parked, so flipping it
+without a wake is a no-op. `thread.join(5)` then exhausts its
+timeout and `result` (assigned inside the thread block) is still
+`nil`, breaking the `expect(result).to be_a(Integer)` assertion.
+Other examples in the file had the same teardown shape but happened
+to assert on side-effects populated BEFORE the join, so they passed
+despite the same 5 s thread leak — runtime was 46 s for 10 examples.
+
+  *Fix shape:* extract a `stop_loop_and_wake(listener, thread)`
+  helper that flips the stop flag, dials one throwaway TCP connection
+  at the listener so the parked `accept(2)` returns, then closes the
+  listener and joins. Replace the `stop_accept_loop` + `listener.close`
+  + `thread.join(5)` pattern at every callsite (8 in-file plus the
+  Server-level engagement example, which goes through `server.stop`).
+  Add a regression block — "teardown is hermetic across repeated
+  bring-ups" — that runs the bring-up + serve + teardown cycle 3
+  times in one process and asserts each teardown is < 1 s.
+
+  *Verification:* 0/10 failures on the bench (was 5/5 deterministic
+  failure pre-fix); spec runtime 46 s → 1.3 s; macOS 11/11 green;
+  full suite 1119 on bench / 1176 on macOS (regression spec adds 1).
+
+  *Out of scope:* the same wake-shape affects `Hyperion::Server#stop`
+  in production — `close()` on the listener fd from the signal-
+  handling thread won't reliably wake the worker's parked accept.
+  Flagging this as a follow-up rather than fixing in 2.13-C scope:
+  briefing was explicit ("Don't touch lib/ext code unless the flake
+  is a real bug there"), and the production failure mode (worker
+  hangs on shutdown) is operationally distinct from the spec flake
+  (test-suite stalls).
+
 ### 2.13-B — CPU JSON gap
 
 **Background.** The 2.12-B re-bench surfaced one row that got *worse*
