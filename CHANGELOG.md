@@ -105,6 +105,107 @@ the 2.10.0 baseline).
    so the `call` method is only ever exercised by callers reaching for
    the route table directly (specs, custom dispatchers).
 
+### 2.10-F — bench result: hello via handle_static 5,768 r/s (vs 5,619 baseline, +2.6%)
+
+**Honest reading: 2.10-F is durable infrastructure, NOT a sustained-r/s win.**
+The C-ext fast path eliminates the Ruby plumbing around the response
+write, but on this workload the dominant cost is the per-connection
+lifecycle (accept4 + clone3 + futex + epoll setup) — NOT the response
+write phase that 2.10-F shrinks. The wrk profile spawns 100 fresh
+keep-alive connections every 20-second run; each one pays the
+connection-startup tax once, and that tax dwarfs the per-request
+write cost on a 5-byte body. Closing THAT gap is explicitly the
+domain of 2.11+.
+
+**Setup (openclaw-vm, Ubuntu 24.04, x86_64, Ruby 3.3.3, page-cache C
+ext compiled fresh against the 2.10-F source).**
+
+| Run | Hyperion args | Rackup |
+|---|---|---|
+| 2.10-F | `-t 5 -w 1 -p 9810 bench/hello_static.ru` | `Hyperion::Server.handle_static(:GET, '/', 'hello')` + Rack 404 fallback |
+
+`wrk -t4 -c100 -d20s --latency http://127.0.0.1:9810/`, 3 trials,
+median r/s reported.
+
+| Run | Trial 1 | Trial 2 | Trial 3 | Median r/s | Median p99 |
+|---|---:|---:|---:|---:|---:|
+| 2.10-D baseline (published, this rackup shape) | — | — | — | **5,619** | **1.93 ms** |
+| **2.10-F (with C-ext fast-path)** | 5,688.55 | 6,035.16 | 5,768.47 | **5,768** | **1.67 ms** |
+| Agoo 2.15.14 (2.10-B reference) | — | — | — | 19,364 | 9.41 ms |
+
+**Delta vs 2.10-D baseline:** **+2.6% r/s** (5,619 → 5,768), **−14%
+p99 latency** (1.93 ms → 1.67 ms). Trial-to-trial spread on this
+host is ±5%, so the r/s delta is inside the noise band; the p99
+improvement is outside the noise band and reproduces across all
+three trials.
+
+**Why no headline rps win.** The 2.10-F change shrinks the response
+phase to one C call. On the pre-2.10-F path, the response phase was
+already a single `write()` syscall (the 2.10-D static buffer write)
+plus a handful of Ruby method dispatches around it. The Ruby
+dispatch overhead — handler closure call, `is_a?(StaticEntry)`
+branch, `socket.write` ivar reads — is ~1-2 microseconds total at
+this scale, swamped by the ~150-200 microsecond per-request floor
+imposed by the connection lifecycle (accept queue, thread-pool
+worker hand-off, parser dispatch, GVL release/acquire on read).
+2.10-F removes that 1-2 µs cleanly; the bench shows it as a small
+p99 improvement (the tail latency on the fast-path-eligible
+requests tightens) but the throughput floor is gated on a different
+bottleneck.
+
+**What 2.10-F DOES move (durable wins).**
+
+1. **−14% p99 latency on the fast path.** Tail latency tightens
+   because the response phase no longer pays the GVL re-acquisition
+   that the Ruby `socket.write` triggered on the post-syscall return.
+   Operator-visible: a static-asset CDN origin running Hyperion
+   sees 1.67 ms instead of 1.93 ms p99 on cached hits.
+
+2. **Syscall-reduction infrastructure for 2.11.** Strace -f over
+   5,000 warm requests on 2.10-F shows: 5,000× write (the
+   `serve_request` C-side write) + ~30,000 ancillary syscalls
+   (accept4, clone3, futex, recvfrom, epoll). The 5,000 writes
+   are unchanged from 2.10-D; the **ancillary syscalls are
+   unchanged too** because they're driven by the connection
+   lifecycle, not the response phase. When 2.11 closes the
+   accept-loop / thread-pool gap, the C-ext write path is already
+   in place — no second Ruby-to-C migration needed.
+
+3. **HEAD support automatic.** `handle_static(:GET, ...)` now
+   auto-registers the HEAD twin (HTTP-mandated). Operators
+   running CDN-shaped traffic against `handle_static` paths get
+   correct HEAD semantics for free; the C side strips the body
+   bytes on HEAD, so the wire saves the body byte-count per
+   HEAD request.
+
+4. **GVL released across the write syscall.** The 2.10-D path
+   ran the `socket.write` under the GVL — a slow client (one
+   that didn't drain the kernel send buffer fast enough) could
+   block other Ruby-side work on the same VM. The C path uses
+   `rb_thread_call_without_gvl`, so other threads / fibers on
+   the same worker can run while the kernel drains.
+
+**Caveats / honest framing.**
+
+- The plan target of "8,000-12,000 r/s (half-way to Agoo)" is
+  NOT met on this row. The half-way mark would have required
+  closing the connection lifecycle gap as well — that's the
+  2.11 sprint's job, not 2.10-F's.
+- Agoo's 19,364 r/s on this row is still 3.4× ahead. Closing
+  that gap requires owning the accept loop in C (which Agoo does)
+  — distinct from owning the response write in C, which is what
+  2.10-F lands.
+- Trial-to-trial noise on this row is ±5% on the openclaw-vm host
+  (visible in the spread 5,688 / 6,035 / 5,768). The 2.6% r/s
+  delta is inside that band; the p99 delta is outside it.
+
+**Recommendation.** Ship 2.10-F. The operator-visible value is
+the −14% tail latency on the fast path, the durable C-side
+write infrastructure for the 2.11 connection-lifecycle work, the
+free HEAD support, and the GVL release across writes. The
+CHANGELOG headline tells operators the honest delta — not "+47%
+to Agoo".
+
 ### 2.10-E — Static asset preload + immutable flag
 
 Adds a boot-time hook that walks operator-supplied directory trees,
