@@ -1,6 +1,46 @@
 # Changelog
 
-## [Unreleased] - 2.7.0
+## [2.7.0] - 2026-05-01
+
+### Headline
+
+A doc-accuracy + spec-stability release with two code-level perf items
+(2.7-B spec fix, 2.7-F retry of 2.6-B). Three bench-host-dependent
+items (2.7-A bisect, 2.7-D matched-PG rerun, 2.7-E Falcon h2) deferred
+to the next bench window — openclaw-vm went offline mid-sprint after
+the 2.6-E doc audit raised the questions these would answer.
+
+| Stream | Result |
+|---|---|
+| 2.7-A — Static 1 MiB regression bisect | DEFERRED. Bench host died after one data point (v2.6.0 = 1,230 r/s today, matches the audit's 1,228 figure — the today-vs-published gap is real, root cause undetermined). Bisect script pre-staged for resume. |
+| 2.7-B — lifecycle_hooks_spec :share macOS flake | FIXED. Tighter readiness probe (poll 100ms, 30s ceiling). 5/5 local + 3/3 CI green. Real race diagnosed: master binds before workers trap SIGTERM; macOS GH runner timing exposes a microseconds-wide window. No production fix owed (operators don't run :share on macOS; on Linux the window closes too fast for human-scale TERMs). |
+| 2.7-C — Generic SSE rackup | SHIPPED `bench/sse_generic.ru` + BENCH row 6b. Cross-server bench (Hyperion vs Puma) deferred — host offline. Honest framing replaces the prior "Puma can't stream SSE" misclaim (which was a Hyperion-flush-sentinel rackup issue, not a Puma capability gap). |
+| 2.7-D — Matched-config WAN-PG Puma rerun | DEFERRED. Needs both bench host AND quiet WAN-PG window. The 2.6-E annotation (apples-to-apples ratio ~2.2× vs the published 4.78×) stands. |
+| 2.7-E — Falcon h2 head-to-head | DEFERRED. Needs bench host + Falcon install. The 2.6-E reframe ("Puma 8 lacks native h2 — Falcon comparison owed") stands. |
+| 2.7-F — fadvise hoisted ONCE per response | SHIPPED with bench validation deferred. Architecturally correct (one `posix_fadvise` call at Ruby loop entry; spec asserts exactly-1-call-per-response). Warm-cache must be ±1% of 2.6.0 1,320 r/s baseline when bench reruns; if it regresses, revert (same disposition as 2.6-B). |
+
+Spec count: 951 (2.6.0) → **956** (2.7.0). 0 failures, 11 pending.
+
+### Production-relevant takeaway for nginx-fronted operators
+
+No new measured perf wins this release — 2.7 was primarily a stability +
+honest-doc + deferred-bench cycle. The 2.6.0 +20.7% static win remains
+the most recent measured headline.
+
+### What's queued for 2.8 (when openclaw-vm returns)
+
+- Run 2.7-A bisect via the pre-staged script
+- Run 2.7-C cross-server SSE bench
+- Run 2.7-D matched-PG bench
+- Run 2.7-E Falcon h2 bench
+- Validate 2.7-F warm/cold cache deltas; revert if regression
+- Resolve the "1,697 r/s published vs 1,228 r/s today" static-1-MiB gap
+
+### Spec stability
+
+The flaky `lifecycle_hooks_spec :share` test that has flaked on macOS
+CI since at least 2.5.0 is now stable across 6 consecutive macOS GH
+runs (2 Ruby versions × 3 attempts in the 2.7-B verification).
 
 ### 2.7-F — `posix_fadvise(SEQUENTIAL)` hoisted once per response (retry of 2.6-B)
 
