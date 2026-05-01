@@ -1,5 +1,63 @@
 # Changelog
 
+## [Unreleased] - 2.10.0
+
+The 2.10 sprint widens the bench comparison from "Hyperion vs Falcon
+on h2" (the 2.9-B head-to-head) to **all four major Ruby web servers**:
+Hyperion, Puma, Falcon, and Agoo. Agoo is widely cited as the fastest
+Ruby web server, so we want it in the matrix as the upper-bound
+reference for the 2.10 follow-on streams (static-response cache,
+direct route registration). 2.10-A ships the harness; 2.10-B will run
+the BASELINE bench BEFORE any 2.10 code changes so the gap that the
+new code closes is honestly known.
+
+### 2.10-A — 4-way bench harness (Hyperion + Puma + Falcon + Agoo)
+
+Harness only — no production code changes, no spec changes
+(spec count stays at 964).
+
+**Files added.**
+
+| File | Purpose |
+|---|---|
+| `bench/Gemfile.4way` | Sibling Gemfile pinning `puma ~> 8.0`, `falcon ~> 0.55`, `agoo`, `rack ~> 3.0`, plus `hyperion-rb` from `ENV['HYPERION_PATH']` (defaults to `/home/ubuntu/hyperion` for the openclaw-vm bench host). Kept separate from the main bench Gemfile so existing harnesses (`h2_falcon_compare.sh`, etc.) are not disturbed by the 2.10-era pins. |
+| `bench/agoo_boot.rb` | Wrapper that lets Agoo serve a Rack rackup (Agoo's CLI doesn't take rackups directly). Calls `Agoo::Server.handle_not_found(app)` so the parsed Rack builder is the catch-all handler, and parks the main thread on a `Queue#pop` so the process stays alive after `Agoo::Server.start` returns (Agoo's `thread_count: N>0` runs workers in their own threads and returns from `start`, unlike `thread_count: 0` which blocks the caller). |
+| `bench/4way_compare.sh` | Single-script harness that boots each of the four servers in turn on the same port (9810) with a matched `-t 5 -w 1` budget, smokes a single 200, and (unless `SMOKE_ONLY=1`) drives 3× `wrk -t4 -c100 -d20s --latency` runs. Subset by passing server names after the rackup: `bench/4way_compare.sh bench/hello.ru hyperion agoo`. |
+
+**Boot recipes (one server per row, all bound to port 9810,
+matched 5-thread / 1-process budget).**
+
+| Server | Command |
+|---|---|
+| Hyperion | `bundle exec hyperion -t 5 -w 1 -p 9810 bench/hello.ru` |
+| Puma | `bundle exec puma -t 5:5 -w 1 -b tcp://127.0.0.1:9810 bench/hello.ru` |
+| Falcon | `bundle exec falcon serve --bind http://localhost:9810 --hybrid -n 1 --forks 1 --threads 5 --config bench/hello.ru` |
+| Agoo | `bundle exec ruby bench/agoo_boot.rb bench/hello.ru 9810 5` |
+
+Falcon's `--threads` flag is documented "hybrid only" — that's why
+the harness explicitly selects `--hybrid -n 1 --forks 1 --threads 5`
+(verified against `falcon serve --help` on the bench host before
+this commit landed).
+
+**Smoke verification on openclaw-vm (`SMOKE_ONLY=1`, GET / against
+`bench/hello.ru`).** SSH to the bench host now works after 2.9-E's
+`IdentitiesOnly yes` fix landed.
+
+| Server | Boots? | Serves 200? | Notes |
+|---|---|---|---|
+| Hyperion | yes (1 s) | yes | `bin/hyperion` from this repo, agoo Gemfile resolves the path gem normally |
+| Puma | yes (1 s) | yes | `puma 8.0`, threads-only |
+| Falcon | yes (1 s) | yes | `falcon 0.55`, `--hybrid -n 1 --forks 1 --threads 5` |
+| Agoo | yes (1 s) | yes | `agoo 2.15.14`. First boot attempt FAILED — needed the `Queue#pop` main-thread parking in `agoo_boot.rb`. With `thread_count: 5`, `Agoo::Server.start` is non-blocking and returns immediately; without the pop the process exits with the listener torn down. Fixed in this commit. |
+
+The full `wrk` bench is **2.10-B's** job, not 2.10-A's — this commit
+only validates that all four servers come up + serve a 200 on the
+shared rackup.
+
+### Filed for later 2.10 streams
+
+(populated as 2.10-B..H land)
+
 ## [2.9.0] - 2026-05-01
 
 ### Headline

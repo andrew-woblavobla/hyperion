@@ -1,0 +1,25 @@
+# frozen_string_literal: true
+
+# 2.10-A — sibling Gemfile for the four-way bench harness
+# (Hyperion + Puma + Falcon + Agoo). Kept separate from the
+# main bench Gemfile so the existing Falcon/Puma versions used
+# by older harnesses (h2_falcon_compare.sh, etc.) are not
+# disturbed by the 2.10-era pins.
+#
+# On the bench host (openclaw-vm) Hyperion lives at
+# /home/ubuntu/hyperion. On a dev machine adjust the path:
+#   BUNDLE_GEMFILE=bench/Gemfile.4way HYPERION_PATH=/path/to/hyperion bundle install
+#
+# Activate from the harness with:
+#   export BUNDLE_GEMFILE=$PWD/bench/Gemfile.4way
+#   bundle install
+#   bundle exec bench/4way_compare.sh bench/hello.ru
+
+source 'https://rubygems.org'
+
+gem 'rack',   '~> 3.0'
+gem 'puma',   '~> 8.0'
+gem 'falcon', '~> 0.55'
+gem 'agoo'
+
+gem 'hyperion-rb', path: ENV.fetch('HYPERION_PATH', '/home/ubuntu/hyperion')
