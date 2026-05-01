@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] - 2.11.0
+## 2.11.0 — 2026-05-01
 
 ### 2.11-B — HPACK FFI marshalling round-2 (cglue confirmed as firm default; +43% v3 vs v2 on Rails-shape h2)
 

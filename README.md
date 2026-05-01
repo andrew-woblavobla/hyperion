@@ -11,6 +11,39 @@ gem install hyperion-rb
 bundle exec hyperion config.ru
 ```
 
+## What's new in 2.11.0
+
+**h2 cold-stream latency cut + native HPACK CGlue flipped to default.**
+Two perf wins on top of 2.10:
+
+- **2.11-A — h2 first-stream TLS handshake parallelization.** The
+  2.10-G `HYPERION_H2_TIMING=1` instrumentation, run against the
+  TCP_NODELAY-fixed handler, isolated the residual cold-stream cost
+  to **bucket 2**: lazy `task.async {}` fiber spawn for the first
+  stream of every connection. Fix: pre-spawn a stream-dispatch fiber
+  pool at connection accept (configurable via `HYPERION_H2_DISPATCH_POOL`,
+  default 4, ceiling 16). h2load `-c 1 -m 1 -n 50` cold first-run:
+  **time-to-1st-byte 20.28 → 9.28 ms (−54%); m=100 throughput +5.5%**.
+  Warm steady-state unchanged (no head-of-line blocking under the small
+  pool — backlog still spills to ad-hoc `task.async`).
+- **2.11-B — HPACK FFI marshalling round-2 (CGlue flipped to default).**
+  Three-way bench (`bench/h2_rails_shape.sh` extended): `ruby` (1,585
+  r/s) vs `native v2` (1,602 r/s, +1% — noise) vs `native v3 / CGlue`
+  (**2,291 r/s, +43% over v2**). The +18-44% native-vs-Ruby headline
+  was almost entirely Fiddle marshalling overhead, not the underlying
+  Rust HPACK encoder — same encoder, no per-call FFI marshalling, +43%
+  rps. Default flipped: unset `HYPERION_H2_NATIVE_HPACK` now selects
+  CGlue. Three escape valves stay (`=v2` to force the old path, `=ruby`
+  / `=off` for the pure-Ruby fallback) for any operator that needs
+  them. Boot log gains a `native_mode` field documenting which path is
+  actually live.
+
+Plus operator infrastructure: a stale-`.dylib`-on-Linux cross-platform
+host-OS portability fix in `H2Codec.candidate_paths` (was silently
+falling through to pure-Ruby on the bench host); `bench/h2_rails_shape.sh`
+race-fixed (boot-log probe + stderr routing). Full bench tables and
+flip-decision rationale in [`CHANGELOG.md`](CHANGELOG.md).
+
 ## What's new in 2.10.1
 
 **Static-asset operator surface (2.10-E) + C-ext fast-path response
