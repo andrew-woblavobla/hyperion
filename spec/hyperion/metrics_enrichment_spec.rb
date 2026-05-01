@@ -259,7 +259,10 @@ RSpec.describe '2.4-C — /-/metrics enrichment' do
         Hyperion::WebSocket::Connection::DEFLATE_RATIO_HISTOGRAM
       ]
       expect(snap).not_to be_nil
-      series = snap[:series][[]]
+      # 2.9-C: deflate-ratio histogram now carries a `route` label;
+      # connections constructed without an env/route fall back to
+      # the `'unrouted'` series.
+      series = snap[:series][['unrouted']]
       expect(series[:count]).to eq(1)
       expect(series[:sum]).to be_within(0.001).of(ratio)
     end

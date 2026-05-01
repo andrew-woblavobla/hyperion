@@ -96,6 +96,10 @@ module Hyperion
 
     class Connection
       attr_reader :subprotocol, :max_message_bytes, :state, :close_code, :close_reason
+      # 2.9-C — count of route-label resolutions for this Connection.
+      # Bumped once at construction; per-message observation paths must
+      # never touch this. Specs use it to guard against per-msg leaks.
+      attr_reader :route_resolutions
 
       # socket           — IO returned by env['rack.hijack'].call. The
       #                    connection assumes ownership; closing the
@@ -122,15 +126,39 @@ module Hyperion
       #                    pair sized to the negotiated window bits, and
       #                    sets RSV1 on outbound text/binary frames. `{}`
       #                    (default) means no compression.
+      # env              — the Rack env at handshake time. Used by 2.9-C to
+      #                    derive a low-cardinality `route` label for the
+      #                    permessage-deflate ratio histogram. Resolution
+      #                    order: explicit `env['hyperion.websocket.route']`
+      #                    (operator-named channel) → templated PATH_INFO
+      #                    via `Hyperion::Metrics.default_path_templater`.
+      #                    Resolved exactly once at construction; cached as
+      #                    a frozen one-element labels Array so the per-
+      #                    message observation is allocation-free.
+      # route            — explicit route override, mostly for unit tests
+      #                    that don't have an `env`. Wins over `env`.
+      # path_templater   — per-conn templater override (specs); falls back
+      #                    to `Hyperion::Metrics.default_path_templater`.
       def initialize(socket, buffered: '', subprotocol: nil,
                      max_message_bytes: 1_048_576,
                      ping_interval: 30, idle_timeout: 60,
-                     extensions: {})
+                     extensions: {}, env: nil, route: nil,
+                     path_templater: nil)
         @socket = socket
         @subprotocol = subprotocol
         @max_message_bytes = max_message_bytes
         @ping_interval = ping_interval
         @idle_timeout = idle_timeout
+
+        # 2.9-C — resolve the route label exactly once, here on the
+        # cold path; cache the frozen labels tuple so every subsequent
+        # `observe_deflate_ratio` reuses it. Reading PATH_INFO + running
+        # the templater per outbound message would add a Hash lookup, a
+        # mutex acquire, and a regex chain to a path that fires once per
+        # frame on chat-shape workloads.
+        @route_resolutions = 0
+        @deflate_ratio_labels = resolve_route_labels(env: env, route: route,
+                                                     path_templater: path_templater)
 
         configure_permessage_deflate(extensions[:permessage_deflate])
 
@@ -730,6 +758,14 @@ module Hyperion
 
       DEFLATE_RATIO_HISTOGRAM = :hyperion_websocket_deflate_ratio
       DEFLATE_RATIO_BUCKETS   = [1.5, 2.0, 5.0, 10.0, 20.0, 50.0].freeze
+      # 2.9-C — `route` label split. Existing aggregate dashboards keep
+      # working: `sum without (route) (rate(...))` recombines the buckets.
+      DEFLATE_RATIO_LABEL_KEYS = %w[route].freeze
+      # 2.9-C — default label tuple for connections that didn't supply an
+      # `env` / `route` at construction (specs, library users that build
+      # a Connection by hand). Frozen so every such conn shares one ref
+      # and the observation path stays allocation-free.
+      UNROUTED_LABELS = ['unrouted'].freeze
 
       def observe_deflate_ratio(original_size, compressed_size)
         return if compressed_size <= 0 || original_size <= 0
@@ -739,11 +775,43 @@ module Hyperion
         metrics = Hyperion.metrics
         metrics.register_histogram(DEFLATE_RATIO_HISTOGRAM,
                                    buckets: DEFLATE_RATIO_BUCKETS,
-                                   label_keys: [])
+                                   label_keys: DEFLATE_RATIO_LABEL_KEYS)
         ratio = original_size.to_f / compressed_size
-        metrics.observe_histogram(DEFLATE_RATIO_HISTOGRAM, ratio)
+        # @deflate_ratio_labels is the per-conn cached frozen labels
+        # tuple — observe with it directly; no per-message allocation.
+        metrics.observe_histogram(DEFLATE_RATIO_HISTOGRAM, ratio,
+                                  @deflate_ratio_labels)
       rescue StandardError
         nil
+      end
+
+      # 2.9-C — resolve the route label for this connection, exactly
+      # once at construction. Returns a frozen one-element Array so the
+      # per-message observation is allocation-free. Resolution order:
+      #
+      #   1. Explicit `route:` kwarg (test / library users)
+      #   2. `env['hyperion.websocket.route']` (operator-named channel)
+      #   3. `PathTemplater#template(env['PATH_INFO'])` (auto)
+      #   4. `'unrouted'` fallback
+      #
+      # Templater errors degrade silently to `'unrouted'` — observability
+      # must never block a Connection from booting.
+      def resolve_route_labels(env:, route:, path_templater:)
+        @route_resolutions += 1
+        resolved =
+          if route && !route.to_s.empty?
+            route.to_s
+          elsif env.is_a?(Hash) && (explicit = env['hyperion.websocket.route']) && !explicit.to_s.empty?
+            explicit.to_s
+          elsif env.is_a?(Hash) && (path = env['PATH_INFO']) && !path.to_s.empty?
+            templater = path_templater || Hyperion::Metrics.default_path_templater
+            templater.template(path.to_s)
+          else
+            'unrouted'
+          end
+        [resolved.dup.freeze].freeze
+      rescue StandardError
+        UNROUTED_LABELS
       end
 
       # Inflate a compressed message. Appends the 4-byte sync trailer

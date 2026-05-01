@@ -29,6 +29,45 @@ corrected.
 
 **No code changes from 2.9-A.** `USERSPACE_CHUNK` stays at 256 KiB.
 
+### 2.9-C — per-route permessage-deflate ratio histogram
+
+`hyperion_websocket_deflate_ratio` (shipped in 2.4-C as a process-wide
+histogram) now carries a `route` label. Operators running ActionCable /
+pubsub apps with multiple channels (chat, notifications, presence,
+telemetry — each with different payload shapes) can finally see which
+channel is paying the Zlib tax for what compression yield.
+
+**Resolution.** `Hyperion::WebSocket::Connection.new` accepts two new
+kwargs (`env:`, `route:`); the route label resolves exactly once at
+construction:
+
+  1. Explicit `route:` kwarg (test / library users)
+  2. `env['hyperion.websocket.route']` (operator-named channel)
+  3. `Hyperion::Metrics.default_path_templater.template(env['PATH_INFO'])`
+     (auto — `/notifications/123` → `/notifications/:id`)
+  4. `'unrouted'` fallback for connections built without `env`
+
+**Hot path.** The resolved label tuple is cached on the `Connection` as
+a frozen one-element Array. The per-message observation is a single
+mutex-guarded Hash lookup against the cached ref — no per-frame regex
+walk, no per-frame allocation. `yjit_alloc_audit_spec` stays at
+≤ 10.0 objects/req on the full HTTP path (the deflate path doesn't
+intersect that audit, but the same zero-allocation discipline applies).
+
+**Cardinality.** Bounded by the templater's LRU (default 1000 entries
+— the same bound that protects `hyperion_request_duration_seconds`'s
+`path` label).
+
+**Backwards compatibility.** Pre-2.9-C dashboards that summed the
+unlabeled histogram keep working: `sum without (route) (rate(...))`
+recovers the prior process-wide signal.
+
+Files: `lib/hyperion/websocket/connection.rb`,
+`spec/hyperion/websocket_per_route_deflate_spec.rb` (8 new specs;
+total → 964), `docs/OBSERVABILITY.md` "Per-route deflate ratio (2.9-C)"
+subsection, `docs/grafana/hyperion-2.4-dashboard.json` two new panels
+("Deflate ratio by route (p50/p99) — 2.9-C").
+
 ## [2.8.0] - 2026-05-01
 
 ### Headline
