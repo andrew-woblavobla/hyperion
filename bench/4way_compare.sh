@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# bench/4way_compare.sh — 2.10-A harness.
+# bench/4way_compare.sh — 2.10-A harness, extended in 2.12-B for a
+# Hyperion handle_static variant.
 #
 # Drives a single rackup (default bench/hello.ru) against all four
 # major Ruby web servers in turn on the same port, capturing wrk
 # requests/sec + p99 latency for three back-to-back 20 s runs each.
 #
-#   * Hyperion — bin/hyperion (this repo)
-#   * Puma     — 8.0.x       (no async-Ruby, threads only)
-#   * Falcon   — 0.55+       (async-Ruby fiber pool)
-#   * Agoo     — 2.15.x      (pure-C HTTP core, see bench/agoo_boot.rb)
+#   * hyperion              — bin/hyperion (this repo, generic Rack rackup)
+#   * hyperion_handle_static — bin/hyperion against an alternate rackup
+#                             (bench/hello_static.ru / static_handle_static.ru)
+#                             that calls `Hyperion::Server.handle_static`
+#                             at boot so the request hot path is the
+#                             2.10-D direct route + 2.10-F C-ext fast path
+#                             (only applicable to hello + small static).
+#   * puma                  — 8.0.x       (no async-Ruby, threads only)
+#   * falcon                — 0.55+       (async-Ruby fiber pool)
+#   * agoo                  — 2.15.x      (pure-C HTTP core, see bench/agoo_boot.rb)
 #
 # Single shell script on purpose: 2.10-B (the actual bench run) wants
 # one command to drive the whole suite, not four. To bench just a
@@ -16,7 +23,20 @@
 #
 #   bench/4way_compare.sh bench/hello.ru hyperion agoo
 #
-# Defaults to all four if no subset is given.
+# 2.12-B — to bench the handle_static variant on a row, pass
+# `hyperion_handle_static` and point HYPERION_STATIC_RACKUP at the
+# alternate rackup:
+#
+#   HYPERION_STATIC_RACKUP=bench/hello_static.ru \
+#     bench/4way_compare.sh bench/hello.ru \
+#       hyperion hyperion_handle_static puma falcon agoo
+#
+# When HYPERION_STATIC_RACKUP is unset the handle_static variant
+# falls back to the same RACKUP as the generic variant (in which
+# case it is a no-op duplicate; harmless but wasteful).
+#
+# Defaults to all four servers (no handle_static variant) if no
+# subset is given — preserves the 2.10-B baseline harness shape.
 #
 # Concurrency budget per server is matched: -t 5 -w 1 (5 threads /
 # fibers, 1 worker / process). Each server gets a fresh PORT bind on
@@ -251,6 +271,25 @@ for srv in "${SUBSET[@]}"; do
       hyp_extra=(${HYPERION_EXTRA:-})
       run_server hyperion bundle exec hyperion "${hyp_extra[@]}" \
         -t "${HYPERION_THREADS:-5}" -w 1 -p "$PORT" "$RACKUP"
+      ;;
+    hyperion_handle_static)
+      # 2.12-B — Hyperion variant booted against an alternate rackup
+      # that pre-registers a handle_static route at boot. The hot path
+      # is the direct-dispatch + C-ext fast-path response writer; no
+      # Rack adapter, no Rack-env build. Falls back to the generic
+      # rackup if HYPERION_STATIC_RACKUP is unset (same data as the
+      # `hyperion` row above; lets operators omit the override
+      # without the harness erroring).
+      hs_rackup="${HYPERION_STATIC_RACKUP:-$RACKUP}"
+      if [ ! -f "$hs_rackup" ]; then
+        echo "[hyperion_handle_static] missing rackup '$hs_rackup' — skipping" | tee -a "$LOG"
+        echo "hyperion_handle_static: SKIP (missing rackup $hs_rackup)" >> "/tmp/4way-summary.log"
+        continue
+      fi
+      # shellcheck disable=SC2206
+      hs_extra=(${HYPERION_EXTRA:-})
+      run_server hyperion_handle_static bundle exec hyperion "${hs_extra[@]}" \
+        -t "${HYPERION_THREADS:-5}" -w 1 -p "$PORT" "$hs_rackup"
       ;;
     puma)
       run_server puma bundle exec puma -t 5:5 -w 1 \
