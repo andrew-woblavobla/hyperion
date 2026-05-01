@@ -1944,6 +1944,10 @@ int pc_internal_stop_requested(void) {
     return hyp_cl_stop ? 1 : 0;
 }
 
+void pc_internal_reset_stop(void) {
+    hyp_cl_stop = 0;
+}
+
 /* Belt-and-suspenders: keep the io_uring sibling's view of the header
  * cap in sync with this file's. Compile-time check via array sizing
  * (we deliberately avoid C11 `_Static_assert` for portability with the

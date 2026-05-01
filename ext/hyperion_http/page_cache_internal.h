@@ -99,6 +99,13 @@ void pc_internal_handoff(int client_fd, const char *partial, size_t partial_len)
  * graceful-shutdown signal. */
 int pc_internal_stop_requested(void);
 
+/* Reset the stop flag to 0. Called by the loop entry points
+ * (`run_static_accept_loop`, `run_static_io_uring_loop`) so a previous
+ * invocation's `stop_accept_loop` doesn't immediately tear down a
+ * fresh loop. Specs hammer this path between examples — the 2.12-C
+ * loop resets inline; the io_uring sibling needs the same surface. */
+void pc_internal_reset_stop(void);
+
 /* The 64 KiB header-cap shared with `page_cache.c`. Re-declared here
  * so io_uring_loop.c doesn't need to mirror the magic number. */
 #ifndef PC_INTERNAL_MAX_HEADER_BYTES

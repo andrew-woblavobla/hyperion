@@ -546,14 +546,42 @@ static void *hyp_iu_run_blocking(void *raw) {
         return NULL;
     }
 
+    /* Bounded wait: the stop flag is flipped from another Ruby thread
+     * on `PageCache.stop_accept_loop`; the listener-close from
+     * `Server#stop` also delivers an -ECANCELED CQE on the multishot
+     * ACCEPT, but the kernel may park us in `submit_and_wait` past
+     * that point. The 250 ms cap means we wake every quarter-second
+     * to re-check the stop flag — well below the human-perceptible
+     * "did graceful shutdown finish?" threshold and small enough that
+     * a smoke spec's `t.join(5)` always succeeds. The timeout is
+     * idle-only: under load the ring stays full and we drain CQEs as
+     * fast as the kernel produces them. */
+    struct __kernel_timespec stop_check_ts;
+    stop_check_ts.tv_sec  = 0;
+    stop_check_ts.tv_nsec = 250 * 1000 * 1000; /* 250 ms */
+
     for (;;) {
         if (pc_internal_stop_requested()) {
             L->stopping = 1;
         }
+        if (L->stopping && L->inflight == 0) {
+            a->graceful = 1;
+            return NULL;
+        }
 
-        int ret = io_uring_submit_and_wait(&L->ring, 1);
+        /* `cqe_ptr` MUST be a valid pointer in liburing 2.5 — passing
+         * NULL segfaults inside the helper (it deref's it to write the
+         * first ready CQE). We don't actually use the ptr (we drain
+         * via `io_uring_for_each_cqe` below), but supplying a stack
+         * slot keeps the helper happy. */
+        struct io_uring_cqe *first_cqe = NULL;
+        int ret = io_uring_submit_and_wait_timeout(&L->ring, &first_cqe, 1,
+                                                   &stop_check_ts, NULL);
+        (void)first_cqe;
         if (ret < 0) {
-            if (ret == -EINTR) {
+            if (ret == -EINTR || ret == -ETIME) {
+                /* Timeout: drain whatever's ready and re-check stop. */
+                (void)hyp_iu_drain_cqes(L);
                 continue;
             }
             if (L->stopping && L->inflight == 0) {
@@ -582,6 +610,11 @@ static VALUE rb_pc_run_static_io_uring_loop(VALUE self, VALUE rb_listen_fd) {
     if (listen_fd < 0) {
         rb_raise(rb_eArgError, "listen_fd must be >= 0");
     }
+
+    /* Reset the stop flag so a previous invocation's
+     * `stop_accept_loop` doesn't immediately tear us down. The 2.12-C
+     * loop does the same dance at entry — see `rb_pc_run_static_accept_loop`. */
+    pc_internal_reset_stop();
 
     /* Clear O_NONBLOCK on the listener — io_uring drives accept itself
      * and we want the kernel to park us in the ring rather than spin

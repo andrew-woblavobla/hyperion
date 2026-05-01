@@ -2,6 +2,7 @@
 
 require 'socket'
 require 'timeout'
+require 'hyperion'
 
 # 2.12-D — io_uring accept loop (Linux 5.x).
 #
