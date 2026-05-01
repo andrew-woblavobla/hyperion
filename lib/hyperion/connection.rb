@@ -213,6 +213,12 @@ module Hyperion
       request_count = 0
       @socket = socket
       @hijacked = false
+      # 2.6-D — sticky flag set after each `:inline_blocking` response
+      # so the next request iteration on the same keep-alive
+      # connection can bypass the per-conn fairness admission check
+      # (and the bookkeeping it carries).  See the
+      # `skip_per_conn_fairness` branch in the request loop below.
+      @last_response_was_static_inline_blocking = false
       # Phase 2b (1.7.1): pre-size the read accumulator once per connection
       # and reuse it across keep-alive requests. `String#clear` between
       # requests preserves the underlying capacity, so subsequent appends
@@ -295,7 +301,21 @@ module Hyperion
         # reserved (caller must release in ensure), false when the cap
         # was hit and a 503 was emitted. nil cap → admit always (hot
         # path stays branchless).
-        if @max_in_flight_per_conn && !per_conn_admit!(socket, peer_addr)
+        #
+        # 2.6-D — skip the fairness check entirely on connections whose
+        # previous response was `:inline_blocking` (auto-detected
+        # static-file traffic).  Static streams are dominated by the
+        # write phase, not concurrent app.call invocations, so the
+        # per-conn fairness cap is dead weight here — its purpose is
+        # to throttle dynamic-route concurrency on a single keep-alive
+        # connection.  Static-asset connections (CDN origins, signed-
+        # download responders) typically run a long sequence of
+        # `to_path` responses; once the first one auto-detects, the
+        # remaining requests skip the admit / release / metric trio.
+        # The flag flips back to false the moment a non-static
+        # response lands on the same connection.
+        skip_per_conn_fairness = @last_response_was_static_inline_blocking
+        if @max_in_flight_per_conn && !skip_per_conn_fairness && !per_conn_admit!(socket, peer_addr)
           @metrics.decrement(:requests_in_flight)
           request_count += 1
           # Don't close — keep the conn alive so the upstream peer can
@@ -309,7 +329,7 @@ module Hyperion
           status, headers, body = call_app(app, request)
         ensure
           @metrics.decrement(:requests_in_flight)
-          per_conn_release! if @max_in_flight_per_conn
+          per_conn_release! if @max_in_flight_per_conn && !skip_per_conn_fairness
         end
 
         # 2.1.0 (WS-1): if the app called `env['rack.hijack'].call` during
@@ -343,6 +363,14 @@ module Hyperion
         # call-site shape.
         @writer.write(socket, status, headers, body, keep_alive: keep_alive,
                                                      dispatch_mode: @response_dispatch_mode)
+        # 2.6-D — record whether this response engaged
+        # `:inline_blocking` so the next request iteration can skip
+        # the per-conn fairness admission check (see the
+        # `skip_per_conn_fairness` branch above).  Sticky on
+        # consecutive static responses; resets on the first non-
+        # static response back on the same conn.
+        @last_response_was_static_inline_blocking =
+          @response_dispatch_mode == :inline_blocking
         @metrics.increment_status(status)
         log_request(request, status, request_started_at) if @log_requests
         # 2.4-C: per-route duration histogram observation. Templating the

@@ -2,6 +2,157 @@
 
 ## [Unreleased] - 2.6.0
 
+### 2.6-D — `:inline_blocking` engagement-gap fix + Connection bookkeeping strip
+
+Two-part landing.  Headline first: closes the 2.6-C runtime
+engagement gap that the maintainer's 2026-05-01 openclaw-vm bench
+flagged ("auto-detect SHOULD kick in here and drop p99 to ~6 ms.
+It doesn't").  Bookkeeping strip second: skip lifecycle hooks +
+per-conn fairness on auto-detected static-file responses.
+
+#### Part 1 — Engagement gap fix (the headline)
+
+**Root cause.**  2.6-C's `Sendfile.copy_to_socket_blocking`
+replaced fiber-yielding `wait_writable` with `IO.select`,
+expecting `IO.select` to park the OS thread on the kernel
+readiness check.  Under `--async-io` it doesn't.  The Async
+gem hooks `Fiber.scheduler.kernel_select`; when the calling
+fiber is non-blocking (the default, including every fiber
+inside `start_async_loop`'s `task.async { dispatch(socket) }`),
+`IO.select` is intercepted by the scheduler and routes through
+its cooperative-yield path — same shape as `wait_writable`,
+just one more layer of indirection.  The auto-detect set the
+flag, the writer plumbed it, the sendfile loop branched on
+it, and EVERY EAGAIN still yielded the fiber.  Unit specs
+that asserted the dispatch_mode flag was set caught only the
+plumbing — they couldn't catch the runtime bypass because
+they ran on a non-Async fiber, where `Fiber.current.blocking?`
+is true by default.
+
+**The fix.**  `ResponseWriter#write_sendfile` wraps the
+entire write path in `Fiber.blocking { ... }` when
+`dispatch_mode == :inline_blocking`.  `Fiber.blocking`
+(class-method block form) flips the calling fiber's
+`Fiber.current.blocking?` to true for the duration; while
+blocking, scheduler hooks (`kernel_select`, `io_wait`,
+`block`) are NOT consulted — the fiber's IO calls go
+straight to the OS, exactly the Puma-style serial-per-
+thread shape `:inline_blocking` was designed to deliver.
+Defensive secondary wrap inside
+`Sendfile.copy_to_socket_blocking` so direct callers get
+the no-yield guarantee even without the writer-level wrap.
+`select_writable_blocking` also wraps when called from a
+non-blocking fiber, belt-and-suspenders.
+
+**Why the unit specs missed it.**  The 2.6-C suite ran
+the writer + sendfile helpers against a `StringIO` /
+direct-`TCPSocket` pair on the spec's main thread — no
+Async reactor, no fiber scheduler current.
+`Fiber.current.blocking?` is true on the main thread by
+default, so the IO.select fell through to the OS as
+expected, and the spec asserting "blocking variant
+fires" passed.  The bug was only observable end-to-end
+under a live `start_async_loop` — which the unit specs
+didn't boot.  2.6-D's regression specs boot a real
+`Async { ... }.wait` block + a real socket pair so the
+fiber-scheduler interception path is actually exercised.
+
+**Bench expectation.**  Pre-2.6-D `--async-io -t 5 -w 1`
+on a 1 MiB warm-cache static asset:
+**1,232 r/s, p99 433-710 ms**.  Post-2.6-D the same
+shape should land at **≥1,200 r/s, p99 ≤10 ms** (within
+noise of the threadpool path's 1,270 r/s p99 6 ms — the
+engagement fix removes the per-chunk fiber round-trip
+the threadpool path never paid).
+
+#### Part 2 — Connection bookkeeping strip on inline_blocking static
+
+When `:inline_blocking` is engaged, the per-conn
+fairness check (2.3-B) and the after-request lifecycle
+hook (2.5-C) are stripped from the request loop:
+
+  * **Per-conn fairness cap** — `Connection#serve` skips
+    the `per_conn_admit!` admission check on the request
+    iteration FOLLOWING a `:inline_blocking` response on
+    the same keep-alive connection.  Sticky flag, resets
+    the moment a non-static response lands.  Static-
+    asset connections (CDN origins, signed-download
+    responders) typically run a long sequence of
+    `to_path` responses; the fairness cap was designed
+    for dynamic-route concurrency throttling and is
+    dead weight on a static stream.
+
+  * **After-request lifecycle hook** — `Adapter::Rack#call`
+    skips `Runtime#fire_request_end` when
+    `Connection#response_dispatch_mode` resolves to
+    `:inline_blocking`.  The before-request hook still
+    fires (it's cheap; useful for span creation,
+    request-id assignment, etc.).  Asymmetric by
+    design: the after-hook is the heavy one (span
+    flush, DB write, async-queue enqueue), and that's
+    the cost we shed.
+
+#### Behaviour change — operators with per-request hooks attached for static-route observability
+
+Pre-2.6-D, `Runtime#on_request_end` fired on EVERY
+request — static-file routes included.  Operators with
+NewRelic / DataDog / OpenTelemetry hooks attached to
+trace span lifecycles would see one span per static
+asset (every `/assets/*.css` / `/uploads/*.png`).  Post-
+2.6-D, those spans STOP firing on auto-detected
+static-file responses.
+
+**Migration.**  The metrics module observes static
+traffic with no hook overhead:
+  * `hyperion_request_duration_seconds` per-route
+    histogram with method/path/status labels.
+  * `:sendfile_responses` counter (per worker).
+  * `:requests_dispatch_inline_blocking` per-mode
+    counter — explicit "this route engaged the
+    static fast path" signal.
+Operators relying on hooks for static observability
+should migrate to these counters/histograms.  The
+hooks remain authoritative for dynamic routes (CPU
+JSON, streaming, hijacked WebSocket, etc.).
+
+#### Files touched
+- `lib/hyperion/response_writer.rb` — `Fiber.blocking`
+  wrap on `write_sendfile` when `dispatch_mode ==
+  :inline_blocking`.  Hot logic split into
+  `write_sendfile_inner` so the wrap is a single
+  method-dispatch when the branch fires, zero cost
+  otherwise.
+- `lib/hyperion/http/sendfile.rb` — defensive
+  `Fiber.blocking` wrap on `copy_to_socket_blocking`
+  + `select_writable_blocking` so direct callers
+  inherit the no-yield guarantee.  No-op when the
+  calling fiber's `blocking?` flag is already true.
+- `lib/hyperion/connection.rb` — `@last_response_was_static_inline_blocking`
+  sticky flag; per-conn fairness admission check is
+  skipped on the request iteration following a
+  `:inline_blocking` response.  Flag resets on the
+  first non-static response.
+- `lib/hyperion/adapter/rack.rb` — `inline_blocking_resolved?`
+  helper consulted by the lifecycle-hook branch in
+  `#call`; `fire_request_end` is skipped when the
+  resolved dispatch mode is `:inline_blocking`.
+- `spec/hyperion/inline_blocking_dispatch_spec.rb` — 4
+  engagement-gap regression specs (Async reactor +
+  socket pair, observe `Fiber.current.blocking?` at
+  the moment of IO.select / sendfile entry), 4
+  lifecycle-hook behaviour specs (before-hook still
+  fires, after-hook skipped on inline_blocking,
+  after-hook still fires on dynamic + on app-error),
+  3 Connection sticky-flag specs.  The pre-2.6-D
+  "fires before-request and after-request hooks on a
+  static-file response" spec is REPLACED with the
+  asymmetric-hook specs because the behaviour
+  changed.
+
+Spec count: 947 → 951 (+4 net; +11 new, -7 superseded
+by replacement specs).  0 failures, 11 pending
+(Linux-only splice tests on macOS).
+
 ### 2.6-C — `:inline_blocking` dispatch mode (Puma-style serial-per-thread sendfile for static)
 
 The biggest remaining 2.6 cut on the static-file row.  Adds a sixth

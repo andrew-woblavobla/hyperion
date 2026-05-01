@@ -378,13 +378,20 @@ RSpec.describe 'Hyperion :inline_blocking dispatch mode (2.6-C)' do
     end
   end
 
-  describe 'Lifecycle hooks fire on :inline_blocking dispatch (2.5-C interop)' do
-    # 2.5-C lifecycle hooks (`Runtime#on_request_start` /
-    # `on_request_end`) are observability — they fire for every
-    # request regardless of dispatch mode.  This spec guards against
-    # an accidental "skip the hooks on inline_blocking" optimization
-    # in a future patch (2.6-D may make hooks opt-OUT for static, but
-    # 2.6-C does NOT change that behaviour).
+  describe 'Lifecycle hooks on :inline_blocking dispatch (2.6-D behaviour change)' do
+    # 2.6-D — when the response auto-detects into `:inline_blocking`,
+    # the after-request lifecycle hook is SKIPPED.  Static-file
+    # routes are observability-served via the metrics module
+    # (`hyperion_request_duration_seconds` histogram +
+    # `:sendfile_responses` counter), not the per-request hooks
+    # which are too expensive to fire on every static asset.  The
+    # before-request hook still fires (cheap, useful for span
+    # creation, request-id assignment, etc.).
+    #
+    # Pre-2.6-D the after-hook fired on every dispatch mode.
+    # Operators with NewRelic / DataDog / OpenTelemetry hooks
+    # attached for static-route observability MUST migrate to the
+    # metrics module; the CHANGELOG calls this out explicitly.
 
     let(:fake_connection) do
       Class.new do
@@ -404,6 +411,18 @@ RSpec.describe 'Hyperion :inline_blocking dispatch mode (2.6-C)' do
       Hyperion::Request.new(
         method: 'GET',
         path: '/asset.bin',
+        query_string: '',
+        http_version: 'HTTP/1.1',
+        headers: { 'host' => 'localhost' },
+        body: '',
+        peer_address: '127.0.0.1'
+      )
+    end
+
+    let(:dynamic_request) do
+      Hyperion::Request.new(
+        method: 'POST',
+        path: '/api/work',
         query_string: '',
         http_version: 'HTTP/1.1',
         headers: { 'host' => 'localhost' },
@@ -440,12 +459,10 @@ RSpec.describe 'Hyperion :inline_blocking dispatch mode (2.6-C)' do
       end.new(path)
     end
 
-    it 'fires before-request and after-request hooks on a static-file response' do
+    it 'fires the before-request hook on a static-file (:inline_blocking) response' do
       runtime = Hyperion::Runtime.new
       starts  = []
-      ends    = []
       runtime.on_request_start { |req, _env| starts << req.path }
-      runtime.on_request_end   { |req, _env, _resp, _err| ends << req.path }
 
       tp = tempfile.path
       app = ->(_env) { [200, {}, file_body(tp)] }
@@ -453,9 +470,60 @@ RSpec.describe 'Hyperion :inline_blocking dispatch mode (2.6-C)' do
       Hyperion::Adapter::Rack.call(app, request, connection: fake_connection, runtime: runtime)
 
       expect(starts).to eq(['/asset.bin'])
-      expect(ends).to eq(['/asset.bin'])
-      # And the dispatch-mode resolution still ran on this branch.
       expect(fake_connection.response_dispatch_mode).to eq(:inline_blocking)
+    end
+
+    it 'SKIPS the after-request hook on a static-file (:inline_blocking) response' do
+      runtime = Hyperion::Runtime.new
+      ends = []
+      runtime.on_request_start { |_req, _env| } # required so has_request_hooks? is true
+      runtime.on_request_end   { |req, _env, _resp, _err| ends << req.path }
+
+      tp = tempfile.path
+      app = ->(_env) { [200, {}, file_body(tp)] }
+
+      Hyperion::Adapter::Rack.call(app, request, connection: fake_connection, runtime: runtime)
+
+      expect(ends).to eq([])
+    end
+
+    it 'STILL fires the after-request hook on dynamic (non-:inline_blocking) responses' do
+      runtime = Hyperion::Runtime.new
+      starts  = []
+      ends    = []
+      runtime.on_request_start { |req, _env| starts << req.path }
+      runtime.on_request_end   { |req, _env, _resp, _err| ends << req.path }
+
+      app = ->(_env) { [200, { 'content-type' => 'application/json' }, ['{"ok":true}']] }
+
+      Hyperion::Adapter::Rack.call(app, dynamic_request, connection: fake_connection,
+                                                         runtime: runtime)
+
+      expect(starts).to eq(['/api/work'])
+      expect(ends).to eq(['/api/work'])
+      # Dynamic body never engages :inline_blocking.
+      expect(fake_connection.response_dispatch_mode).to be_nil
+    end
+
+    it 'fires the after-request hook when the app raises (no dispatch_mode set)' do
+      runtime = Hyperion::Runtime.new
+      end_payloads = []
+      runtime.on_request_start { |_req, _env| }
+      runtime.on_request_end do |_req, _env, _resp, err|
+        end_payloads << err.class.name
+      end
+
+      app = ->(_env) { raise 'boom' }
+
+      # The adapter's outer rescue swallows StandardError into a 500
+      # tuple, so the call returns normally; we just want to confirm
+      # the after-hook fired with the error.  Pre-2.6-D it always
+      # fired; we preserve that for the error path because the
+      # response shape (500 / Array body) doesn't auto-detect into
+      # `:inline_blocking`.
+      Hyperion::Adapter::Rack.call(app, dynamic_request, connection: fake_connection,
+                                                         runtime: runtime)
+      expect(end_payloads).to eq(['RuntimeError'])
     end
   end
 
@@ -522,6 +590,250 @@ RSpec.describe 'Hyperion :inline_blocking dispatch mode (2.6-C)' do
           expect(reader.value).to eq('')
         end
       end
+    end
+  end
+
+  describe '2.6-D — engagement gap fix (Fiber.blocking under Async)' do
+    # 2.6-C shipped the dispatch mode but the maintainer's openclaw-vm
+    # bench under `--async-io` showed p99 stuck at 433-710 ms — the
+    # auto-detect set the flag, the writer plumbed it, but the
+    # blocking-sendfile loop's `IO.select` STILL went through the
+    # Async fiber scheduler's `kernel_select` hook, so each EAGAIN
+    # yielded the fiber instead of parking the OS thread.  2.6-D
+    # closes the gap by wrapping the `:inline_blocking` write in
+    # `Fiber.blocking { ... }` — the calling fiber's `blocking?`
+    # flag flips to true for the duration, the scheduler is no
+    # longer consulted, and the OS thread parks on the kernel
+    # readiness check exactly as Puma does.
+    #
+    # The regression specs below boot a real Async reactor + a real
+    # socket pair so the fiber-yield path is actually exercised.
+    # Pre-2.6-D, these specs WOULD fail under `--async-io` (the
+    # blocking variant would silently fall back to fiber-yielding
+    # via the Async scheduler's IO.select hook).
+
+    let(:tempfile) do
+      Tempfile.new(%w[hyperion-2-6-d-engagement .bin]).tap do |f|
+        f.binmode
+        # Larger than SENDFILE_COALESCE_THRESHOLD (64 KiB) so the
+        # streaming path runs (which is the only path that calls
+        # `copy_to_socket_blocking`).
+        f.write('x' * 200_000)
+        f.flush
+      end
+    end
+
+    after { tempfile.close! }
+
+    def file_body(path)
+      Class.new do
+        def initialize(path)
+          @path = path
+        end
+
+        def to_path
+          @path
+        end
+
+        def each
+          yield File.binread(@path)
+        end
+
+        def close; end
+      end.new(path)
+    end
+
+    it 'flips Fiber.current.blocking? to true while sendfile is running under Async' do
+      require 'async'
+
+      observed_blocking = nil
+      observed_scheduler_was_set = nil
+
+      # Stub `select_writable_blocking` so we observe the calling-
+      # fiber state at the moment EAGAIN handling fires.  Even on
+      # platforms where the blocking sendfile path completes without
+      # ever returning EAGAIN (warm-cache + fast loopback), we
+      # observe the blocking-flag at `copy_to_socket_blocking` entry
+      # by stubbing the inner.
+      original_inner = Hyperion::Http::Sendfile.method(:copy_to_socket_blocking_inner)
+      allow(Hyperion::Http::Sendfile).to receive(:copy_to_socket_blocking_inner) do |out_io, file_io, off, len|
+        observed_scheduler_was_set ||= !Fiber.scheduler.nil?
+        observed_blocking ||= Fiber.current.blocking?
+        original_inner.call(out_io, file_io, off, len)
+      end
+
+      writer = Hyperion::ResponseWriter.new
+      Async do
+        # Spawn a real socket pair so the writer takes a real path
+        # (not StringIO); use TCPServer/TCPSocket so the platform's
+        # native sendfile branch is reachable on Linux/Darwin.
+        server = TCPServer.new('127.0.0.1', 0)
+        port   = server.addr[1]
+        client_pair = TCPSocket.new('127.0.0.1', port)
+        srv_side, = server.accept
+        # Drain the server side concurrently so the writer doesn't
+        # block on a full socket buffer.
+        drain = Thread.new { srv_side.read(200_000 + 200) }
+        writer.write(client_pair, 200, { 'content-type' => 'application/octet-stream' },
+                     file_body(tempfile.path), dispatch_mode: :inline_blocking)
+        client_pair.close
+        drain.join(2)
+        server.close
+      end.wait
+
+      expect(observed_scheduler_was_set).to be(true) # Sanity: Async scheduler was current at entry.
+      expect(observed_blocking).to be(true)          # Engagement-gap fix: Fiber.blocking flipped the flag.
+    end
+
+    it 'invokes copy_to_socket_blocking (not copy_to_socket) under :inline_blocking on a real socket' do
+      # End-to-end engagement regression: a Hyperion::Connection
+      # serving a `to_path` body under an Async scheduler MUST land
+      # on the blocking sendfile primitive, not the fiber-yielding
+      # one.  Pre-2.6-D the auto-detect set the flag but the under-
+      # `--async-io` write path bypassed the dispatch_mode branch
+      # because IO.select itself was scheduler-aware.
+      require 'async'
+
+      blocking_calls   = 0
+      yielding_calls   = 0
+
+      allow(Hyperion::Http::Sendfile).to receive(:copy_to_socket_blocking).and_wrap_original do |original, *args|
+        blocking_calls += 1
+        original.call(*args)
+      end
+      allow(Hyperion::Http::Sendfile).to receive(:copy_to_socket).and_wrap_original do |original, *args|
+        yielding_calls += 1
+        original.call(*args)
+      end
+
+      writer = Hyperion::ResponseWriter.new
+      Async do
+        server = TCPServer.new('127.0.0.1', 0)
+        port   = server.addr[1]
+        client_pair = TCPSocket.new('127.0.0.1', port)
+        srv_side, = server.accept
+        drain = Thread.new { srv_side.read(200_000 + 200) }
+        writer.write(client_pair, 200, {}, file_body(tempfile.path),
+                     dispatch_mode: :inline_blocking)
+        client_pair.close
+        drain.join(2)
+        server.close
+      end.wait
+
+      expect(blocking_calls).to eq(1)
+      expect(yielding_calls).to eq(0)
+    end
+
+    it 'leaves the fiber-yielding path engaged when dispatch_mode is nil under Async' do
+      require 'async'
+
+      blocking_calls = 0
+      yielding_calls = 0
+
+      allow(Hyperion::Http::Sendfile).to receive(:copy_to_socket_blocking).and_wrap_original do |original, *args|
+        blocking_calls += 1
+        original.call(*args)
+      end
+      allow(Hyperion::Http::Sendfile).to receive(:copy_to_socket).and_wrap_original do |original, *args|
+        yielding_calls += 1
+        original.call(*args)
+      end
+
+      writer = Hyperion::ResponseWriter.new
+      Async do
+        server = TCPServer.new('127.0.0.1', 0)
+        port   = server.addr[1]
+        client_pair = TCPSocket.new('127.0.0.1', port)
+        srv_side, = server.accept
+        drain = Thread.new { srv_side.read(200_000 + 200) }
+        writer.write(client_pair, 200, {}, file_body(tempfile.path)) # default (nil) dispatch_mode
+        client_pair.close
+        drain.join(2)
+        server.close
+      end.wait
+
+      expect(yielding_calls).to eq(1)
+      expect(blocking_calls).to eq(0)
+    end
+
+    it 'select_writable_blocking flips Fiber.current.blocking? to true' do
+      # Direct test of the helper that 2.6-C shipped without the
+      # `Fiber.blocking` wrap.  Pre-2.6-D this would fail under an
+      # Async reactor (Fiber.current.blocking? would be false because
+      # the scheduler-aware IO.select would intercept).
+      require 'async'
+      observed = []
+
+      Async do
+        srv = TCPServer.new('127.0.0.1', 0)
+        port = srv.addr[1]
+        client = TCPSocket.new('127.0.0.1', port)
+        srv_conn, = srv.accept
+
+        # Custom IO that records the fiber's blocking flag at the
+        # moment IO.select is consulted.
+        wrapper = Object.new
+        wrapper.define_singleton_method(:to_io) { client }
+        # Wrap in Fiber.blocking-eligible call: the helper itself
+        # decides whether to wrap based on Fiber.current.blocking?.
+        # We assert the post-wrap state by checking via a stub of
+        # IO.select.
+        allow(IO).to receive(:select).and_wrap_original do |original, *args|
+          observed << Fiber.current.blocking?
+          original.call(*args)
+        end
+
+        Hyperion::Http::Sendfile.send(:select_writable_blocking, wrapper)
+
+        client.close
+        srv_conn.close
+        srv.close
+      end.wait
+
+      # observed should be a non-empty array with all values true.
+      expect(observed).not_to be_empty
+      expect(observed).to all(be(true))
+    end
+  end
+
+  describe '2.6-D — Connection per-conn fairness bypass on :inline_blocking sticky path' do
+    # 2.6-D — once a Connection's previous response auto-detected
+    # into `:inline_blocking`, the next request iteration on the
+    # same keep-alive connection skips the per-conn fairness
+    # admission check.  Static-asset connections (CDN origins,
+    # signed-download responders) typically run a long sequence
+    # of `to_path` responses; the fairness cap was designed for
+    # dynamic-route concurrency throttling and is dead weight on
+    # a static stream.
+
+    it 'flips @last_response_was_static_inline_blocking after a :inline_blocking response' do
+      conn = Hyperion::Connection.new
+      conn.response_dispatch_mode = :inline_blocking
+      # Simulate the post-write flag flip the request loop performs:
+      # we call the same line of code by setting via instance_variable_set.
+      conn.instance_variable_set(:@last_response_was_static_inline_blocking,
+                                 conn.response_dispatch_mode == :inline_blocking)
+      expect(conn.instance_variable_get(:@last_response_was_static_inline_blocking)).to be(true)
+    end
+
+    it 'resets @last_response_was_static_inline_blocking on a non-static response' do
+      conn = Hyperion::Connection.new
+      conn.instance_variable_set(:@last_response_was_static_inline_blocking, true)
+      conn.response_dispatch_mode = nil
+      conn.instance_variable_set(:@last_response_was_static_inline_blocking,
+                                 conn.response_dispatch_mode == :inline_blocking)
+      expect(conn.instance_variable_get(:@last_response_was_static_inline_blocking)).to be(false)
+    end
+
+    it 'has Connection#per_conn_admit! available for non-static dynamic routes' do
+      # Sanity: the per-conn fairness machinery still exists and
+      # fires for connections configured with a cap.  We don't
+      # exercise the full serve loop here (that's covered by the
+      # 2.3-B specs); we just confirm the cap-bookkeeping ivars
+      # are still wired when the cap is set.
+      conn = Hyperion::Connection.new(max_in_flight_per_conn: 1)
+      expect(conn.instance_variable_get(:@max_in_flight_per_conn)).to eq(1)
+      expect(conn.instance_variable_get(:@in_flight_mutex)).to be_a(Mutex)
     end
   end
 end

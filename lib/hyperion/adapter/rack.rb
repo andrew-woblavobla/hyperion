@@ -198,6 +198,21 @@ module Hyperion
           # — verified by `yjit_alloc_audit_spec`. Resolving `runtime`
           # is itself zero-allocation: `Runtime.default` returns a
           # memoised singleton.
+          #
+          # 2.6-D — when the response auto-detects into `:inline_blocking`
+          # (static-file body responding to `:to_path`, no streaming
+          # marker) we SKIP the after-request lifecycle hook.  Static
+          # asset traffic is high-volume + low-value for trace
+          # instrumentation: a NewRelic / OpenTelemetry hook firing on
+          # every 200-byte favicon or 1 MiB asset response wastes CPU
+          # finishing spans nobody queries.  Operators wanting to
+          # observe static traffic should use the metrics module
+          # (per-route histogram + sendfile_responses counter), which
+          # is allocation-free on the hot path.  The before-request
+          # hook still fires — its semantic ("the request is about
+          # to be processed") is preserved across all dispatch modes;
+          # it's the after-hook (typically heavy: span flush, DB
+          # write, async-queue enqueue) that benefits from the skip.
           rt = runtime || Hyperion::Runtime.default
           if rt.has_request_hooks?
             rt.fire_request_start(request, env)
@@ -207,8 +222,8 @@ module Hyperion
               rt.fire_request_end(request, env, nil, e)
               raise
             end
-            rt.fire_request_end(request, env, response, nil)
             resolve_dispatch_mode!(env, response, connection)
+            rt.fire_request_end(request, env, response, nil) unless inline_blocking_resolved?(connection)
             return response
           end
 
@@ -328,6 +343,18 @@ module Hyperion
           return unless body.respond_to?(:to_path)
 
           connection.response_dispatch_mode = :inline_blocking
+        end
+
+        # 2.6-D — read-back of the resolved dispatch mode.  Used by the
+        # lifecycle-hook branch in `#call` to decide whether to fire
+        # the after-request hook.  Returns false when `connection` is
+        # nil (h2 streams, ad-hoc adapter callers in specs) so those
+        # paths keep their hook firing behaviour unchanged.
+        def inline_blocking_resolved?(connection)
+          return false unless connection
+          return false unless connection.respond_to?(:response_dispatch_mode)
+
+          connection.response_dispatch_mode == :inline_blocking
         end
 
         def build_env(request, connection: nil)
