@@ -86,7 +86,7 @@ in cluster mode and `CLI.run_single` → `Server` in single-mode.
 | `lib/hyperion/master.rb` | Pass `@config.resolved_preload_static_dirs` through the worker spawn args so cluster mode also warms each worker's page cache at boot. |
 | `lib/hyperion/worker.rb` | Accept and forward `preload_static_dirs:` to `Server.new`. |
 
-**Spec count: 964 → 1004 (+40).** All 1004 examples green; 11 pending
+**Spec count: 1018 → 1045 (+27).** All 1045 examples green; 11 pending
 (unchanged platform-only kTLS / io_uring branches from the 2.10.0 baseline).
 
 ### 2.10-E — bench result: static 1 KiB cold 1,929 r/s vs warm 1,886 r/s (no rps win)
@@ -94,7 +94,7 @@ in cluster mode and `CLI.run_single` → `Server` in single-mode.
 **Honest reading: the preload feature does NOT move sustained throughput
 on the static-1-KB row, but it does normalize first-request latency.**
 
-Bench-only — no production code changes, spec count unchanged at 1004.
+Bench-only — no production code changes, spec count unchanged at 1045.
 
 **Setup (openclaw-vm, Ubuntu 24.04, x86_64, Ruby 3.3.3, page-cache C
 ext compiled fresh against the 2.10-E source).**
