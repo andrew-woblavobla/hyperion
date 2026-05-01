@@ -1,6 +1,28 @@
 # Changelog
 
-## [Unreleased] - 2.9.0
+## [2.9.0] - 2026-05-01
+
+### Headline
+
+A measurement-correction + observability + ops-fix release. The 2.9
+sprint resolved the deferred 2.7 / 2.8 bench items now that openclaw-vm
+is back online, plus shipped the 2.8-A per-route deflate metric that
+was held mid-sprint, plus closed the recurring "Permission denied
+(publickey)" subagent-SSH gap.
+
+| Item | Result |
+|---|---|
+| **2.9-A — chunk-size A/B (2.6-A delta quantified)** | **+7.4% rps** for 256 KiB vs 64 KiB chunk on fresh host (3,358 vs 3,128 r/s median, p99 identical). Real but smaller than 2.6-A's inflated +20.7% (which was measured against a degraded baseline). |
+| **2.9-B — Falcon h2 head-to-head** | **hello: parity. h2_post: Falcon +10%. h2_rails_shape: Hyperion +58%** (Rust HPACK earning its keep on header-heavy responses). 2.10-A finding filed: Hyperion's max-lat stuck at ~40 ms vs Falcon's 5-10 ms (suspect first-stream setup delay). |
+| **2.9-C — Per-route deflate ratio** | `hyperion_websocket_deflate_ratio` now carries a `route` label (explicit `env['hyperion.websocket.route']` or `env['PATH_INFO']` templated). Multi-channel ActionCable operators see per-channel compression. Cardinality bounded by templater LRU. |
+| **2.9-D — Matched-config PG bench** | **Hyperion +29.8% rps, p99 26% lower** at matched pool=80 against local PG (max_conn=100). The 2.0.0 "+378% / 4.78×" was a config artifact; honest architectural advantage is +30% rps + 26% lower tail. |
+| **2.9-E — SSH subagent gap** | Documented in `docs/BENCH_HOST_SETUP.md`. Fix: `IdentitiesOnly yes` + explicit `IdentityFile` in `~/.ssh/config`. Verified hermetic-env reproducibility. |
+
+Spec count: 956 (2.8.0) → **964** (2.9.0). 0 failures, 11 pending.
+
+### Filed for 2.10
+
+- **2.10-A** Hyperion h2 max-lat ~40 ms ceiling (vs Falcon's 5-10 ms). Suspect first-stream setup delay.
 
 ### 2.9-E — Fix recurring SSH "Permission denied (publickey)" subagent gap
 
