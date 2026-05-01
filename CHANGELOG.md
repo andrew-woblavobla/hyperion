@@ -2,6 +2,51 @@
 
 ## [Unreleased] - 2.7.0
 
+### 2.7-C — Generic SSE rackup (drops the Hyperion-flush sentinel)
+
+Bench/docs only — no production code.
+
+The 2.6-E audit pass flagged that `bench/sse.ru` returns chunks via a
+Hyperion-specific `:__hyperion_flush__` sentinel (a hint into
+`ChunkedCoalescer#force_flush!`). On Hyperion the sentinel is
+recognised and treated as a flush hint; on Puma the sentinel is
+emitted **as a literal chunk** (`":__hyperion_flush__"` written to the
+chunked stream), which breaks the wire framing on the wrk side. That
+mis-framing is why the published row 6 in BENCH_HYPERION_2_0.md
+showed Puma at "0 r/s, 11,686 read errors" — a rackup-config artefact,
+NOT a Puma SSE-capability gap. The audit reframed the row honestly
+and filed a generic rackup as the 2.7 follow-up; this is that follow-up.
+
+**Verdict.** Cross-server bench rerun is still owed: bench-host SSH
+was unreachable during the 2.7-C doc pass, so the new row 6b in the
+matrix is parked as **pending** until the next bench-host run lands
+honest numbers for Hyperion vs Puma (and ideally Falcon) on the
+generic rackup.
+
+**Added.** `bench/sse_generic.ru` — 1000 SSE events of ~50 bytes
+each, `"data: event=I ts=T\n\n"` format, returned via a body whose
+`each` method yields **plain Strings** to the server's writer. No
+`:__hyperion_flush__`, no `body.flush`, no `[chunk]` arrays — just
+the Rack 3 standard streaming contract. The rackup is portable and
+boots identically on Hyperion, Puma, and Falcon.
+
+**Verification (local).** Loaded the rackup via `Rack::Builder.parse_file`
+and iterated the body: 1000 chunks, ~34.9 KB total, all `String`,
+zero `Symbol` sentinels. Status 200 + `text/event-stream`. The
+existing `bench/sse.ru` is **untouched** — it remains the right
+rackup for testing Hyperion's flush-sentinel protocol; the new file
+is a sibling, not a replacement.
+
+**Docs.** `docs/BENCH_HYPERION_2_0.md` row 6 reworded as a
+"Hyperion-flush-sentinel internal test, not a fair Puma comparison",
+new row 6b added for the generic rackup with results marked
+**pending** (2.7-C bench-host run owed). The SSE streaming narrative
+section ends with a 2.7-C status note instead of the prior
+"filed for follow-up" line.
+
+**Spec count unchanged** (951 examples, 0 failures, 11 pending) — no
+production code touched.
+
 ### 2.7-B — `lifecycle_hooks_spec.rb` `:share` macOS CI flake fix
 
 Spec-only change. `spec/hyperion/lifecycle_hooks_spec.rb`'s

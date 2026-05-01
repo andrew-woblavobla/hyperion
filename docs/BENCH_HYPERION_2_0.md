@@ -81,7 +81,8 @@ Topology-relevance column: **prod** = applies to nginx-fronted plaintext-h1 depl
 | 3 | CPU-bound JSON `-w 4 -t 5` (`bench/work.ru`) | **15,585** | 12,912 | **+20.7%** | 2.58 ms / 21.82 ms | prod | YES |
 | 4 | Static 1 MiB `-w 1 -t 5` (`bench/static.ru`) | 1,809 | **2,139** | -15.4% | 4.37 ms / 57.74 ms | prod | NO (rps), **YES (p99 13.2× lower)** |
 | 5 | Static 8 KB `-w 1 -t 5` (`bench/static_8k.ru`) | 121 | **1,246** | -90.3% | 43.85 ms / 109.05 ms | prod | **NO** — see [caveat](#caveat-static-8k-at--t-5); -t 64 gets to 1,112; closed in 2.0.1 |
-| 6 | SSE 1000×50 B (`bench/sse.ru`, `wrk -t1 -c1`) | **24** | 0 (Puma fails the rackup) | n/a — see [SSE row](#sse-streaming) | 41.19 ms / — | prod (with caveat) | **NOT a Puma capability gap** — the rackup uses a Hyperion-specific `:__hyperion_flush__` flush sentinel that Puma emits as a literal chunk, breaking the wire framing on the wrk side. A generic SSE workload (no Hyperion sentinel) needs to be added before this row supports a "Puma can't stream" claim. |
+| 6 | SSE 1000×50 B (`bench/sse.ru`, `wrk -t1 -c1`) — **Hyperion-flush-sentinel internal test, not a fair Puma comparison** | **24** | 0 (rackup uses a Hyperion-only sentinel, Puma framing breaks) | n/a — see [SSE row](#sse-streaming) | 41.19 ms / — | prod (with caveat) | Hyperion-only protocol exercise; the cross-server number lives in row 6b. |
+| 6b | SSE 1000×50 B (`bench/sse_generic.ru`, `wrk -t1 -c1`) — **generic Rack 3 chunked rackup, no sentinel** | **pending** (2.7-C bench-host run) | **pending** | **pending** | pending | prod | **pending** — 2.7-C added the rackup; bench-host SSH was unavailable during the doc pass, so the cross-server row is filed as a follow-up rerun (see [SSE row](#sse-streaming)). |
 | 7 | PG-bound 50ms wait (Hyp `--async-io -t 5 -w 1` pool=200 vs Puma `-t 100:100`) | **2,189** (originally; see verification rerun: median **~2,567** at matched-WAN-PG) | 458 | **originally +378%** (4.78×) — **honest matched-config ratio is uncalibrated**; see [Row 7 verification](#row-7-verification-rerun-2026-04-29-2145-utc) | 597 ms / 566 ms | prod | YES (architecturally; magnitude indicative only) |
 | 8 | PG realistic transactional (Hyp `--async-io` pool=64 vs Puma `-t 30`) | **1,216** | 268 | **+354%** (4.54×) — **same apples-to-oranges caveat as row 7**: Hyperion against WAN PG max_conn=500, Puma against local PG max_conn=100. Magnitude indicative only. | 5.96 s / 7.18 s | prod | YES (architecturally; magnitude indicative only) |
 | 9 | TLS h1 hello (Hyp `-t 64 -w 1` vs Puma `-t 5:64`) | **3,425** | 2,142 | **+59.9%** | 78.17 ms / 37.06 ms | bench-only | YES (only if you terminate TLS at Hyperion) |
@@ -308,9 +309,16 @@ response syscalls from ~1000 (one per event) to ~10-15 (1 head + N
 buffer drains + 1 terminator). The syscall-coalescing claim is
 verified at the syscall level in `spec/hyperion/chunked_coalescing_spec.rb`.
 
-**Filed for follow-up**: add `bench/sse_generic.ru` (no Hyperion
-sentinel) and rerun against Puma to characterise Puma's actual SSE
-capability honestly.
+**2.7-C status**: `bench/sse_generic.ru` **has been added** (no
+Hyperion sentinel, just standard Rack 3 streaming — `each` yields
+1000 `"data: ...\n\n"` Strings to the server's writer). It boots and
+serves identically on Hyperion, Puma, and Falcon. Local smoke test
+confirms 1000 chunks, ~35 KB total, all `String` (no `Symbol`
+sentinels) — the rackup is portable. **The cross-server bench rerun
+is still owed**: bench-host (`openclaw-vm`) SSH was unreachable
+during the 2.7-C doc pass, so row 6b in the matrix above is parked
+as `pending` until the next bench-host run lands honest numbers for
+Hyperion vs Puma (and ideally vs Falcon) on the generic rackup.
 
 ## PG-bound 50ms wait
 
