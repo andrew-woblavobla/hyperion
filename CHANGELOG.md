@@ -128,11 +128,34 @@ BENCH section so the cumulative perf delta is visible.
 
 **Headline (vs 2.10-B baseline on openclaw-vm, static 1 KiB row, `-t 5 -w 1`).**
 
-| Build | r/s | vs 2.10-B | vs Agoo 2.15.14 |
+| Build | r/s (median of 3) | vs 2.10-B | vs Agoo 2.15.14 |
 |---|---:|---:|---:|
-| 2.10-B baseline (Hyperion 2.9.0) | 1,380 | — | -47% (Agoo wins) |
-| **2.10-C with PageCache engaged** | _filled by bench commit_ | _delta_ | _delta_ |
+| 2.10-B baseline (Hyperion 2.9.0) | 1,380 | — | −47% (Agoo wins) |
+| **2.10-C with PageCache engaged** | **1,880** | **+36%** | −28% |
 | Agoo 2.15.14 (reference) | 2,606 | +89% | — |
+
+Three trials on openclaw-vm: 1880 / 1932 / 1794 r/s; latency
+median dropped from ≈3.7 ms to ≈2.7 ms.  The PageCache primitive
+delivers the response-buffer half of agoo's small-static
+advantage; the remaining gap to Agoo on the 1 KiB row lives in
+connection handling — Hyperion's HTTP/1.1 path spawns a thread
+per accept, while Agoo runs an event-loop model.  That gap is
+the explicit subject of 2.10-D / 2.10-E / 2.10-F (connection
+fastpath + Rack-bypass routes), each of which will reuse the
+PageCache primitive shipped here.
+
+**Plan target was 5,000 r/s.** That target assumed the PageCache
+could remove the entire Rack-stack cost on a hit, but the
+adapter still pays for ENV pool acquire + header hash iteration
++ the file_size stat from ResponseWriter; on a strace −f over
+500 warm-cache requests we still see 500 × accept4 + 500 ×
+clone3 (per-conn thread spawn) + 500 × stat.  The cache buffer
+itself contributes 500 × write() — the single-syscall promise
+holds inside the cache, but the wider connection path drops
+~18,000 syscalls on the 500-request slice (≈36 syscalls /
+request) of which ~8 are application-level.  Closing the rest
+to one syscall per response is 2.10-F's job (the direct-route
+register).
 
 The win source mirrors agoo's `agooPage` design: each cached static
 asset's full HTTP/1.1 response (status line + Content-Type +
