@@ -2,7 +2,40 @@
 
 ## [Unreleased] - 2.11.0
 
-### 2.11-B — HPACK FFI marshalling round-2 (`HYPERION_H2_NATIVE_HPACK` native-mode axis)
+### 2.11-B — HPACK FFI marshalling round-2 (cglue confirmed as firm default; +43% v3 vs v2 on Rails-shape h2)
+
+**Bench result (openclaw-vm, 25-header h2load -c 1 -m 100 -n 5000, 3 runs/variant, median):**
+
+| Variant | Env value | Median rps |
+|---|---|---:|
+| Ruby fallback | `=off`   | 1585.35 r/s |
+| Native v2 (Fiddle, forced) | `=v2`    | 1602.27 r/s |
+| Native v3 (CGlue, forced)  | `=cglue` | 2291.44 r/s |
+
+| Delta | Value |
+|---|---:|
+| native (v2) vs ruby | +1.1% (within noise) |
+| **cglue (v3) vs native (v2)** | **+43.0%** (HEADLINE — Fiddle marshalling overhead) |
+| cglue (v3) vs ruby            | +44.5% (total native win) |
+
+**Decision: flip cglue default ON.** The bench cleanly attributes the
++18-44% native-vs-ruby headline to the C-glue path's elimination of
+per-call Fiddle marshalling, *not* to the underlying Rust HPACK
+encoder. With cglue forced off, native v2 is +1-5% over ruby —
+basically noise on this header count. The 2.5-B headline ("+18%
+native vs ruby") was actually measuring v3 vs ruby because `=1`
+silently picked v3 on cglue-available hosts; 2.11-B's `=v2` token
+made the v2-only number measurable for the first time.
+
+The `:auto` resolved state (unset / `=1` / `=true`) was already
+selecting cglue when available since 2.4-A; this round confirms
+that selection and updates the boot-log mode string to advertise
+cglue as the de jure default. The runtime behavior on a host where
+cglue is available is unchanged from 2.10 — the de facto cglue
+selection becomes de jure, with a `default since 2.11-B` marker
+in the human-readable `mode` log field.
+
+
 
 The 2.5-B Rails-shape bench measured native v3 (CGlue) at +18% over
 the Ruby fallback on a 25-header response — comfortably above the
