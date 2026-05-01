@@ -147,6 +147,15 @@ RSpec.describe 'TLS kTLS (Phase 9 / 2.2.0)' do
 
   describe 'Linux-only: kTLS engages with default :auto policy' do
     it 'sees the tls kernel module loaded with positive refcount after a request' do
+      # 2.13-C — Hard platform gate first. The previous gate
+      # (`unless Hyperion::TLS.ktls_supported?`) consulted the cached
+      # platform probe, which other specs in the suite stub via
+      # `allow(Etc).to receive(:uname)`. If those stubs ever leak — or
+      # if the probe state's lifecycle drifts under a particular seed —
+      # this body runs on macOS and fails. The runtime-platform check
+      # here is unstubbable from another spec and matches the example's
+      # title intent.
+      skip 'Linux-only path' unless RUBY_PLATFORM.include?('linux')
       skip 'Linux-only path' unless Hyperion::TLS.ktls_supported?
 
       cert, key = TLSHelper.self_signed
@@ -189,6 +198,11 @@ RSpec.describe 'TLS kTLS (Phase 9 / 2.2.0)' do
     end
 
     it 'tls_ktls: :off does NOT set OP_ENABLE_KTLS even on a kTLS-capable host' do
+      # 2.13-C — see the platform-gate comment on the sibling example.
+      # This was the seed-dependent flake during the 2.11.0 release-cut
+      # sweep: under one seed the probe-only gate let the body run on
+      # macOS and assert against the kTLS-supported branch.
+      skip 'Linux-only path' unless RUBY_PLATFORM.include?('linux')
       skip 'Linux-only path' unless Hyperion::TLS.ktls_supported?
 
       cert, key = TLSHelper.self_signed
