@@ -45,11 +45,36 @@ module Hyperion
       @cglue_available == true
     end
 
+    # 2.11-B — operator-controllable gate that overlays CGlue
+    # availability. The Encoder/Decoder hot paths probe this (NOT
+    # `cglue_available?`) so a `HYPERION_H2_NATIVE_HPACK=v2` boot can
+    # force the Fiddle path even on a host where the C glue loaded
+    # successfully. This is the bench-isolation knob 2.11-B's
+    # `bench/h2_rails_shape.sh` needs to compare native-v2 against
+    # native-v3 honestly — without it, "native" and "cglue" variants
+    # would always pick the same physical path.
+    #
+    # `Http2Handler#initialize` writes the gate based on the env var;
+    # tests can flip `@cglue_disabled` directly. Default false (i.e.,
+    # gate is OPEN — same physical behavior as 2.4-A through 2.10).
+    def self.cglue_active?
+      cglue_available? && !@cglue_disabled
+    end
+
+    def self.cglue_disabled=(value)
+      @cglue_disabled = value ? true : false
+    end
+
+    def self.cglue_disabled
+      @cglue_disabled == true
+    end
+
     # Force a reload (test seam). Unsets the memoized state so the next
     # `available?` call probes the filesystem again.
     def self.reset!
       @available = nil
       @cglue_available = nil
+      @cglue_disabled = false
       @lib = nil
     end
 
@@ -126,7 +151,13 @@ module Hyperion
         # into a new owned String — that's the contract callers rely
         # on (`protocol-http2`'s Compressor#encode returns a String,
         # not a slice into shared mutable memory).
-        if H2Codec.cglue_available?
+        #
+        # 2.11-B — probe `cglue_active?` (NOT `cglue_available?`) so an
+        # operator-set `HYPERION_H2_NATIVE_HPACK=v2` boot routes through
+        # Fiddle even when the C glue is physically present. Same
+        # branch shape; one extra ivar read on the hot path which
+        # disappears under YJIT inlining.
+        if H2Codec.cglue_active?
           # Pad the scratch String with zero bytes so its length matches
           # capacity — the C ext writes into RSTRING_PTR up to RSTRING_LEN
           # and then truncates back via rb_str_set_len after encoding.
@@ -272,7 +303,8 @@ module Hyperion
         # 2.4-A — fast path: reuse a per-decoder scratch and dispatch
         # through the C glue. The Rust ABI writes `[u32 name_len][name]
         # [u32 val_len][val]` repeated; we unpack that in Ruby.
-        if H2Codec.cglue_available?
+        # 2.11-B — `cglue_active?` overlays an operator-set v2 force.
+        if H2Codec.cglue_active?
           if capacity > @scratch_out_capacity
             new_cap = @scratch_out_capacity
             new_cap *= 2 while new_cap < capacity

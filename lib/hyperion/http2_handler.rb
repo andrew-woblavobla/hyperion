@@ -515,14 +515,19 @@ module Hyperion
       # threshold. 2.4-A's hello-shape bench saw parity because HPACK
       # is <1% of per-stream CPU on a 2-header response.
       #
+      # 2.11-B — `HYPERION_H2_NATIVE_HPACK` extended with a native-mode
+      # axis (`auto` / `cglue` / `v2` / `off`). See `resolve_h2_native_hpack_state`.
       # Operators who want the prior 2.4.x default (Ruby fallback, env
-      # var unset) can now set `HYPERION_H2_NATIVE_HPACK=off` (or
-      # `0`/`false`/`no`/`off`) explicitly. `HYPERION_H2_NATIVE_HPACK=1`
-      # still works for explicit opt-in.
+      # var unset) can set `HYPERION_H2_NATIVE_HPACK=off` (or
+      # `0`/`false`/`no`/`off`/`ruby`). `HYPERION_H2_NATIVE_HPACK=1`
+      # / unset preserves the 2.5-B `auto` behavior. `=cglue`/`=v2`
+      # forces the corresponding native sub-path.
       #
       # When OFF (env-overridden): `protocol-http2`'s pure-Ruby HPACK
       # Compressor / Decompressor handles everything as in 2.0.0–2.4.x.
-      @h2_native_hpack_enabled = @h2_codec_available && resolve_h2_native_hpack_default
+      @h2_native_mode          = resolve_h2_native_hpack_state
+      @h2_native_hpack_enabled = @h2_codec_available && @h2_native_mode != :off
+      apply_h2_cglue_gate(@h2_native_mode)
       @h2_codec_native = @h2_native_hpack_enabled # back-compat ivar — preserved for codec_native? readers
       # 2.10-G — opt-in connection-setup timing instrumentation. When set,
       # `serve` captures four monotonic timestamps per connection:
@@ -590,21 +595,42 @@ module Hyperion
       %w[1 true yes on].include?(v.downcase)
     end
 
-    # Read an env-var flag with explicit OFF support. Used by
-    # `HYPERION_H2_NATIVE_HPACK` since 2.5-B flipped the default to ON.
-    # Returns true if the env var is unset / empty / explicitly truthy;
-    # returns false only when the operator sets it to a truthy-OFF
-    # value (0/false/no/off, case-insensitive). Anything else falls
-    # back to the default-on behavior so we don't surprise operators
-    # who set typo'd values.
-    def resolve_h2_native_hpack_default
+    # 2.11-B — resolve the operator-requested native-mode state from
+    # `HYPERION_H2_NATIVE_HPACK`.
+    #
+    # Returns one of:
+    #   * `:auto`  — native enabled, prefer cglue if available
+    #                (unset / `1` / `true` / `yes` / `on` / `auto`)
+    #   * `:cglue` — native enabled, force cglue (warn-fallback to v2
+    #                if cglue is unavailable; native_mode log marker
+    #                surfaces the divergence to the operator)
+    #   * `:v2`    — native enabled, force Fiddle (skip cglue even if
+    #                available; this is the bench-isolation knob the
+    #                2.11-B Rails-shape harness needs)
+    #   * `:off`   — ruby fallback (`0` / `false` / `no` / `off` / `ruby`)
+    #
+    # Unknown values fall through to `:auto` rather than crashing the
+    # connection — same forgiving-default policy as the pre-2.11-B
+    # `resolve_h2_native_hpack_default`.
+    def resolve_h2_native_hpack_state
       v = ENV['HYPERION_H2_NATIVE_HPACK']
-      return true if v.nil? || v.empty?
+      return :auto if v.nil? || v.empty?
 
       lc = v.downcase
-      return false if %w[0 false no off].include?(lc)
+      return :off   if %w[0 false no off ruby].include?(lc)
+      return :cglue if %w[cglue v3].include?(lc)
+      return :v2    if %w[v2 fiddle].include?(lc)
 
-      true
+      :auto
+    end
+
+    # 2.11-B — flip the global `H2Codec.cglue_disabled` gate based on
+    # the resolved native-mode state. The gate is per-process state
+    # (the codec module is a singleton) so reset it on every handler
+    # construction; otherwise a test that booted with `=v2` would leak
+    # the disable into a subsequent default-mode handler.
+    def apply_h2_cglue_gate(state)
+      Hyperion::H2Codec.cglue_disabled = (state == :v2)
     end
 
     # 2.0.0 Phase 6b: emit a single-shot boot log line per process
@@ -615,23 +641,32 @@ module Hyperion
       return if Hyperion::Http2Handler.instance_variable_get(:@codec_state_logged)
 
       Hyperion::Http2Handler.instance_variable_set(:@codec_state_logged, true)
-      cglue_active = @h2_native_hpack_enabled && Hyperion::H2Codec.cglue_available?
-      mode =
-        if @h2_native_hpack_enabled && cglue_active
-          'native (Rust v3 / CGlue) — HPACK on hot path, no Fiddle per call'
-        elsif @h2_native_hpack_enabled
-          'native (Rust v2 / Fiddle) — HPACK on hot path, Fiddle marshalling per call'
-        elsif @h2_codec_available
-          'fallback (protocol-http2 / pure Ruby HPACK) — native available but opted out via HYPERION_H2_NATIVE_HPACK=off'
-        else
-          'fallback (protocol-http2 / pure Ruby HPACK) — native unavailable'
-        end
+      # 2.11-B — `cglue_active` gates on the operator-controllable
+      # `cglue_active?` predicate (was `cglue_available?` pre-2.11-B).
+      # When the operator sets `=v2` we want the boot log to read
+      # `cglue_active: false` even though the C glue did install
+      # successfully — the bench harness inspects this field to
+      # differentiate the variants.
+      cglue_active = @h2_native_hpack_enabled && Hyperion::H2Codec.cglue_active?
+      cglue_requested_unavailable = @h2_native_mode == :cglue &&
+                                    @h2_native_hpack_enabled &&
+                                    !Hyperion::H2Codec.cglue_available?
+      mode = describe_codec_mode(cglue_active: cglue_active,
+                                 cglue_requested_unavailable: cglue_requested_unavailable)
+      native_mode_log = if !@h2_native_hpack_enabled
+                          @h2_native_mode == :off ? 'off' : 'native-disabled'
+                        elsif cglue_requested_unavailable
+                          'cglue-requested-unavailable'
+                        else
+                          @h2_native_mode.to_s
+                        end
       @logger.info do
         {
           message: 'h2 codec selected',
           mode: mode,
           native_available: @h2_codec_available,
           native_enabled: @h2_native_hpack_enabled,
+          native_mode: native_mode_log,
           cglue_active: cglue_active,
           hpack_path: if @h2_native_hpack_enabled
                         cglue_active ? 'native-v3' : 'native-v2'
@@ -642,6 +677,29 @@ module Hyperion
       end
       @metrics.increment(:h2_codec_native_selected) if @h2_native_hpack_enabled
       @metrics.increment(:h2_codec_fallback_selected) unless @h2_native_hpack_enabled
+    end
+
+    # 2.11-B — boot-log mode descriptor (extracted for clarity since
+    # the matrix of native_mode × cglue_available × cglue_active grew
+    # past the point where an inline conditional was readable).
+    def describe_codec_mode(cglue_active:, cglue_requested_unavailable:)
+      if !@h2_native_hpack_enabled
+        if @h2_codec_available
+          'fallback (protocol-http2 / pure Ruby HPACK) — native available but opted out via HYPERION_H2_NATIVE_HPACK=off'
+        else
+          'fallback (protocol-http2 / pure Ruby HPACK) — native unavailable'
+        end
+      elsif cglue_active && @h2_native_mode == :cglue
+        'native (Rust v3 / CGlue, forced) — HPACK on hot path, no Fiddle per call'
+      elsif cglue_active
+        'native (Rust v3 / CGlue) — HPACK on hot path, no Fiddle per call'
+      elsif @h2_native_mode == :v2
+        'native (Rust v2 / Fiddle, forced) — HPACK on hot path, Fiddle marshalling per call'
+      elsif cglue_requested_unavailable
+        'native (Rust v2 / Fiddle) — CGlue requested via HYPERION_H2_NATIVE_HPACK=cglue but unavailable, fell back'
+      else
+        'native (Rust v2 / Fiddle) — HPACK on hot path, Fiddle marshalling per call'
+      end
     end
 
     # Read-only accessor used by tests + diagnostics. true = the

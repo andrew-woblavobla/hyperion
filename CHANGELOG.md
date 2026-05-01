@@ -2,6 +2,80 @@
 
 ## [Unreleased] - 2.11.0
 
+### 2.11-B — HPACK FFI marshalling round-2 (`HYPERION_H2_NATIVE_HPACK` native-mode axis)
+
+The 2.5-B Rails-shape bench measured native v3 (CGlue) at +18% over
+the Ruby fallback on a 25-header response — comfortably above the
++15% flip threshold, which moved the native-vs-Ruby default to ON.
+The remaining open question 2.5-B punted on: how much of that +18%
+is the Rust HPACK encoder, and how much is the C-glue path's
+elimination of per-call Fiddle marshalling? A direct A/B was
+impossible at the time because `=1` always picked v3 on hosts
+where the C glue had installed successfully.
+
+**Surface change.** `HYPERION_H2_NATIVE_HPACK` now accepts an
+explicit native-mode token alongside the legacy Boolean values.
+The legacy values still resolve to the same physical path they
+did before, so this is back-compat for every operator who set the
+env var pre-2.11-B:
+
+| Value | Resolves to | Pre-2.11-B behavior | 2.11-B behavior |
+|---|---|---|---|
+| (unset) / `1` / `true` / `yes` / `on` / `auto` | `:auto`  | native, prefer cglue | native, prefer cglue (unchanged) |
+| `cglue` / `v3`        | `:cglue` | (same as `1`) | force cglue, warn-fallback to v2 |
+| `v2` / `fiddle`       | `:v2`    | (same as `1`) | force v2/Fiddle (skip cglue even if installed) |
+| `0` / `false` / `no` / `off` / `ruby` | `:off`   | ruby fallback | ruby fallback (unchanged) |
+
+The new `=v2` value is the bench-isolation knob `bench/h2_rails_shape.sh`
+needs: without it the harness's "native" variant silently picked v3
+on bench hosts where the C glue loaded successfully, making the
+v2-vs-v3 delta unmeasurable. With `=v2` the operator can force the
+Fiddle path on a host where cglue is physically present.
+
+**Implementation.** `Hyperion::H2Codec.cglue_active?` overlays
+`cglue_available?` with an operator-controllable gate
+(`H2Codec.cglue_disabled = true|false`). The Encoder/Decoder hot
+paths probe `cglue_active?` (was `cglue_available?`); one extra
+ivar read per encode call which YJIT inlines away. `Http2Handler`
+sets the gate at construction based on the resolved native-mode
+state. The gate is global (the codec module is a singleton); the
+handler resets it on every construction so a `=v2` boot can't leak
+the disable into a subsequent default-mode handler.
+
+**Boot log.** The `h2 codec selected` log line gains a new `native_mode`
+field exposing the operator-requested mode (`auto` / `cglue` / `v2` /
+`off` / `cglue-requested-unavailable`). The existing `hpack_path`
+field continues to be one of `pure-ruby` / `native-v2` / `native-v3` —
+unchanged, ops dashboards keying off it keep working. The `mode`
+human-readable string differentiates `forced` from `auto` selections
+so a misconfigured `=cglue` boot on a host without the C glue is
+visible in one log line instead of requiring a process trace.
+
+**Bench harness.** `bench/h2_rails_shape.sh` now runs three variants
+(`ruby`, `native`, `cglue`) instead of two and emits
+`delta_native_vs_ruby` (informational — should reproduce the 2.5-B
++18% headline) plus `delta_cglue_vs_native` (the headline for
+2.11-B — does cutting per-call Fiddle marshalling buy anything on
+top of the v2 path?). The decision rule keys off the cglue-vs-native
+delta:
+
+| Outcome (cglue vs native) | Action |
+|---|---|
+| ≥ +15% rps | Flip cglue default ON (replace 2.5-B's auto-cglue dance) |
+| Parity / +5-10% (within noise) | Keep cglue opt-in, file as deferred |
+| ≥ −2% (negative) | Investigate, do not ship |
+
+Each variant runs 3x, output is the median.
+
+**Spec coverage.** `spec/hyperion/h2_codec_native_mode_spec.rb` — 17
+new examples covering: each native-mode token resolves to the
+expected `hpack_path`; `=cglue` on a host without the C glue logs
+`native_mode=cglue-requested-unavailable` and falls through to v2;
+`=v2` actually flips `H2Codec.cglue_active?` to false even when
+cglue is available; the three bench-variant tokens
+(`{off,v2,cglue}`) produce the three distinct `hpack_path` values
+the harness compares.
+
 ### 2.11-A — h2 first-stream TLS handshake parallelization (Bucket 2: pre-spawned dispatch worker pool)
 
 The 2.10-G TCP_NODELAY fix lifted the ~40 ms h2 max-latency ceiling
