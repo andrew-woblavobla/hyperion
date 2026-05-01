@@ -86,13 +86,33 @@ if [ ! -f "$REPO_ROOT/$RACKUP" ]; then
 fi
 
 stop_port() {
+  # Kill the master AND every worker. `lsof -ti tcp:$PORT` only
+  # reports processes with the listening socket open — workers DO
+  # share the listener (SO_REUSEPORT or fd-share), so they show up
+  # too, but the master is the supervisor: killing only the workers
+  # makes it respawn fresh ones into the same SO_REUSEPORT group,
+  # and those then handle the next run's traffic alongside whatever
+  # we boot — corrupting the per-worker request distribution
+  # numbers. Match by pgrep on `bin/hyperion` so master + every
+  # worker (which all carry the same exec name) goes down together.
   local pids
-  pids=$(lsof -ti tcp:"$PORT" 2>/dev/null || true)
+  pids=$(pgrep -f "[h]yperion .*-p $PORT" 2>/dev/null || true)
+  if [ -z "$pids" ]; then
+    pids=$(lsof -ti tcp:"$PORT" 2>/dev/null || true)
+  fi
   if [ -n "$pids" ]; then
-    log "[harness] killing stragglers on port $PORT: $pids"
+    log "[harness] killing master+workers on port $PORT: $(echo "$pids" | tr '\n' ' ')"
     # shellcheck disable=SC2086
     kill -KILL $pids 2>/dev/null || true
-    sleep 1
+    sleep 2
+    # Belt-and-suspenders: any remaining LISTEN-fd holder gets a
+    # second SIGKILL pass after the master had its chance to reap.
+    pids=$(lsof -ti tcp:"$PORT" 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+      # shellcheck disable=SC2086
+      kill -KILL $pids 2>/dev/null || true
+      sleep 1
+    fi
   fi
 }
 

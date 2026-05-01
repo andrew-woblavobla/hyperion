@@ -142,27 +142,9 @@ module Hyperion
       buf << render(metrics_sink.snapshot)
       buf << render_histograms(metrics_sink.histogram_snapshot)
       buf << render_gauges(metrics_sink.gauge_snapshot)
-      labeled = metrics_sink.labeled_counter_snapshot
-      # 2.12-E — fold in the C-loop counter ONLY for the process-wide
-      # default Metrics sink (the one the C accept loop's served
-      # requests are conceptually attributed to). Arbitrary spec-only
-      # `Metrics.new` fixtures aren't connected to the C loop, so
-      # surfacing a process-global atomic on them would let a counter
-      # bumped by a previous test leak into a "fresh-sink, empty-body"
-      # assertion. Production paths (AdminMiddleware,
-      # AdminListener) read `Hyperion.metrics` which IS the default
-      # sink, so the fold-in still fires there.
-      labeled = merge_c_loop_into_dispatch_snapshot(labeled) if owns_c_loop_counter?(metrics_sink)
+      labeled = merge_c_loop_into_dispatch_snapshot(metrics_sink.labeled_counter_snapshot)
       buf << render_labeled_counters(labeled)
       buf
-    end
-
-    def owns_c_loop_counter?(metrics_sink)
-      return false unless defined?(::Hyperion::Runtime)
-
-      metrics_sink.equal?(::Hyperion::Runtime.default.metrics)
-    rescue StandardError
-      false
     end
 
     # 2.12-E — merge `Hyperion::Http::PageCache.c_loop_requests_total`
@@ -174,23 +156,34 @@ module Hyperion
     # loop bypasses `Connection#serve`, so no Ruby-side
     # `tick_worker_request` call ever lands.
     #
+    # We only fold in when the labeled-counter family is ALREADY in
+    # the snapshot — i.e., something on the Ruby side has called
+    # `Metrics#tick_worker_request` at least once on this sink. The
+    # `Server#run_c_accept_loop` boot path performs a single
+    # registration tick on the runtime's metrics sink so this
+    # condition holds for any production cluster engaging the C loop.
+    #
+    # Why the gate matters: spec fixtures that `Hyperion::Metrics.new`
+    # to assert "empty body when no metrics have been recorded" would
+    # otherwise pull in a process-global atomic bumped by an earlier
+    # spec's C-loop run. Those fixtures never register the family, so
+    # the fold-in skips them cleanly.
+    #
     # Idempotent on snapshots that already contain a series for the
-    # current PID (the Connection-served + h2 requests from this same
-    # worker are added to the C-loop count). Pure on the input — we
-    # build a deep-enough copy of the snapshot so the live Hash
-    # behind `Metrics#labeled_counter_snapshot` isn't mutated.
+    # current PID. Pure on the input — we build a shallow copy of the
+    # snapshot so the live Hash behind `Metrics#labeled_counter_snapshot`
+    # isn't mutated.
     #
     # Defensive: when the C ext isn't loaded (JRuby / TruffleRuby) we
     # silently skip — the snapshot stays Ruby-only.
     def merge_c_loop_into_dispatch_snapshot(snap)
+      family = snap[REQUESTS_DISPATCH_TOTAL]
+      return snap if family.nil?
+
       c_loop_count = c_loop_requests_total
       return snap if c_loop_count <= 0
 
       pid_label = Process.pid.to_s
-      family = snap[REQUESTS_DISPATCH_TOTAL] || {
-        meta: { label_keys: %w[worker_id].freeze },
-        series: {}
-      }
       merged_series = family[:series].dup
       key = [pid_label].freeze
       existing_key = merged_series.keys.find { |k| k.first == pid_label } || key

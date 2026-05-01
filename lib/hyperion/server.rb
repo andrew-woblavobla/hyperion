@@ -460,6 +460,16 @@ module Hyperion
       pc.set_lifecycle_callback(ConnectionLoop.build_lifecycle_callback(@runtime))
       pc.set_lifecycle_active(@runtime.has_request_hooks?)
       pc.set_handoff_callback(ConnectionLoop.build_handoff_callback(self))
+      # 2.12-E — register the per-worker request counter family on the
+      # runtime's metrics sink BEFORE the C loop starts ticking. The
+      # PrometheusExporter's C-loop fold-in is gated on the family
+      # already existing in the snapshot (so spec-only sinks that
+      # never tick stay clean), and the C accept loop bypasses
+      # `Connection#serve` — without an explicit boot-time register,
+      # a 100% C-loop worker would scrape zero requests even with
+      # the atomic happily ticking.
+      runtime_metrics.ensure_worker_request_family_registered! \
+        if runtime_metrics.respond_to?(:ensure_worker_request_family_registered!)
 
       # 2.12-D — io_uring path takes precedence over accept4 when the
       # operator opted in AND the runtime probe at boot succeeds. The

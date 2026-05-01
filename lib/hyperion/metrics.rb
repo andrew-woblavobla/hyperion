@@ -139,7 +139,12 @@ module Hyperion
       increment_labeled_counter(REQUESTS_DISPATCH_TOTAL, [label])
     end
 
-    private def ensure_worker_request_family_registered!
+    # 2.12-E — Idempotently register the labeled-counter family. Public
+    # so `Server#run_c_accept_loop` can register at boot — the
+    # PrometheusExporter's C-loop fold-in is gated on the family being
+    # in the snapshot, and a 100% C-loop worker never goes through
+    # `tick_worker_request` to register lazily.
+    def ensure_worker_request_family_registered!
       return if @worker_request_family_registered
 
       register_labeled_counter(REQUESTS_DISPATCH_TOTAL, label_keys: WORKER_ID_LABEL_KEYS)
