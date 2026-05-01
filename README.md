@@ -174,11 +174,17 @@ See [`docs/WEBSOCKETS.md`](docs/WEBSOCKETS.md).
 All numbers are real wrk runs against published Hyperion configs. Hyperion ships **with default-ON structured access logs**; Puma comparisons use Puma defaults (no per-request log emission). Each section is stamped with the Hyperion version + bench host it was measured against — bench-host drift over time is real (see "Bench-host drift" note below).
 
 **Headline doc**: the most recent comprehensive sweep is
-[`docs/BENCH_HYPERION_2_0.md`](docs/BENCH_HYPERION_2_0.md) (Hyperion
-2.0.0 vs Puma 8.0.1, 16-vCPU Ubuntu 24.04, 12 workloads). The 1.6.0
-matrix at [`docs/BENCH_2026_04_27.md`](docs/BENCH_2026_04_27.md) covers
-9 workloads × 25+ configs against hyperion-async-pg 0.5.0; both docs
-include caveats and per-row reproduction commands.
+[`docs/BENCH_HYPERION_2_11.md`](docs/BENCH_HYPERION_2_11.md) — the
+2.12-B 4-way re-bench (Hyperion 2.11.0 vs Puma 8.0.1 / Falcon 0.55.3 /
+Agoo 2.15.14, 16-vCPU Ubuntu 24.04, 6 workloads). It's the post-
+2.10/2.11-wins re-baseline of the four-server matrix that originally
+shipped in [`docs/BENCH_HYPERION_2_0.md`](docs/BENCH_HYPERION_2_0.md)
+§ "4-way head-to-head (2.10-B baseline)" — the older doc is the
+**historical baseline (pre-2.10/2.11 wins)** and is preserved
+unchanged for archaeology. The 1.6.0 matrix at
+[`docs/BENCH_2026_04_27.md`](docs/BENCH_2026_04_27.md) covers 9
+workloads × 25+ configs against hyperion-async-pg 0.5.0; all three
+docs include caveats and per-row reproduction commands.
 
 > **Bench-host drift note (2026-05-01).** A spot-check rerun on
 > `openclaw-vm` 5 days after the 2.0.0 sweep showed Puma 8.0.1 and

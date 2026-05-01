@@ -1,5 +1,126 @@
 # Changelog
 
+## [Unreleased] - 2.12.0
+
+### 2.12-B — Fresh 4-way re-bench (post-2.10/2.11 wins)
+
+The 4-way head-to-head in `docs/BENCH_HYPERION_2_0.md`
+§ "4-way head-to-head (2.10-B baseline, 2026-05-01)" was
+captured before the 2.10-C / 2.10-D / 2.10-E / 2.10-F /
+2.10-G / 2.11-A / 2.11-B wins landed. Every Hyperion column
+in that doc was therefore stale; the Puma / Falcon / Agoo
+columns were unchanged (no version bumps on the bench host).
+This stream re-runs the entire 6-row matrix on the 2.11.0
+codebase — same host (`openclaw-vm`, 16 vCPU, Ubuntu 24.04,
+Linux 6.8.0), same tools (`wrk` + `perfer`), 3 trials per
+row, median reported — and writes the results to a new
+`docs/BENCH_HYPERION_2_11.md` (pointed at from the README's
+Benchmarks section; the 2.0 doc is now marked "historical
+baseline (pre-2.10/2.11 wins)").
+
+The harness at `bench/4way_compare.sh` gains a sixth server
+label, `hyperion_handle_static`, which boots Hyperion against
+an alternate rackup whose hot path is the
+`Hyperion::Server.handle_static` direct route + 2.10-F C-ext
+fast-path response writer + 2.10-C PageCache fold. This
+exposes two Hyperion columns on the rows where it applies
+(hello + small static): "Rack-style" (the legacy generic-Rack
+path most apps run unchanged) and "`handle_static`" (the peak
+path operators can opt into by registering one pre-built
+route at boot). New rackup `bench/static_handle_static.ru`
+preloads the 1 KB static asset bytes at boot and serves them
+through the same direct-route fast path; the existing
+`bench/hello_static.ru` (added in 2.10-F) plays the same role
+for the hello row.
+
+**Headline shifts (medians, vs the 2.10-B baseline at the
+same workload):**
+
+| # | Workload | 2.10-B Hyperion | 2.11.0 Rack-style | 2.11.0 `handle_static` | Gap-vs-leader shift |
+|---:|---|---:|---:|---:|---|
+| 1 | hello | 4,587 | 4,477 (-2.4%, noise) | **5,502** (+19.9%) | gap to Agoo: 4.22× → **3.46×** with `handle_static` |
+| 2 | static 1 KB | 1,380 | 1,687 (**+22.2%**, PageCache 2.10-C auto-engage) | **5,935** (+330%) | gap to Agoo: 1.89× behind → **flipped, Hyperion +127%** |
+| 3 | static 1 MiB | 1,378 | 1,513 (+9.8%) | n/a (handle_static buffers in memory; defeats sendfile) | Hyperion lead vs Agoo: 9.07× → 9.74× (held) |
+| 4 | CPU JSON 50-key | 3,450 | 3,659 (+6.0%) | n/a (per-request `JSON.generate`) | gap to Agoo: 1.85× → **2.05× (widened)**; Agoo +17.5% in same window |
+| 5 | PG-bound async (`pg_sleep 50ms`) | 1,564 | 1,565 (+0.1%) | n/a | Hyperion-only; identical |
+| 6 | SSE 1000 events × 50 B | 500 | 472 (-5.6%, noise) | n/a (single fixed response) | Hyperion lead vs Puma: 3.65× → 3.58× (flat) |
+
+**Reading the deltas.**
+
+- **The 2.10-D + 2.10-F + 2.10-C win-stack lands cleanly on
+  static 1 KB.** Hyperion's `handle_static` row at 5,935 r/s
+  wins the column outright by +127% (2.27×) over Agoo, +208%
+  over Falcon, +282% over Puma. The Rack-style row also moved
+  up +22.2% from the PageCache auto-engage even without
+  explicit `handle_static` registration. Operators who can
+  register one pre-built route via `handle_static` pick up a
+  3.5× lift over the generic Rack-style path on this exact
+  shape.
+- **Hello narrowed but did not close.** The gap to Agoo went
+  from 4.22× to 3.46× with `handle_static`; the Rack-style
+  row stayed flat (within bench noise) — meaning the 2.10-D
+  direct-route win **only manifests when the rackup actually
+  opts in via `handle_static`**.
+- **CPU JSON widened.** Agoo +17.5% in the same window
+  Hyperion +6.0% took the gap from 1.85× to 2.05×. This is
+  the one row the 2.10/2.11 streams didn't move; closing it
+  is the obvious 2.12 follow-on.
+- **Large static, PG-bound async, SSE — Hyperion's existing
+  wins held.** Sendfile (9.7× over Agoo on 1 MiB), fiber-
+  cooperative I/O (Hyperion-only on PG-bound, identical to
+  2.10-B), ChunkedCoalescer (3.58× over Puma, 16.7× over
+  Falcon on SSE) all stayed clean. Agoo's SSE behavior
+  regressed to a hard segfault at boot on `bench/sse_generic.ru`
+  (different shape from 2.10-B's "buffers entire response,
+  takes ~5 s to flush"; same conclusion either way — Agoo is
+  not a viable SSE server on this rackup at any throughput).
+- **Tail latency is still Hyperion's clean win** across every
+  row with a non-trivial p99: hello 1.73 ms vs Agoo 10.47 ms
+  / Puma 29 ms / Falcon 408 ms; 1 KB 1.69 ms vs 57–86 ms;
+  1 MiB 4.63 ms vs 82–720 ms; CPU JSON 2.60 ms vs 17–411 ms;
+  SSE 2.85 ms vs 11–42 ms.
+
+**Harness changes** (`bench/4way_compare.sh`):
+
+- New server label `hyperion_handle_static` — boots Hyperion
+  against an alternate rackup specified by the new
+  `HYPERION_STATIC_RACKUP` env var (falls back to the same
+  `RACKUP` as the legacy `hyperion` label if unset, which
+  becomes a harmless no-op duplicate). The four legacy
+  labels (`hyperion`, `puma`, `falcon`, `agoo`) keep their
+  byte-identical 2.10-B shape so the older doc stays
+  reproducible.
+
+**New rackup**: `bench/static_handle_static.ru` — preloads
+the 1 KB static asset (`/tmp/hyperion_bench_1k.bin`) at boot,
+registers it via `Hyperion::Server.handle_static`, and falls
+through to a 404 lambda for any other path. Mirrors the role
+`bench/hello_static.ru` plays for the hello row.
+
+**Spec coverage** (`spec/hyperion/bench_handle_static_rackups_spec.rb`,
+9 examples):
+
+- `bench/hello_static.ru` parses cleanly and registers a `/`
+  StaticEntry with the expected response bytes.
+- `bench/static_handle_static.ru` preloads the asset and
+  registers a route at boot; fails fast if the asset is
+  missing rather than booting empty (prevents a silently-
+  bound 404 from masking a misconfigured bench run).
+- `bench/4way_compare.sh` knows how to boot all five variant
+  labels (hyperion, hyperion_handle_static, puma, falcon,
+  agoo) — a typo in the harness's case statement or the
+  new env var name fails this spec at unit-level instead
+  of waiting for a 41-minute bench sweep to surface the
+  regression.
+
+Spec count: 1093 → 1102 (+9). 0 failures, 11 pending —
+invariant preserved.
+
+**Reproducing.** See
+`docs/BENCH_HYPERION_2_11.md` § "Reproducing 4-way" for the
+six per-row commands. Bench host: `openclaw-vm`, sweep dir
+`/home/ubuntu/bench-2.12-B/`. Total wall time ~41 min.
+
 ## 2.11.0 — 2026-05-01
 
 ### 2.11-B — HPACK FFI marshalling round-2 (cglue confirmed as firm default; +43% v3 vs v2 on Rails-shape h2)
