@@ -28,13 +28,19 @@ module Hyperion
 
     attr_reader :size, :max_pending
 
-    def initialize(size:, max_pending: nil, max_in_flight_per_conn: nil)
+    def initialize(size:, max_pending: nil, max_in_flight_per_conn: nil, route_table: nil)
       @size        = size
       @max_pending = max_pending
       # 2.3-B: per-conn fairness cap propagated to every Connection
       # constructed by `:connection` jobs. nil (default) = no cap,
       # matches 2.2.0. Positive integer = per-conn ceiling.
       @max_in_flight_per_conn = max_in_flight_per_conn
+      # 2.10-D — direct-dispatch route table propagated to every
+      # Connection constructed by `:connection` jobs.  nil falls
+      # through to `Hyperion::Server.route_table` (the process-wide
+      # singleton); a non-nil instance is honoured verbatim (test
+      # / multi-tenant seam).
+      @route_table = route_table
       @inbox = Queue.new # multiplexes both kinds of jobs
       # Pre-allocate one reply queue per in-flight slot for the legacy `#call`
       # path. Bounded by `size`: if all workers are busy, all reply queues are
@@ -141,7 +147,8 @@ module Hyperion
             # cap (if configured) takes effect on this worker's serve loop.
             begin
               Hyperion::Connection
-                .new(max_in_flight_per_conn: @max_in_flight_per_conn)
+                .new(max_in_flight_per_conn: @max_in_flight_per_conn,
+                     route_table: @route_table)
                 .serve(socket, app, max_request_read_seconds: max_request_read_seconds)
             rescue StandardError => e
               Hyperion.logger.error do

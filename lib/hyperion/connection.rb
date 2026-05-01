@@ -76,7 +76,7 @@ module Hyperion
 
     def initialize(parser: self.class.default_parser, writer: ResponseWriter.new, thread_pool: nil,
                    log_requests: nil, max_body_bytes: MAX_BODY_BYTES, runtime: nil,
-                   max_in_flight_per_conn: nil, path_templater: nil)
+                   max_in_flight_per_conn: nil, path_templater: nil, route_table: nil)
       @parser         = parser
       @writer         = writer
       @thread_pool    = thread_pool
@@ -135,6 +135,21 @@ module Hyperion
       # keep the existing pattern of caching boot-time refs as ivars so
       # the per-request observe stays a single Hash lookup.
       @path_templater = path_templater || Hyperion::Metrics.default_path_templater
+      # 2.10-D — direct-dispatch route table.  The hot-path lookup
+      # is `@route_table&.lookup(method, path)` so the nil-default
+      # case (no operator-registered direct routes — the
+      # overwhelming majority of 2.x deployments) collapses to a
+      # single `nil`-test before falling through to the Rack
+      # adapter.  When `route_table:` is passed we honour the
+      # explicit value (test seam / multi-tenant).  When omitted
+      # AND the Hyperion::Server class is loaded, we resolve to
+      # the process-wide singleton; ad-hoc Connection callers in
+      # specs that don't load Server keep the nil fallback.
+      @route_table = if route_table
+                       route_table
+                     elsif defined?(Hyperion::Server) && Hyperion::Server.respond_to?(:route_table)
+                       Hyperion::Server.route_table
+                     end
       register_request_duration_histogram!
     end
 
@@ -297,6 +312,27 @@ module Hyperion
         # paying — at default-ON log_requests the second call here is
         # avoided (we reuse `request_started_at`).
         request_started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        # 2.10-D — direct-dispatch fast path.  Bypasses the Rack
+        # adapter entirely (no env-hash build, no middleware chain,
+        # no body-iteration overhead) on routes the operator
+        # registered via `Hyperion::Server.handle(:GET, '/path',
+        # handler)` or `.handle_static(...)`.  Lifecycle hooks
+        # still fire so trace instrumentation works regardless of
+        # dispatch shape.
+        #
+        # Lookup is O(1) (two Hash#[] hits) and the nil-default
+        # case (no direct routes registered — the overwhelming
+        # majority of deployments) collapses to one nil-test plus
+        # one Hash#[] miss before falling through to the regular
+        # path; cost on the regular path is < 1 us.
+        if @route_table && (direct_handler = @route_table.lookup(request.method, request.path))
+          dispatch_direct!(socket, request, direct_handler, request_started_at, peer_addr)
+          request_count += 1
+          break unless should_keep_alive_after_direct?(request)
+
+          set_idle_timeout(socket)
+          next
+        end
         # 2.3-B per-conn fairness gate. Returns true when the slot was
         # reserved (caller must release in ensure), false when the cap
         # was hit and a 503 was emitted. nil cap → admit always (hot
@@ -425,6 +461,109 @@ module Hyperion
     end
 
     private
+
+    # 2.10-D — direct-dispatch handler invocation.  Bypasses the
+    # Rack adapter (`Adapter::Rack.call` builds the env hash, walks
+    # the middleware chain, runs WS handshake validation — none of
+    # which a direct route needs).  Fires the runtime's lifecycle
+    # hooks so NewRelic / AppSignal / OpenTelemetry instrumentation
+    # is mode-agnostic; `env` is `nil` on direct routes (no env was
+    # built) — observers documented to expect a nil env on this
+    # branch.
+    #
+    # Two write shapes:
+    #
+    #   * `RouteTable::StaticEntry` — pre-built response buffer
+    #     from `handle_static`.  The hot path: ONE socket.write of
+    #     the full HTTP/1.1 response (status + Content-Type +
+    #     Content-Length + body), zero header build, zero body
+    #     iteration.
+    #   * Plain `[status, headers, body]` Rack tuple — the
+    #     standard ResponseWriter writes it via the existing
+    #     code path.  Slower than StaticEntry but still skips the
+    #     entire Rack env construction.
+    def dispatch_direct!(socket, request, handler, request_started_at, peer_addr)
+      @metrics.increment(:bytes_read, 0) # no-op — bytes already counted upstream
+      @metrics.increment(:requests_in_flight)
+      @metrics.increment(:direct_route_hits)
+      response = nil
+      error    = nil
+      begin
+        @runtime.fire_request_start(request, nil) if @runtime.has_request_hooks?
+        response = handler.call(request)
+      rescue StandardError => e
+        error = e
+        @metrics.increment(:app_errors)
+        @logger.error do
+          {
+            message: 'direct route raised',
+            method: request.method,
+            path: request.path,
+            error: e.message,
+            error_class: e.class.name
+          }
+        end
+        response = [500, { 'content-type' => 'text/plain' }, ['Internal Server Error']]
+      ensure
+        @metrics.decrement(:requests_in_flight)
+      end
+
+      status = write_direct_response(socket, response)
+
+      if @runtime.has_request_hooks?
+        @runtime.fire_request_end(request, nil, error.nil? ? response : nil, error)
+      end
+
+      @metrics.increment_status(status)
+      log_request(request, status, request_started_at) if @log_requests
+      observe_request_duration(request, status, request_started_at)
+      status
+    rescue StandardError => e
+      # Lifecycle-hook failure is logged inside fire_request_*; this
+      # rescue catches socket write errors so the request loop sees
+      # the problem and can decide whether to keep the connection
+      # alive (we just close on any exception here — it's the safe
+      # default).
+      @logger.error do
+        { message: 'direct dispatch write failed',
+          peer_addr: peer_addr,
+          error: e.message,
+          error_class: e.class.name }
+      end
+      500
+    end
+
+    # 2.10-D — write a direct-route response.  Returns the status
+    # code that was written (so `dispatch_direct!` can bump the
+    # status counter without re-parsing the response).  Two
+    # shapes — the StaticEntry one-shot write is the agoo-style
+    # hot path; the Rack-tuple branch lets handlers compute a
+    # response per-request without paying for env construction.
+    def write_direct_response(socket, response)
+      if response.is_a?(::Hyperion::Server::RouteTable::StaticEntry)
+        socket.write(response.response_bytes)
+        return 200
+      end
+
+      status, headers, body = response
+      @writer.write(socket, status, headers, body, keep_alive: true)
+      status
+    end
+
+    # 2.10-D — keep-alive decision for direct-dispatch responses.
+    # Direct routes don't get the full
+    # `Connection: close` header inspection that Rack tuples
+    # receive (StaticEntry has its headers baked in; we trust the
+    # operator); we just honour the request-side `Connection`
+    # header.  HTTP/1.1 default-keepalive, HTTP/1.0 default-close.
+    def should_keep_alive_after_direct?(request)
+      conn_request = request.header('connection')&.downcase
+      case request.http_version
+      when 'HTTP/1.1' then conn_request != 'close'
+      when 'HTTP/1.0' then conn_request == 'keep-alive'
+      else false
+      end
+    end
 
     # 2.3-B per-conn fairness admit. Mutex-guarded compare-and-bump so
     # async-io fibers / pipelined requests on the same OS thread don't

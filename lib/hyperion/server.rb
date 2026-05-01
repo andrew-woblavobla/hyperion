@@ -5,6 +5,8 @@ require 'openssl'
 require 'async'
 require 'async/scheduler'
 
+require_relative 'server/route_table'
+
 module Hyperion
   # Phase 2a server: bind a TCPServer, accept connections, schedule each on its
   # own fiber via Async. Multiple in-flight requests run concurrently on a
@@ -40,6 +42,87 @@ module Hyperion
 
     attr_reader :host, :port, :runtime
 
+    # 2.10-D — process-wide direct-dispatch route table.  Operators
+    # register routes via `Hyperion::Server.handle(:GET, '/hello',
+    # handler)` BEFORE forking workers; each forked worker inherits
+    # the populated table via copy-on-write.  Per-Server instances
+    # can override by passing `route_table:` to the constructor (a
+    # test seam — production code uses the class singleton).
+    #
+    # Lazily initialized so `require 'hyperion'` itself doesn't pay
+    # the allocation when the operator never registers a direct
+    # route (the common 1.x deployment).
+    def self.route_table
+      @route_table ||= RouteTable.new
+    end
+
+    # Test seam: replace the process-wide route table with a fresh
+    # (or stub) instance.  Used by `direct_route_spec.rb` so each
+    # example starts from an empty table without needing to call
+    # `clear` (which would interfere with parallel registration
+    # tests).
+    class << self
+      attr_writer :route_table
+    end
+
+    # 2.10-D — register a direct-dispatch handler.  Bypasses the Rack
+    # adapter on hit: when a request whose method + path matches
+    # this entry arrives, `Connection#serve` skips the env-hash
+    # build, the middleware chain, and the body-iteration loop —
+    # the handler is called directly with a `Hyperion::Request`
+    # value object.
+    #
+    # `method_sym` is one of `:GET`, `:POST`, `:PUT`, `:DELETE`,
+    # `:HEAD`, `:PATCH`, `:OPTIONS` (case-insensitive — `:get`
+    # works too).  `path` is an exact-match String (regex / glob
+    # routing is intentionally out of scope; future work).
+    # `handler` is any object responding to `#call(request)` that
+    # returns a `[status, headers, body]` Rack tuple.
+    #
+    # Lifecycle hooks (`Runtime#on_request_start` /
+    # `on_request_end`) still fire on direct routes so NewRelic /
+    # AppSignal / OpenTelemetry instrumentation works regardless
+    # of dispatch shape.
+    #
+    # On a non-match (any path / method not registered here) the
+    # request falls through to the regular Rack adapter dispatch
+    # — existing behaviour for un-handled routes is unchanged.
+    def self.handle(method_sym, path, handler)
+      route_table.register(method_sym, path, handler)
+    end
+
+    # 2.10-D — register a direct-dispatch route whose response is
+    # FULLY known at registration time.  The full HTTP/1.1 response
+    # buffer (status line + Content-Type + Content-Length + body)
+    # is built ONCE here and stashed in a `RouteTable::StaticEntry`;
+    # on hit, `Connection#serve` issues a single `socket.write` of
+    # the pre-built bytes — no header build, no body iteration,
+    # zero per-request allocation past the Connection ivars.
+    #
+    # Mirrors agoo's optimal hello-world path.  `body_bytes` is
+    # the response body (frozen automatically); `content_type`
+    # defaults to `text/plain`.  Returns the registered
+    # `StaticEntry` for inspection.
+    def self.handle_static(method_sym, path, body_bytes, content_type: 'text/plain')
+      raise ArgumentError, 'body_bytes must be a String' unless body_bytes.is_a?(String)
+      raise ArgumentError, 'content_type must be a String' unless content_type.is_a?(String)
+
+      body = body_bytes.dup.b.freeze
+      head = +"HTTP/1.1 200 OK\r\n" \
+              "content-type: #{content_type}\r\n" \
+              "content-length: #{body.bytesize}\r\n" \
+              "\r\n"
+      head.force_encoding(Encoding::ASCII_8BIT)
+      buffer = (head + body).freeze
+
+      method_key = method_sym.to_s.upcase.to_sym
+      entry = RouteTable::StaticEntry.new(method_key, path.dup.freeze, buffer).freeze
+      # The handler closure returns the StaticEntry so the
+      # Connection dispatcher can branch on `is_a?(StaticEntry)`.
+      route_table.register(method_sym, path, ->(_request) { entry })
+      entry
+    end
+
     # 1.7.0 added kwargs (all default to current behaviour):
     #   * `runtime:`             — `Hyperion::Runtime` instance (default
     #                               `Runtime.default`). Threaded through to
@@ -73,7 +156,8 @@ module Hyperion
                    tls_ktls: :auto,
                    io_uring: :off,
                    max_in_flight_per_conn: nil,
-                   tls_handshake_rate_limit: :unlimited)
+                   tls_handshake_rate_limit: :unlimited,
+                   route_table: nil)
       validate_async_io!(async_io)
       @host                     = host
       @port                     = port
@@ -128,10 +212,20 @@ module Hyperion
       # to true so the hot path stays branchless. Built eagerly so
       # bench harnesses can introspect via `server.tls_handshake_limiter`.
       @tls_handshake_limiter    = Hyperion::TLS::HandshakeRateLimiter.new(tls_handshake_rate_limit)
+      # 2.10-D: per-instance route table (defaults to the class-level
+      # singleton).  Tests can inject a fresh table to isolate
+      # registrations from other examples.
+      @route_table              = route_table || Hyperion::Server.route_table
     end
 
     # Read-only handle for tests + bench harness introspection.
     attr_reader :tls_handshake_limiter
+
+    # 2.10-D — read-only handle to the per-instance route table.
+    # Connection#serve consults this after parse to decide whether
+    # to engage the direct-dispatch fast path.  Defaults to the
+    # process-wide `Hyperion::Server.route_table` singleton.
+    attr_reader :route_table
 
     # Read-only handle to the per-worker SSL context (nil when the
     # listener is plain TCP). Exposed so the worker can call
@@ -208,7 +302,8 @@ module Hyperion
       listen unless @server
       if @thread_count.positive?
         @thread_pool = ThreadPool.new(size: @thread_count, max_pending: @max_pending,
-                                      max_in_flight_per_conn: @max_in_flight_per_conn)
+                                      max_in_flight_per_conn: @max_in_flight_per_conn,
+                                      route_table: @route_table)
       end
       maybe_start_admin_listener
 
@@ -274,7 +369,8 @@ module Hyperion
           mode = DispatchMode.new(:inline_h1_no_pool)
           record_dispatch(mode)
           Connection.new(runtime: @explicit_runtime ? @runtime : nil,
-                         max_in_flight_per_conn: @max_in_flight_per_conn).serve(
+                         max_in_flight_per_conn: @max_in_flight_per_conn,
+                         route_table: @route_table).serve(
                            socket, @app, max_request_read_seconds: @max_request_read_seconds
                          )
         end
@@ -419,7 +515,8 @@ module Hyperion
         #      TLS h1 path.
         record_dispatch(mode)
         Connection.new(runtime: @explicit_runtime ? @runtime : nil,
-                       max_in_flight_per_conn: @max_in_flight_per_conn).serve(
+                       max_in_flight_per_conn: @max_in_flight_per_conn,
+                       route_table: @route_table).serve(
                          socket, @app, max_request_read_seconds: @max_request_read_seconds
                        )
       when :threadpool_h1
@@ -440,7 +537,8 @@ module Hyperion
           # threadpool_h1 (the connection's logical mode).
           record_dispatch(mode)
           Connection.new(runtime: @explicit_runtime ? @runtime : nil,
-                         max_in_flight_per_conn: @max_in_flight_per_conn).serve(
+                         max_in_flight_per_conn: @max_in_flight_per_conn,
+                         route_table: @route_table).serve(
                            socket, @app, max_request_read_seconds: @max_request_read_seconds
                          )
         end
@@ -450,7 +548,8 @@ module Hyperion
         # under its own bucket now (pre-1.7 it was un-counted).
         record_dispatch(mode)
         Connection.new(runtime: @explicit_runtime ? @runtime : nil,
-                       max_in_flight_per_conn: @max_in_flight_per_conn).serve(
+                       max_in_flight_per_conn: @max_in_flight_per_conn,
+                       route_table: @route_table).serve(
                          socket, @app, max_request_read_seconds: @max_request_read_seconds
                        )
       end
