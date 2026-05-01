@@ -270,23 +270,43 @@ walks the standard `ResponseWriter` for the
 `[status, headers, body]` tuple — slower than the static path
 but still skips the entire Rack-adapter overhead.
 
-**Bench validation on openclaw-vm.** Hello-world via
+**Bench validation on openclaw-vm** (`-t 5 -w 1`, `wrk -t4
+-c100 -d20s --latency`, three trials median).  Hello-world via
 `handle_static` vs the 2.10-B Rack-lambda baseline:
 
-| Path | r/s (median of 3) | vs 2.10-B baseline | vs Agoo 2.15.14 |
-|---|---:|---:|---:|
-| 2.10-B Rack lambda (Hyperion 2.9.0) | 4,587 | — | −76% (Agoo wins) |
-| **2.10-D handle_static** | **TBD on openclaw-vm bench window** | TBD | TBD |
-| Agoo 2.15.14 (reference) | 19,364 | +322% | — |
+| Path | r/s (median of 3) | p99 latency | vs 2.10-B baseline | vs Agoo 2.15.14 |
+|---|---:|---:|---:|---:|
+| 2.10-B Rack lambda (Hyperion 2.9.0, published) | 4,587 | 2.08 ms | — | −76% (Agoo wins) |
+| 2.10-B re-baseline (this run, same host, vanilla rackup) | 4,408 | 2.19 ms | −4% drift | — |
+| **2.10-D handle_static** | **5,619** | **1.93 ms** | **+22% / +27%** vs the published / re-bench | −71% |
+| Agoo 2.15.14 (reference) | 19,364 | 9.41 ms | +322% | — |
 
-The bench validation step requires SSH to openclaw-vm; this
-commit lands the API + specs.  The bench harness re-run will
-populate the row above on the next bench window.  Plan target
-is ≥ 12,000 r/s on `/hello` via `handle_static` (+160% over
-2.10-B baseline; closes the gap toward Agoo's 19,364 r/s by
-~70% of the absolute remaining distance — within striking
-range for further opportunistic squeezes from the connection
-fast-path in 2.10-E/F).
+Three trials on openclaw-vm: 5,619 / 5,335 / 5,914 r/s.
+**+22% over the published 2.10-B baseline; +27% over the
+re-bench on the same host today.**  p99 latency 1.93 ms — the
+cleanest p99 in the 4-way matrix (Agoo's p99 on this row is
+9.41 ms, 4.9× wider despite the higher mean throughput).
+
+**Plan target was 12,000 r/s; we landed at 5,619 r/s
+(47% of plan target).**  Honest reading of the gap: removing
+the Rack-adapter cost (env-hash build + middleware chain +
+body iteration) was correctly sized at 2.10-D's win zone, but
+on a `-c 100 -t 4` wrk profile the dominant cost is NOT the
+adapter — it's the per-accept thread-pool clone3 + the
+per-Connection ivar allocation that ResponseWriter / Connection
+still pay before the dispatch_direct! branch.  An strace -f
+sample over 5,000 warm requests shows: 5,000× accept4 +
+5,000× clone3 (per-conn submit_connection enqueue → worker
+spawn / wakeup) + 5,000× write (the StaticEntry buffer) +
+~30,000 ancillary syscalls (epoll, recvfrom, futex, …).  The
+StaticEntry path itself is ONE syscall per request as
+designed — the cache buffer write — but the surrounding
+connection lifecycle still dominates.  Closing the rest is
+explicitly the subject of 2.10-E (connection fast-path) and
+2.10-F (event-loop accept) — both of which now have a clean
+hand-off API: `route_table.lookup` is the gating call;
+2.10-E/F can short-circuit even earlier (before the worker
+hop) for direct routes.
 
 **Files added.**
 
