@@ -244,8 +244,77 @@ What Hyperion handles for you: ALPN negotiation, HTTP/2 framing, HPACK,
 per-stream flow control, the trailer-frame emit, binary-clean
 `env['rack.input']` (gRPC bodies are non-UTF-8), and `te: trailers`
 preserved into `env['HTTP_TE']`. What you handle: protobuf
-marshalling and the `grpc-status` semantics. Streaming RPCs (server /
-client / bidi) are 2.13 candidates — pin to unary for now.
+marshalling and the `grpc-status` semantics.
+
+### Streaming RPCs (2.13-D+)
+
+All four gRPC call shapes work on Hyperion since 2.13-D — unary,
+server-streaming, client-streaming, and bidirectional. The detection
+trigger is the gRPC content-type plus `te: trailers`; any HTTP/2
+request that carries both is dispatched to the Rack app on HEADERS
+arrival (rather than after END_STREAM), and `env['rack.input']`
+becomes a streaming IO that blocks reads until the next DATA frame
+lands. Plain HTTP/2 traffic (without those headers) keeps the unary
+buffered semantics — no behaviour change for non-gRPC clients.
+
+**Server-streaming.** Yield one gRPC-framed message per `each`
+iteration; Hyperion writes each yield as its own DATA frame:
+
+```ruby
+class StreamReply
+  def initialize(messages); @messages = messages; end
+  def each; @messages.each { |m| yield m }; end       # one DATA frame each
+  def trailers; { 'grpc-status' => '0' }; end
+  def close; end
+end
+
+run ->(env) {
+  env['rack.input'].read # the unary request message
+  [200, { 'content-type' => 'application/grpc' }, StreamReply.new(messages)]
+}
+```
+
+**Client-streaming.** Read messages off `env['rack.input']` as the peer
+sends them. Reads block until a DATA frame arrives:
+
+```ruby
+run ->(env) {
+  io = env['rack.input']
+  count = 0
+  while (prefix = io.read(5)) && prefix.bytesize == 5
+    length = prefix.byteslice(1, 4).unpack1('N')
+    msg = io.read(length)
+    count += 1
+  end
+  [200, { 'content-type' => 'application/grpc' }, GrpcBody.new(reply_for(count))]
+}
+```
+
+**Bidirectional.** Interleave reads and writes. The response body is
+iterated lazily, so you can read one request message, yield one reply,
+read the next, yield the next:
+
+```ruby
+class BidiReplies
+  def initialize(io); @io = io; end
+  def each
+    while (prefix = @io.read(5)) && prefix.bytesize == 5
+      len = prefix.byteslice(1, 4).unpack1('N')
+      msg = @io.read(len)
+      yield grpc_frame(handle(msg))                   # sent immediately
+    end
+  end
+  def trailers; { 'grpc-status' => '0' }; end
+  def close; end
+end
+
+run ->(env) {
+  [200, { 'content-type' => 'application/grpc' }, BidiReplies.new(env['rack.input'])]
+}
+```
+
+The streaming-input path runs each stream on its own fiber, so
+concurrent read+write on the same stream is safe.
 
 ## Highlights
 

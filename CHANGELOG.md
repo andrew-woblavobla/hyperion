@@ -2,6 +2,76 @@
 
 ## [Unreleased] — 2.13.0
 
+### 2.13-D — gRPC streaming RPCs + ghz vs Falcon bench
+
+**Background.** 2.12-F shipped gRPC unary on h2 — trailers
+(`grpc-status` / `grpc-message` final HEADERS frame), `te: trailers`
+handling, and h2 request half-close semantics. The three remaining
+gRPC call shapes — server-streaming, client-streaming, and
+bidirectional — were not yet wired. 2.13-D closes that gap.
+
+**What was missing.** `dispatch_stream` gated on
+`RequestStream#request_complete` (i.e., END_STREAM on the request),
+which is correct for unary but blocks both streaming-input shapes:
+the app cannot read DATA frames until END_STREAM has already arrived.
+Likewise the response path materialised the full body into a single
+String before splitting it across DATA frames, which folded
+multi-message server-streaming responses into one logical write
+(verified: a 5-message body produced one DATA frame, not five).
+
+**What 2.13-D ships.**
+
+1. **Server-streaming.** When the response body responds to
+   `:trailers`, `dispatch_stream` now iterates `body#each` lazily and
+   emits one DATA frame per yielded chunk (no inter-chunk coalescing),
+   followed by the trailer HEADERS frame carrying END_STREAM=1. A
+   single oversize chunk still gets max-frame-size split inside the
+   per-chunk send path, but small messages stay one DATA frame each.
+   Plain HTTP/2 traffic (no `:trailers` method on the body) keeps the
+   pre-2.13-D buffered shape — no behaviour change for non-gRPC apps.
+
+2. **Streaming-input dispatch.** A new
+   `Hyperion::Http2Handler::StreamingInput` IO-shaped queue replaces
+   the buffered `@request_body` String for requests that look like
+   gRPC: `content-type: application/grpc*` AND `te: trailers` on a
+   POST. When promoted, `process_data` pushes each DATA frame's bytes
+   into the queue (and the END_STREAM frame closes the writer), and
+   the serve-loop dispatches the app on HEADERS arrival via a new
+   `RequestStream#dispatchable?` predicate. The Rack adapter detects
+   the non-String request body and sets `env['rack.input']` directly
+   to the queue (no StringIO wrap, so streaming-read semantics are
+   preserved). Reads block the calling fiber on `Async::Notification`
+   until either bytes arrive or the writer closes.
+
+3. **Bidirectional.** Falls out for free once 1 + 2 are in place —
+   each h2 stream already runs on its own fiber, so concurrent
+   read+write on the same stream is supported by the Async scheduler.
+
+**Tests.** `spec/hyperion/grpc_streaming_spec.rb` (5 examples):
+server-streaming wire shape (5 yielded chunks → 5 DATA frames + trailer
+HEADERS, END_STREAM ride placement asserted), client-streaming
+(5 spaced DATA frames decoded by the app via `rack.input.read`),
+bidirectional (5 round-trips with strict ordering), and 2 unit specs
+on `StreamingInput` (blocking reads + EOF handling, partial-chunk
+slicing). All run end-to-end via `Protocol::HTTP2::Client` over real
+TLS — same harness shape as the 2.12-F unary specs.
+
+**Constraints respected.** No regression in the 1176/0/15 baseline:
+post-2.13-D suite is 1181/0/15 (5 new streaming examples + 0
+regressions). The pre-existing
+`http2_empty_body_short_circuit_spec`'s `FakeStream` test double
+needed a `respond_to?(:streaming_input)` guard at the dispatch
+read-site — added defensively (no protocol change). The 2.10-G
+TCP_NODELAY hunk, 2.10-E preload hooks, 2.10-F `rb_pc_serve_request`,
+2.11-A dispatch pool warmup, 2.11-B cglue HPACK default, 2.12-C accept4
+loop, 2.12-D io_uring loop, 2.12-E per-worker counter, 2.12-F gRPC
+unary trailers, 2.13-A metric shards, 2.13-B response head builder
+C-rewrite, 2.13-C flake fixes are all on master and untouched by
+this change.
+
+**Bench.** See the companion `[bench]` commit for ghz numbers and
+the documented limits of the Hyperion-vs-Falcon comparison.
+
 ### 2.13-C — Spec flake hunt
 
 Two flakes carried over from the 2.11/2.12 release cuts. Both are

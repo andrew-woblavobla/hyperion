@@ -362,9 +362,24 @@ module Hyperion
           server_name, server_port = split_host(host_header)
 
           env = ENV_POOL.acquire
-          input = INPUT_POOL.acquire
-          input.string = request.body
-          input.rewind
+          # 2.13-D — gRPC streaming requests pass a non-String IO-shaped
+          # body (Hyperion::Http2Handler::StreamingInput) and must NOT go
+          # through the StringIO pool: the StringIO would `string=` consume
+          # it as a String and lose the streaming-read semantic. Fall back
+          # to the legacy buffered path only when `request.body` is a
+          # String — covers HTTP/1.1 (always String) and HTTP/2 unary
+          # (String per RequestStream#@request_body). The streaming path
+          # tags `input` as nil so the ensure-block release skips the
+          # pool return for this request.
+          if request.body.is_a?(String)
+            input = INPUT_POOL.acquire
+            input.string = request.body
+            input.rewind
+            env['rack.input'] = input
+          else
+            input = nil
+            env['rack.input'] = request.body
+          end
 
           # Adapter-owned (non-header, non-request-line) env. SERVER_NAME/PORT
           # need split_host, REMOTE_ADDR needs peer info, the rack.* keys are
@@ -379,7 +394,6 @@ module Hyperion
           # without a backing socket.
           env['REMOTE_ADDR']       = request.peer_address || '127.0.0.1'
           env['rack.url_scheme']   = 'http'
-          env['rack.input']        = input
           env['rack.errors']       = $stderr
           if connection
             # 2.1.0 (WS-1) — Rack 3 full-hijack. The proc captures the

@@ -259,6 +259,176 @@ module Hyperion
     # regular headers, and any DATA frame body bytes for later dispatch.
     # Also exposes a `window_available` notification fan-out so the
     # response-writer fiber can sleep until WINDOW_UPDATE arrives.
+    # 2.13-D — IO-shaped streaming request body backing `rack.input` for
+    # gRPC client-streaming and bidirectional RPCs. Push side is the
+    # `RequestStream#process_data` callback (one push per inbound DATA
+    # frame); read side is the Rack app's `env['rack.input'].read` calls.
+    #
+    # Reads block the calling fiber via `Async::Notification` until either
+    # bytes arrive or the writer side calls `close_writer` (END_STREAM on
+    # the request).
+    #
+    # Contract notes:
+    #   * `read(n)` returns up to n bytes, or fewer at EOF (Rack 3 §11
+    #     IO-conformance: `read(length)` returns nil on EOF).
+    #   * `read` (no argument) reads until EOF and returns the rest.
+    #   * `each` yields chunk-by-chunk (one yield per pushed chunk).
+    #   * `rewind` is a no-op — streaming bodies aren't seekable.
+    #   * `close` is a no-op on the read side; the writer drives
+    #     end-of-stream via `close_writer`.
+    #
+    # The class is intentionally narrow — it implements only the methods
+    # gRPC handlers and Rack apps actually call against `rack.input`. A
+    # real Rack app that does `rack.input.size` or `rack.input.gets` will
+    # raise (Rack 3 §11 doesn't require those for streaming inputs).
+    class StreamingInput
+      EMPTY_BIN = String.new('', encoding: Encoding::ASCII_8BIT).freeze
+
+      def initialize
+        @chunks = []
+        @notify = ::Async::Notification.new
+        @writer_closed = false
+        @reader_closed = false
+        @bytes_buffered = 0
+      end
+
+      # 2.13-D — push a DATA-frame's bytes onto the queue. Called from
+      # `RequestStream#process_data`. Empty / already-closed pushes are
+      # silently dropped (the END_STREAM path uses `close_writer` instead).
+      def push(bytes)
+        return if @writer_closed
+        return if bytes.nil?
+
+        s = bytes.to_s
+        return if s.empty?
+
+        # Force ASCII-8BIT so gRPC binary payloads survive; matches the
+        # encoding contract on `RequestStream#@request_body`.
+        s = s.b unless s.encoding == Encoding::ASCII_8BIT
+        @chunks << s
+        @bytes_buffered += s.bytesize
+        @notify.signal
+      end
+
+      # 2.13-D — signal end-of-request. Wakes any reader fiber parked on
+      # `read` so it can return EOF (`nil` from `read(n)`, accumulated
+      # buffer from `read` with no arg).
+      def close_writer
+        @writer_closed = true
+        @notify.signal
+      end
+
+      def writer_closed?
+        @writer_closed
+      end
+
+      attr_reader :bytes_buffered
+
+      # Read up to `length` bytes (or all remaining bytes when `length` is
+      # nil). Blocks the fiber until at least one chunk is available OR
+      # the writer has closed. Returns `nil` on EOF when `length` is given
+      # (Rack 3 §11 IO-conformance), otherwise the empty string on EOF
+      # when `length` is nil.
+      def read(length = nil)
+        if length.nil?
+          # Drain everything until EOF.
+          out = String.new(encoding: Encoding::ASCII_8BIT)
+          loop do
+            wait_for_data
+            while (chunk = @chunks.shift)
+              out << chunk
+              @bytes_buffered -= chunk.bytesize
+            end
+            break if @writer_closed && @chunks.empty?
+          end
+          out
+        else
+          return nil if length.zero?
+
+          out = String.new(encoding: Encoding::ASCII_8BIT)
+          remaining = length
+          while remaining.positive?
+            wait_for_data
+            if @chunks.empty? && @writer_closed
+              return out.empty? ? nil : out
+            end
+
+            chunk = @chunks.first
+            break unless chunk # writer-closed race
+
+            if chunk.bytesize <= remaining
+              out << chunk
+              remaining -= chunk.bytesize
+              @bytes_buffered -= chunk.bytesize
+              @chunks.shift
+            else
+              out << chunk.byteslice(0, remaining)
+              # Mutate head chunk: take the tail.
+              @chunks[0] = chunk.byteslice(remaining, chunk.bytesize - remaining)
+              @bytes_buffered -= remaining
+              remaining = 0
+            end
+          end
+          out
+        end
+      end
+
+      def each
+        return enum_for(:each) unless block_given?
+
+        loop do
+          wait_for_data
+          while (chunk = @chunks.shift)
+            @bytes_buffered -= chunk.bytesize
+            yield chunk
+          end
+          break if @writer_closed && @chunks.empty?
+        end
+      end
+
+      def gets
+        # Rack 3 streaming-input contract doesn't require gets; emulate
+        # naively for apps that call it: read until \n or EOF.
+        out = String.new(encoding: Encoding::ASCII_8BIT)
+        loop do
+          ch = read(1)
+          return out.empty? ? nil : out if ch.nil?
+
+          out << ch
+          break if ch == "\n".b
+        end
+        out
+      end
+
+      def rewind
+        # Streaming bodies aren't seekable; Rack 3 §11 allows read-only
+        # streaming inputs. We return false instead of raising so apps
+        # that defensively rewind() (Rack::Multipart::Parser, etc.) keep
+        # working — they just won't get the data they expected on a gRPC
+        # streaming body, which is fine because such apps aren't gRPC
+        # services.
+        false
+      end
+
+      def close
+        @reader_closed = true
+        nil
+      end
+
+      def closed?
+        @reader_closed
+      end
+
+      private
+
+      def wait_for_data
+        return if @chunks.any?
+        return if @writer_closed
+
+        @notify.wait
+      end
+    end
+
     class RequestStream < ::Protocol::HTTP2::Stream
       # RFC 7540 §8.1.2.1 — the only pseudo-headers a server MUST accept on a
       # request. Anything else (notably `:status`, which is response-only, or
@@ -270,7 +440,8 @@ module Hyperion
       # in HTTP/2 requests; their semantics are folded into HTTP/2 framing.
       FORBIDDEN_HEADERS = %w[connection transfer-encoding keep-alive upgrade proxy-connection].freeze
 
-      attr_reader :request_headers, :request_body, :request_complete, :protocol_error_reason
+      attr_reader :request_headers, :request_body, :request_complete, :protocol_error_reason,
+                  :streaming_input
 
       def initialize(*)
         super
@@ -290,6 +461,15 @@ module Hyperion
         @window_available = ::Async::Notification.new
         @protocol_error_reason = nil
         @declared_content_length = nil
+        # 2.13-D — gRPC streaming RPCs. When the request HEADERS block carries
+        # `content-type: application/grpc*` AND `te: trailers`, we promote the
+        # stream into "streaming-input mode": DATA frames are pushed into a
+        # `StreamingInput` queue (vs. accumulated into `@request_body`) and
+        # the dispatch loop fires the app on HEADERS arrival (vs. END_STREAM),
+        # so client-streaming + bidirectional RPCs work. Plain HTTP/2 traffic
+        # keeps the pre-2.13-D buffered semantic.
+        @streaming_input = nil
+        @streaming_dispatch_ready = false
       end
 
       # Used by the dispatch loop to decide whether to invoke the app or
@@ -312,10 +492,18 @@ module Hyperion
         # Run RFC 7540 §8.1.2 validation as soon as we have a complete header
         # block. We do it here (not at end_stream) so the dispatcher sees the
         # error flag before it spawns a fiber for the request.
-        validate_request_headers! if first_block && !protocol_error?
+        if first_block && !protocol_error?
+          validate_request_headers!
+          # 2.13-D — promote to streaming-input mode for gRPC requests so
+          # client-streaming + bidi RPCs see DATA frames as they arrive.
+          maybe_promote_streaming_input! unless protocol_error?
+        end
         if frame.end_stream?
           validate_body_length! unless protocol_error?
           @request_complete = true
+          # 2.13-D — closing the writer side wakes any reader fiber the
+          # app has parked on `rack.input.read`.
+          @streaming_input&.close_writer
         end
         decoded
       end
@@ -324,15 +512,42 @@ module Hyperion
         data = super
         # rubocop:disable Rails/Present
         if data && !data.empty?
-          @request_body << data
+          if @streaming_input
+            # 2.13-D — gRPC streaming-input: push DATA-frame bytes into the
+            # queue Rack apps read from via `env['rack.input']`. Tracking
+            # `@request_body_bytes` for content-length cross-check still
+            # applies (a streaming gRPC request that advertises content-
+            # length would still be wire-validated), but we deliberately
+            # SKIP `@request_body << data` — the streaming path doesn't
+            # buffer bytes a second time.
+            @streaming_input.push(data)
+          else
+            @request_body << data
+          end
           @request_body_bytes += data.bytesize
         end
         # rubocop:enable Rails/Present
         if frame.end_stream?
           validate_body_length! unless protocol_error?
           @request_complete = true
+          @streaming_input&.close_writer
         end
         data
+      end
+
+      # 2.13-D — was this stream marked dispatchable on HEADERS arrival?
+      # The serve-loop dispatches both `request_complete` streams (unary
+      # path: app fires after END_STREAM) AND `streaming_dispatch_ready`
+      # streams (gRPC streaming path: app fires after HEADERS so it can
+      # read DATA frames as they land).
+      def streaming_dispatch_ready?
+        @streaming_dispatch_ready
+      end
+
+      # 2.13-D — generic predicate used by the serve loop instead of
+      # `request_complete`. True for both code paths.
+      def dispatchable?
+        @request_complete || @streaming_dispatch_ready
       end
 
       # RFC 7540 §8.1.2 — request header validation. Sets
@@ -420,6 +635,42 @@ module Hyperion
       # available_frame_size in a loop.
       def wait_for_window
         @window_available.wait
+      end
+
+      # 2.13-D — promote the stream into streaming-input mode when the
+      # request HEADERS look like a gRPC RPC. Detection rules (intentionally
+      # narrow so we don't accidentally streaming-promote plain HTTP/2):
+      #
+      #   * `content-type` starts with `application/grpc` (covers `+proto`,
+      #     `+json`, etc.). gRPC's MIME-type registry guarantees this prefix.
+      #   * `te: trailers` is present (RFC 7230 §4 — gRPC requires it on every
+      #     request). HTTP/2 §8.1.2.2 already constrains `te` to `trailers`,
+      #     so any request that carries `te` at all hit our validator first.
+      #
+      # When promoted, we allocate the `StreamingInput` queue and arm
+      # `@streaming_dispatch_ready` so the serve loop can dispatch the app
+      # immediately (instead of waiting for END_STREAM).
+      #
+      # The `:method` check (POST only) is defensive: gRPC RPCs are POST.
+      # GET-shaped requests with these headers are almost certainly a bug
+      # in the caller, not an intentional gRPC streaming request — fall
+      # through to the buffered path and let the app sort it out.
+      def maybe_promote_streaming_input!
+        method = pseudo_value(':method')
+        return unless method == 'POST'
+
+        ct = nil
+        te = nil
+        @request_headers.each do |pair|
+          name = pair[0].to_s
+          ct ||= pair[1].to_s if name == 'content-type'
+          te ||= pair[1].to_s if name == 'te'
+        end
+        return unless ct && ct.start_with?('application/grpc')
+        return unless te && te.downcase.strip == 'trailers'
+
+        @streaming_input = StreamingInput.new
+        @streaming_dispatch_ready = true
       end
 
       private
@@ -800,7 +1051,10 @@ module Hyperion
         ready_ids.uniq.each do |sid|
           stream = server.streams[sid]
           next unless stream.is_a?(RequestStream)
-          next unless stream.request_complete
+          # 2.13-D — `dispatchable?` covers both unary (request_complete on
+          # END_STREAM) and gRPC streaming-input (dispatch_ready on first
+          # HEADERS). Pre-2.13-D this was a `request_complete` check.
+          next unless stream.dispatchable?
           next if stream.closed?
           next if stream.instance_variable_get(:@hyperion_dispatched)
 
@@ -1122,13 +1376,22 @@ module Hyperion
       hyperion_headers = regular
       hyperion_headers['host'] ||= authority if authority
 
+      # 2.13-D — when streaming-input was promoted on this stream, hand the
+      # `StreamingInput` queue to the Rack adapter as the request body. The
+      # adapter detects the non-String body and sets `env['rack.input']`
+      # directly to the queue (no StringIO wrap). When unary, the legacy
+      # path uses the buffered String body. Spec FakeStream stand-ins
+      # don't define `streaming_input`, so we duck-type via `respond_to?`
+      # rather than rely on the method's existence.
+      body = (stream.respond_to?(:streaming_input) ? stream.streaming_input : nil) ||
+             stream.request_body
       request = Hyperion::Request.new(
         method: method,
         path: path,
         query_string: query || '',
         http_version: 'HTTP/2',
         headers: hyperion_headers,
-        body: stream.request_body,
+        body: body,
         peer_address: peer_addr
       )
 
@@ -1173,19 +1436,22 @@ module Hyperion
         end
       end
 
-      # 2.12-F — gRPC support: bodies that respond to `:trailers` carry a
+      # 2.12-F — gRPC unary support: bodies that respond to `:trailers` carry a
       # final HEADERS frame (with END_STREAM=1) right after the DATA frames.
       # The Rack 3 contract is "iterate body first, then call body.trailers"
-      # — so we materialise the payload, then *before* `body.close`
-      # (`Rack::BodyProxy` clears state on close) snapshot the trailers Hash.
-      # `nil` / empty Hash → no trailing frame. Non-Hash values are coerced
-      # to a Hash defensively; a misbehaving app must not be able to crash
-      # the connection.
-      payload = String.new(encoding: Encoding::ASCII_8BIT)
-      body_chunks.each { |c| payload << c.to_s }
-      response_trailers = collect_response_trailers(body_chunks)
-      body_chunks.close if body_chunks.respond_to?(:close)
-
+      # — so for the unary trailer case we materialise the payload, then
+      # *before* `body.close` (`Rack::BodyProxy` clears state on close)
+      # snapshot the trailers Hash.
+      #
+      # 2.13-D — gRPC streaming support: when the body responds to `:trailers`
+      # we iterate it chunk-by-chunk and emit ONE DATA frame per yielded
+      # chunk (no inter-chunk coalescing). Server-streaming RPCs yield one
+      # gRPC-framed message per `each` iteration; preserving chunk boundaries
+      # on the wire is what lets clients read messages incrementally. The
+      # h2 max-frame-size split inside `send_body_chunk` still applies if a
+      # single message exceeds the peer's MAX_FRAME_SIZE, but a small message
+      # is still one DATA frame.
+      #
       # Hotfix C2: empty-body responses (RFC 7230 §3.3.3 — 204/304 + HEAD)
       # MUST NOT carry a DATA frame. Folding END_STREAM onto the HEADERS
       # frame collapses the response to one encoder-mutex acquisition and
@@ -1201,13 +1467,32 @@ module Hyperion
         writer_ctx.encode_mutex.synchronize do
           stream.send_headers(out_headers, ::Protocol::HTTP2::END_STREAM)
         end
-      elsif have_trailers?(response_trailers)
-        # gRPC / Rack-3-trailers path: HEADERS (no END_STREAM), DATA frames
-        # (no END_STREAM on last DATA), final HEADERS with END_STREAM=1.
+        body_chunks.close if body_chunks.respond_to?(:close)
+      elsif body_chunks.respond_to?(:trailers)
+        # gRPC / Rack-3-trailers path: HEADERS (no END_STREAM), one DATA
+        # frame per yielded chunk (no END_STREAM on the last DATA), final
+        # HEADERS with END_STREAM=1 carrying the trailers (or just
+        # END_STREAM on the last DATA when trailers turn out to be empty).
         writer_ctx.encode_mutex.synchronize { stream.send_headers(out_headers) }
-        send_body(stream, payload, writer_ctx, end_stream: false)
-        send_trailers(stream, response_trailers, writer_ctx)
+        send_body_streaming(stream, body_chunks, writer_ctx)
+        response_trailers = collect_response_trailers(body_chunks)
+        body_chunks.close if body_chunks.respond_to?(:close)
+        if have_trailers?(response_trailers)
+          send_trailers(stream, response_trailers, writer_ctx)
+        else
+          # No trailers materialised — close the stream with an empty
+          # END_STREAM DATA frame so the peer sees end-of-response.
+          writer_ctx.encode_mutex.synchronize do
+            stream.send_data('', ::Protocol::HTTP2::END_STREAM)
+          end
+        end
       else
+        # Pre-2.12-F shape: HEADERS → DATA frames with END_STREAM on last DATA.
+        # Buffer the payload (already the legacy semantic) and let send_body
+        # do max-frame-size splitting.
+        payload = String.new(encoding: Encoding::ASCII_8BIT)
+        body_chunks.each { |c| payload << c.to_s }
+        body_chunks.close if body_chunks.respond_to?(:close)
         writer_ctx.encode_mutex.synchronize { stream.send_headers(out_headers) }
         send_body(stream, payload, writer_ctx)
       end
@@ -1307,6 +1592,48 @@ module Hyperion
         flags = last_chunk && end_stream ? ::Protocol::HTTP2::END_STREAM : 0
 
         writer_ctx.encode_mutex.synchronize { stream.send_data(chunk, flags) }
+      end
+    end
+
+    # 2.13-D — server-streaming send path. Iterates the Rack body via `#each`
+    # and emits ONE DATA frame per yielded chunk (no coalescing), so each
+    # gRPC message lands as its own frame and clients can decode messages
+    # incrementally. The h2 max-frame-size clamping inside `send_body_chunk`
+    # still applies — a single chunk that exceeds the peer's MAX_FRAME_SIZE
+    # is split across multiple DATA frames, all without END_STREAM. The
+    # caller emits the final END_STREAM (either via `send_trailers` or via
+    # an empty trailing DATA frame) AFTER this method returns.
+    #
+    # Empty chunks (zero-byte Strings the app yielded) are skipped — sending
+    # a zero-byte DATA frame is legal HTTP/2 but pointless and would inflate
+    # frame counts on the wire.
+    def send_body_streaming(stream, body, writer_ctx)
+      body.each do |chunk|
+        bytes = chunk.to_s
+        next if bytes.empty?
+
+        send_body_chunk(stream, bytes, writer_ctx)
+      end
+    end
+
+    # 2.13-D — write a single chunk as one or more DATA frames (none with
+    # END_STREAM). Splits across frames only if the chunk exceeds the peer's
+    # available_frame_size (max-frame-size + flow-control window). The hot
+    # path for gRPC streaming is a single message under MAX_FRAME_SIZE, which
+    # results in one `send_data` call.
+    def send_body_chunk(stream, payload, writer_ctx)
+      offset = 0
+      bytesize = payload.bytesize
+      while offset < bytesize
+        available = stream.available_frame_size
+        if available <= 0
+          stream.wait_for_window
+          next
+        end
+
+        chunk = payload.byteslice(offset, available)
+        offset += chunk.bytesize
+        writer_ctx.encode_mutex.synchronize { stream.send_data(chunk, 0) }
       end
     end
 
