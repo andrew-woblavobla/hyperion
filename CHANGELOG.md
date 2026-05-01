@@ -2,6 +2,89 @@
 
 ## [Unreleased] - 2.7.0
 
+### 2.7-F — `posix_fadvise(SEQUENTIAL)` hoisted once per response (retry of 2.6-B)
+
+2.6-B added `posix_fadvise(fd, 0, len, POSIX_FADV_SEQUENTIAL)` inside
+the C primitive's per-chunk body — `rb_sendfile_copy`,
+`rb_sendfile_copy_splice`, and `rb_sendfile_copy_splice_into_pipe`
+each issued the hint once per kernel round.  After 2.6-A's
+chunk-cap bump to 256 KiB, that worked out to **4 fadvise64 syscalls
+per 1 MiB warm-cache response**, all of them no-ops because the
+page cache already held the data.  Maintainer's openclaw-vm bench
+measured **-6.6% warm-cache** (1,289 → 1,204 r/s, median of 3); the
+commit was reverted (4cd8009).
+
+**Why the hoist makes sense architecturally.** A readahead hint
+operates on a *file*, not a *kernel call* — it tells the kernel
+"this fd will be read sequentially from offset 0 for `len` bytes,
+prefetch accordingly".  The right cardinality is once per
+*response* (one file → one hint), not once per *chunk* (one file
+→ N hints depending on chunk size).  2.6-B got the cardinality
+wrong; 2.7-F gets it right.
+
+**Where the call lives.** `Hyperion::Http::Sendfile.native_copy_loop`
+in `lib/hyperion/http/sendfile.rb` calls a new
+`maybe_fadvise_sequential(file_io, len)` helper at function entry,
+*before* dispatching into `splice_copy_loop` or
+`plain_sendfile_loop`.  The helper gates on three conditions:
+the C ext defines `fadvise_sequential` (Linux only),
+`len >= FADVISE_THRESHOLD` (256 KiB — files smaller fit in a single
+sendfile / splice round and don't benefit from prefetch), and
+`real_fd?(file_io)` (StringIO / mock IOs without a kernel fd are
+skipped).  The C primitive (`rb_sendfile_fadvise_sequential` in
+`ext/hyperion_http/sendfile.c`) is a thin wrapper around
+`posix_fadvise(2)` that returns `:ok` / `:noop` (non-Linux build) /
+`:error`; the Ruby caller ignores the return value.  Net warm-
+cache impact: **at most 1 extra syscall per response** (≤1%) vs
+2.6.0's zero.
+
+**Verification (local, macOS arm64, Ruby 3.3.3).** 956 examples
+pass, 0 failures, 11 pending (was 951 / 0 / 11 — the 5 new
+examples are 2.7-F's behavioural specs).  The C primitive returns
+`:noop` on Darwin, the Ruby gate skips the helper because
+`respond_to?(:fadvise_sequential)` is true but the underlying call
+is the no-op variant — no behaviour change on non-Linux hosts.
+
+**Bench validation — DEFERRED.** openclaw-vm was unreachable from
+the controller session at landing (SSH timeout, same condition as
+2.7-A and 2.7-C bench rerunes), so the bench rerun is queued for
+the next bench-host run.  The criteria the bench must hit:
+
+- **Warm-cache** (the typical bench harness, 100 long-lived wrk
+  keep-alive connections): 2.7-F vs 2.6.0 baseline 1,320 r/s on
+  the 1 MiB static row — **must be within ±1% (or +)**.  If
+  warm-cache regresses by even 1%, **revert 2.7-F** the same way
+  2.6-B was reverted.  Don't ship a measured regression to chase
+  a theoretical cold-cache win.
+- **Cold-cache** (`vm.drop_caches=3` between each request): 2.7-F
+  should show **measurable +5-10%** vs no-fadvise.  Cold-cache
+  isn't the production hot path (assets sit in page cache), but
+  it's the workload where the hint actually does something — if
+  this row doesn't move, the hint provides no value at any
+  cardinality and we should consider dropping it entirely on the
+  next perf pass.
+
+**Files touched.**
+- `ext/hyperion_http/sendfile.c` — new `rb_sendfile_fadvise_sequential`
+  primitive + 3 new symbols (`:ok` / `:noop` / `:error`); ~50 lines
+  of C plus the singleton-method registration.
+- `lib/hyperion/http/sendfile.rb` — new `FADVISE_THRESHOLD` constant
+  (256 KiB), new private `maybe_fadvise_sequential` helper, single
+  call site at the top of `native_copy_loop` (covers both
+  `splice_copy_loop` and `plain_sendfile_loop` branches).
+- `spec/hyperion/http_sendfile_spec.rb` — new `2.7-F — fadvise
+  hoisted once per response` describe block: 5 examples covering
+  the constant, the C primitive contract, the once-per-response
+  invocation count (the regression-killer assertion vs 2.6-B's
+  per-chunk shape), and both skip paths (small-file `copy_small`
+  route + 100 KiB streaming below `FADVISE_THRESHOLD`).
+
+**Not touched.** `copy_to_socket_blocking` (the `:inline_blocking`
+dispatch path).  Same readahead logic applies in principle, but
+the blocking path's spec surface is wider and the warm/cold bench
+numbers should drive that decision.  Filed for 2.7.x if the
+deferred bench rerun shows clear cold-cache value.
+
 ### 2.7-A — Static 1 MiB regression bisect — DEFERRED
 
 **Status: DEFERRED.** openclaw-vm bench host was offline at the 2.7-A

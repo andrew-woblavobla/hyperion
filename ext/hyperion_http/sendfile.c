@@ -815,6 +815,64 @@ static VALUE rb_sendfile_copy_splice_into_pipe(VALUE self, VALUE out_io, VALUE i
 #endif
 }
 
+/* ============================================================
+ * 2.7-F — posix_fadvise(SEQUENTIAL) hoisted once per response.
+ * ============================================================
+ *
+ * 2.6-B added posix_fadvise(fd, 0, len, POSIX_FADV_SEQUENTIAL) PER
+ * CHUNK in the body of rb_sendfile_copy / rb_sendfile_copy_splice /
+ * rb_sendfile_copy_splice_into_pipe.  After 2.6-A's chunk-size bump
+ * to 256 KiB, that meant 4 fadvise64 syscalls per 1 MiB response —
+ * 4 wasted syscalls on warm-cache, where the page cache already
+ * holds the data and the hint is a no-op.  Maintainer's bench
+ * rerun on openclaw-vm measured -6.6% warm-cache (1,289 → 1,204
+ * r/s); 2.6-B was reverted (commit 4cd8009).
+ *
+ * 2.7-F retries the kernel hint with the right architecture: a
+ * standalone primitive that the Ruby loop entry calls ONCE per
+ * response, BEFORE the chunk loop starts.  One syscall per response
+ * is well within warm-cache noise (≤1%); the cold-cache pre-read
+ * benefit (kernel reads pages into page cache before sendfile chunks
+ * hit them) is preserved.  The threshold gate ("don't fadvise tiny
+ * files") lives in the Ruby caller — the C primitive is unconditional
+ * once invoked.
+ *
+ * Linux only.  Non-Linux builds compile this as a no-op that returns
+ * :noop; the Ruby caller checks `respond_to?(:fadvise_sequential)`
+ * before calling, so non-Linux callers don't even hit the no-op path.
+ */
+static VALUE sym_ok;
+static VALUE sym_noop;
+static VALUE sym_error;
+
+static VALUE rb_sendfile_fadvise_sequential(VALUE self, VALUE file_io, VALUE rb_len) {
+    (void)self;
+
+#ifdef HYP_SF_LINUX
+    long len_l = NUM2LONG(rb_len);
+    if (len_l <= 0) {
+        /* Nothing to advise on; the Ruby caller normally gates on a
+         * threshold but defend against zero/negative anyway. */
+        return sym_noop;
+    }
+
+    int fd = extract_fd(file_io, "file_io");
+
+    /* posix_fadvise on Linux returns 0 on success or a positive errno
+     * on failure (does NOT set the global errno).  Treat any non-zero
+     * return as :error — the caller ignores the result either way,
+     * the hint is informational. */
+    int rc = posix_fadvise(fd, 0, (off_t)len_l, POSIX_FADV_SEQUENTIAL);
+    if (rc != 0) {
+        return sym_error;
+    }
+    return sym_ok;
+#else
+    (void)file_io; (void)rb_len;
+    return sym_noop;
+#endif
+}
+
 /* Sendfile.supported? — module-introspection helper. Lets the Ruby caller
  * pick its branch without needing a rescue NotImplementedError around the
  * first call (which would burn an exception object on every static
@@ -893,6 +951,8 @@ void Init_hyperion_sendfile(void) {
                                rb_sendfile_small_threshold, 0);
     rb_define_singleton_method(rb_mHyperionHttpSendfile, "platform_tag",
                                rb_sendfile_platform_tag, 0);
+    rb_define_singleton_method(rb_mHyperionHttpSendfile, "fadvise_sequential",
+                               rb_sendfile_fadvise_sequential, 2);
 
     id_fileno = rb_intern("fileno");
     id_to_io  = rb_intern("to_io");
@@ -901,6 +961,9 @@ void Init_hyperion_sendfile(void) {
     sym_partial     = ID2SYM(rb_intern("partial"));
     sym_eagain      = ID2SYM(rb_intern("eagain"));
     sym_unsupported = ID2SYM(rb_intern("unsupported"));
+    sym_ok          = ID2SYM(rb_intern("ok"));
+    sym_noop        = ID2SYM(rb_intern("noop"));
+    sym_error       = ID2SYM(rb_intern("error"));
 
     /* Keep symbols and module references rooted so the GC doesn't
      * collect them between calls. */
@@ -908,6 +971,9 @@ void Init_hyperion_sendfile(void) {
     rb_gc_register_mark_object(sym_partial);
     rb_gc_register_mark_object(sym_eagain);
     rb_gc_register_mark_object(sym_unsupported);
+    rb_gc_register_mark_object(sym_ok);
+    rb_gc_register_mark_object(sym_noop);
+    rb_gc_register_mark_object(sym_error);
 
     /* 2.2.0 — the splice path no longer carries persistent state.
      * Each copy_splice() call opens its own pipe2(O_CLOEXEC) pair

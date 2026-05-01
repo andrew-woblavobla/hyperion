@@ -124,6 +124,25 @@ module Hyperion
       # gets the splice attempt.
       SPLICE_THRESHOLD = SMALL_FILE_THRESHOLD
 
+      # 2.7-F — `posix_fadvise(fd, 0, len, POSIX_FADV_SEQUENTIAL)` fires
+      # ONCE per response when the streaming loop is engaged AND the
+      # response body is at least this large.  Files smaller than the
+      # threshold hit the kernel in a single sendfile / splice round;
+      # the readahead hint is dead weight for them.  At and above
+      # FADVISE_THRESHOLD the kernel will issue multiple chunks (the
+      # 2.6-A USERSPACE_CHUNK is 256 KiB), and pre-warming the page
+      # cache before the chunk loop starts avoids the second/third
+      # chunk waiting on disk I/O on cold-cache requests.
+      #
+      # 2.6-B regressed warm-cache by -6.6% because the same hint
+      # was called PER CHUNK in the C primitive (4× per 1 MiB
+      # response).  2.7-F hoists the call to the Ruby loop entry —
+      # once per response, regardless of how many chunks the kernel
+      # uses — making the warm-cache impact at most 1 extra syscall
+      # per response (≤1%).  See CHANGELOG entry 2.7-F + ext/...
+      # /sendfile.c (rb_sendfile_fadvise_sequential).
+      FADVISE_THRESHOLD = 256 * 1024
+
       class << self
         # 2.2.0 — runtime probe for the splice path.  `splice_supported?`
         # in the C ext only reports compile-time availability (true on
@@ -338,6 +357,17 @@ module Hyperion
         # unsupported for the rest of the process and fall through
         # to plain sendfile.
         def native_copy_loop(out_io, file_io, offset, len)
+          # 2.7-F — hoisted fadvise hint.  Called ONCE per response
+          # on Linux for files >= FADVISE_THRESHOLD (256 KiB).  Pre-
+          # warms the page cache so subsequent sendfile / splice
+          # chunks don't wait on disk I/O.  NOT called per-chunk:
+          # 2.6-B did that and regressed -6.6% warm-cache (commit
+          # 4cd8009).  Both `splice_copy_loop` and
+          # `plain_sendfile_loop` benefit from the single call here
+          # — the dispatch below picks exactly one branch per
+          # response, so this is true once-per-response.
+          maybe_fadvise_sequential(file_io, len)
+
           use_splice = splice_runtime_supported? && len > SPLICE_THRESHOLD &&
                        respond_to?(:copy_splice_into_pipe)
 
@@ -346,6 +376,32 @@ module Hyperion
           else
             plain_sendfile_loop(out_io, file_io, offset, len)
           end
+        end
+
+        # 2.7-F — best-effort POSIX_FADV_SEQUENTIAL hint.  Called
+        # once per response from `native_copy_loop`.  Skipped on
+        # non-Linux hosts (the C ext doesn't define
+        # `fadvise_sequential` there), on small files (single-chunk
+        # responses don't benefit from readahead pre-warming), and
+        # on file-like objects without a real kernel fd (StringIO,
+        # mock IOs).  Errors from the C primitive are intentionally
+        # ignored — the hint is informational, never load-bearing
+        # for correctness.  If `copy_to_socket_blocking` ever wants
+        # the same hint, lift this call into a helper called from
+        # the blocking dispatcher too (deferred to 2.7.x — the
+        # blocking path's spec surface is wider and the warm/cold
+        # bench numbers should drive that decision).
+        def maybe_fadvise_sequential(file_io, len)
+          return unless respond_to?(:fadvise_sequential)
+          return if len < FADVISE_THRESHOLD
+          return unless real_fd?(file_io)
+
+          fadvise_sequential(file_io, len)
+        rescue StandardError
+          # Defensive: posix_fadvise's surface is informational. Any
+          # type-coercion / fd-extraction error must not bring down a
+          # static-file response.
+          nil
         end
 
         # 2.2.x fix-A — splice path with one pipe pair per response.

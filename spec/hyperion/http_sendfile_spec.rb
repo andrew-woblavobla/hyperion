@@ -197,6 +197,111 @@ RSpec.describe Hyperion::Http::Sendfile do
     end
   end
 
+  describe '2.7-F — fadvise hoisted once per response' do
+    # 2.6-B was reverted (commit 4cd8009) because the fadvise call
+    # lived in the C primitive's per-chunk loop — 4× per 1 MiB
+    # response after 2.6-A's chunk-size bump, measured -6.6%
+    # warm-cache regression on openclaw-vm.  2.7-F retries with the
+    # call hoisted to the Ruby loop entry (`native_copy_loop`),
+    # which dispatches once per response.  These specs assert the
+    # behavioural contract: the primitive exists, it's invoked
+    # exactly once per streaming response, and small responses
+    # (below FADVISE_THRESHOLD) skip it.
+
+    it 'exposes the FADVISE_THRESHOLD constant at 256 KiB' do
+      expect(described_class::FADVISE_THRESHOLD).to eq(256 * 1024)
+    end
+
+    it 'defines a fadvise_sequential C primitive' do
+      skip 'native ext not loaded' unless described_class.respond_to?(:fadvise_sequential)
+
+      # Returns a Symbol — :ok / :error on Linux, :noop everywhere else.
+      # The Ruby caller ignores the value; we just assert the contract.
+      expect(%i[ok noop error]).to include(
+        described_class.fadvise_sequential(tempfile, payload.bytesize)
+      )
+    end
+
+    it 'invokes fadvise_sequential exactly once per response on the streaming path' do
+      skip 'native ext not loaded' unless described_class.respond_to?(:fadvise_sequential)
+
+      # Spy on the primitive: count how many times the streaming
+      # loop calls it for a single 1 MiB response.  Pre-2.7-F (the
+      # reverted 2.6-B layout) called it 4× — once per 256 KiB
+      # chunk.  2.7-F's hoist makes it exactly 1.
+      call_count = 0
+      original = described_class.method(:fadvise_sequential)
+      allow(described_class).to receive(:fadvise_sequential) do |*args|
+        call_count += 1
+        original.call(*args)
+      end
+
+      with_socket_pair(payload.bytesize) do |client, reader|
+        written = described_class.copy_to_socket(client, tempfile, 0, payload.bytesize)
+        client.close
+        expect(written).to eq(payload.bytesize)
+        expect(reader.value).to eq(payload)
+      end
+
+      expect(call_count).to eq(1)
+    end
+
+    it 'does NOT call fadvise_sequential on small files routed through copy_small' do
+      skip 'native ext not loaded' unless described_class.respond_to?(:fadvise_sequential)
+      skip 'native ext not loaded' unless described_class.respond_to?(:copy_small)
+
+      eight_k = Tempfile.new(%w[hy-sf-8k-fadv .bin]).tap do |f|
+        f.binmode
+        f.write('A' * 8192)
+        f.flush
+        f.rewind
+      end
+      begin
+        allow(described_class).to receive(:fadvise_sequential).and_call_original
+
+        with_socket_pair(8192) do |client, _reader|
+          described_class.copy_to_socket(client, eight_k, 0, 8192)
+          client.close
+        end
+
+        # Small files take the copy_small fast path which bypasses
+        # native_copy_loop entirely; fadvise should never fire.
+        expect(described_class).not_to have_received(:fadvise_sequential)
+      ensure
+        eight_k.close!
+      end
+    end
+
+    it 'skips fadvise when len < FADVISE_THRESHOLD even on the streaming path' do
+      skip 'native ext not loaded' unless described_class.respond_to?(:fadvise_sequential)
+
+      # 100 KiB is above SMALL_FILE_THRESHOLD (so it streams) but
+      # below FADVISE_THRESHOLD (256 KiB) — the gate in
+      # `maybe_fadvise_sequential` should skip the call.
+      size = 100 * 1024
+      bytes = ('Q' * size).b
+      f = Tempfile.new(%w[hy-sf-100k-fadv .bin]).tap do |t|
+        t.binmode
+        t.write(bytes)
+        t.flush
+        t.rewind
+      end
+      begin
+        allow(described_class).to receive(:fadvise_sequential).and_call_original
+
+        with_socket_pair(size) do |client, reader|
+          described_class.copy_to_socket(client, f, 0, size)
+          client.close
+          expect(reader.value.bytesize).to eq(size)
+        end
+
+        expect(described_class).not_to have_received(:fadvise_sequential)
+      ensure
+        f.close!
+      end
+    end
+  end
+
   describe 'EAGAIN / fiber-yield correctness' do
     # Fake out_io that returns :eagain once then accepts the rest.
     # Verifies the loop yields (calls wait_writable) and resumes from the
