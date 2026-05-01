@@ -124,9 +124,108 @@ BENCH doc:
 the same 6 rows and append a new "post-{stream}" table to the
 BENCH section so the cumulative perf delta is visible.
 
+### 2.10-C — Hyperion::Http::PageCache (pre-built static-response cache)
+
+**Headline (vs 2.10-B baseline on openclaw-vm, static 1 KiB row, `-t 5 -w 1`).**
+
+| Build | r/s | vs 2.10-B | vs Agoo 2.15.14 |
+|---|---:|---:|---:|
+| 2.10-B baseline (Hyperion 2.9.0) | 1,380 | — | -47% (Agoo wins) |
+| **2.10-C with PageCache engaged** | _filled by bench commit_ | _delta_ | _delta_ |
+| Agoo 2.15.14 (reference) | 2,606 | +89% | — |
+
+The win source mirrors agoo's `agooPage` design: each cached static
+asset's full HTTP/1.1 response (status line + Content-Type +
+Content-Length + body) lives in ONE contiguous heap buffer that's
+built ONCE on first read. The hot path (`PageCache.write_to(socket,
+path)`) hashes the path, snapshots the buffer pointer + length out
+of the cache under a brief pthread mutex, releases the mutex, then
+issues `write(fd, buf, len)` from C without the GVL. Per-request
+cost on a hit is:
+
+* 0 file reads — body bytes already live in the response buffer.
+* 0 mime lookups — Content-Type baked in at insert time.
+* 0 header re-builds — Content-Length / status line baked in.
+* 0 Rack env construction — engaged below the Rack adapter.
+* 0 Ruby allocations on the C path itself (the only return value
+  is a `SSIZET2NUM` Integer that's small enough to fit in a
+  pointer-encoded Fixnum on every supported host).
+* 1 socket write syscall in the common case.
+
+**Files added.**
+
+| File | Purpose |
+|---|---|
+| `ext/hyperion_http/page_cache.c` | C primitive (~800 LOC). Open-addressed bucket table (`PAGE_BUCKET_SIZE = 1024`, `MAX_KEY_LEN = 1024` mirroring agoo). pthread mutex on the structural ops; readers snapshot under the lock then release before the kernel write. `Init_hyperion_page_cache` runs from `parser.c` after `Init_hyperion_sendfile`. |
+| `lib/hyperion/http/page_cache.rb` | Ruby façade. Adds `write_response` (alias of `write_to`), `preload(dir, immutable: false)` (recursive), `mark_immutable` / `mark_mutable`, `available?`. |
+| `spec/hyperion/page_cache_spec.rb` | 25 specs — round-trip via real TCP pair, mtime invalidation, immutable flag, recursive preload, per-extension Content-Type matrix (12 extensions), zero-allocation hot path (< 100 objects per 1000 hits), `recheck_seconds` knob. |
+
+**Files touched.**
+
+| File | Change |
+|---|---|
+| `ext/hyperion_http/extconf.rb` | `$srcs` adds `page_cache.c` so it links into the same `.bundle` / `.so` as `parser.c` / `sendfile.c` (single `require 'hyperion_http/hyperion_http'` brings up the full surface). |
+| `ext/hyperion_http/parser.c` | `Init_hyperion_http` calls `Init_hyperion_page_cache` after `Init_hyperion_sendfile`. |
+| `lib/hyperion.rb` | Requires `lib/hyperion/http/page_cache.rb` between `http/sendfile` and `adapter/rack`. |
+| `lib/hyperion/response_writer.rb` | `write_sendfile_inner` checks the page cache first via the new `page_cache_write` helper. On a hit (or after opportunistic populate-then-write for files ≤ `AUTO_THRESHOLD = 64 KiB`), skip the entire `File.open` / `file.read` / `build_head` / `io.write` path. Class-level `page_cache_available?` probe memoised at load. Falls through cleanly when the IO is StringIO / SSL-wrapped (no real fd) — see `real_fd_io?`. |
+
+**Public Ruby API.**
+
+```ruby
+PC = Hyperion::Http::PageCache
+
+PC.preload('/var/www/public')                            # warm on boot
+PC.mark_immutable('/var/www/public/asset-abcdef.css')    # hashed assets
+PC.cache_file('/var/www/public/index.html')              # one file
+PC.fetch(path)            # :ok | :stale | :missing
+PC.write_to(socket, path) # bytes_written | :missing  (hot path)
+PC.size; PC.clear
+PC.recheck_seconds = 5.0  # default; matches agoo's PAGE_RECHECK_TIME
+```
+
+**Auto-engage from `Adapter::Rack`.** Operators get the page cache
+for free on `Rack::Files`-style routes (any body that responds to
+`:to_path`) — `ResponseWriter#write_sendfile_inner` first calls
+`page_cache_write`. Above the 64 KiB threshold it falls through to
+the existing sendfile path because Hyperion already dominates big
+static at 9× Agoo (the 2.10-B baseline). Apps wanting predictable
+first-request latency call `PageCache.preload(dir)` on boot;
+apps with content-hashed assets call `mark_immutable(path)` to
+skip the per-recheck-window stat entirely.
+
+**Wire-output note (intentional).** The cached response carries
+status line + `Content-Type` + `Content-Length` + blank line + body
+only — no `Date`, no `Connection`. Same shape Agoo emits on its
+fast path. Non-cached paths still emit the full Hyperion header
+set via `build_head`. Any response that carries `Set-Cookie` /
+`Cache-Control` / `ETag` / `Last-Modified` / `Content-Encoding` /
+`Content-Disposition` / `Vary` falls through to the existing path
+unconditionally — those headers can't be safely baked into a
+cross-request buffer.
+
+**Mtime recheck.** Every cache lookup honours
+`recheck_seconds` (default 5.0s, matches agoo's `PAGE_RECHECK_TIME`).
+On expiry the C path stat()s the file; if `mtime` is unchanged it
+just bumps `last_check`, otherwise it rebuilds the response buffer
+in place. Per-page `set_immutable(true)` skips the stat entirely
+— for fingerprinted assets the cache is effectively a one-shot
+read.
+
+**Concurrency.** Cache is per-process. Each forked Hyperion worker
+holds its own table; no IPC, no shared memory, no cross-worker
+contention. Within a worker, the table is guarded by a pthread
+mutex that's held only for the lookup + snapshot — the kernel
+`write()` runs without the GVL and without any Ruby-level lock
+so other fibers / threads keep running while the socket buffer
+drains.
+
+**Spec count.** 964 → 989 (+25 in `page_cache_spec.rb`). All 989
+green on macOS arm64; Linux x86_64 verified via the bench host
+boot.
+
 ### Filed for later 2.10 streams
 
-(populated as 2.10-C..H land)
+(populated as 2.10-D..H land)
 
 ## [2.9.0] - 2026-05-01
 

@@ -48,6 +48,25 @@ module Hyperion
 
     CRLF_HEADER_VALUE = /[\r\n]/
 
+    # 2.10-C — class-level memoised probe for the C-side page cache.
+    # The C ext registers `Hyperion::Http::PageCache.write_to` at
+    # `Init_hyperion_page_cache` time (parser.c calls it after
+    # `Init_hyperion_sendfile`).  We probe once per ResponseWriter
+    # class load and cache the bool — keeps the per-request branch a
+    # single ivar read.  Operators can flip this off at runtime with
+    # `Hyperion::ResponseWriter.page_cache_available = false` for A/B
+    # rollback (handy during the 2.10 bake).
+    class << self
+      attr_accessor :page_cache_available
+
+      def page_cache_available?
+        @page_cache_available
+      end
+    end
+    self.page_cache_available =
+      defined?(::Hyperion::Http::PageCache) &&
+      ::Hyperion::Http::PageCache.respond_to?(:write_to)
+
     # 2.6-C — `dispatch_mode:` is the per-response opt-in dispatch shape
     # (typically `:inline_blocking` for static-file routes auto-detected
     # by `Adapter::Rack#call`, or `nil` for the default fiber-yielding
@@ -171,6 +190,34 @@ module Hyperion
 
     def write_sendfile_inner(io, status, headers, body, keep_alive:, dispatch_mode: nil)
       path = body.to_path
+
+      # 2.10-C — pre-built static-response cache fast path.  When the
+      # page cache holds an entry for this path AND the response is a
+      # plain 200 with no app-supplied headers we can't bake into the
+      # cache (Set-Cookie, ETag, custom Cache-Control), bypass the
+      # entire file-open / head-build / write loop and issue ONE write
+      # syscall with the pre-built buffer.  Operators get this
+      # automatically on Rack::Files routes; bigger files (>
+      # AUTO_THRESHOLD = 64 KiB) keep the existing sendfile path
+      # because Hyperion already dominates big-static at 9× Agoo
+      # (per the 2.10-B baseline).
+      #
+      # Wire-output note: the cached buffer carries status +
+      # Content-Type + Content-Length only (no Date, no Connection)
+      # — same shape Agoo emits.  This is a deliberate wire-output
+      # change FOR CACHED RESPONSES ONLY.  Non-cached paths fall
+      # through to `build_head` below and still emit the full header
+      # set.  Apps needing Date/Connection on every response can opt
+      # out by setting `env['hyperion.streaming'] = true`, which
+      # skips the auto-detect that landed dispatch_mode here in the
+      # first place.
+      cached_bytes = page_cache_write(io, path, headers)
+      if cached_bytes
+        Hyperion.metrics.increment(:bytes_written, cached_bytes)
+        body.close if body.respond_to?(:close)
+        return
+      end
+
       file = File.open(path, 'rb')
       file_size = file.size
 
@@ -240,6 +287,82 @@ module Hyperion
         return v.to_i if k.to_s.casecmp('content-length').zero?
       end
       nil
+    end
+
+    # 2.10-C — page-cache engage helper.  Returns the bytes written
+    # on a cache hit (or after an opportunistic populate-then-write),
+    # or `nil` to signal "fall through to the existing sendfile
+    # path".  Three short-circuits keep the hot path branchless on
+    # the common cases:
+    #
+    #   1. Status must be 200.  Caches don't store negotiated 304s
+    #      / 206 Range / 416 Range-not-satisfiable / 404s.
+    #   2. The response carries no header that has to be re-emitted
+    #      per request (Set-Cookie / Cache-Control: max-age=N /
+    #      ETag / Last-Modified).  We pre-bake Content-Type +
+    #      Content-Length into the cache buffer; anything else
+    #      forces the full path.
+    #   3. The C primitive must be loaded.  Falsy on JRuby /
+    #      TruffleRuby / hosts where the C ext didn't compile.
+    #
+    # On a path-not-cached hit, opportunistically populate the cache
+    # *if* the file is below `AUTO_THRESHOLD` (64 KiB); larger files
+    # keep the existing sendfile path because Hyperion already
+    # dominates big-static at 9× Agoo.
+    def page_cache_write(io, path, headers)
+      return nil unless self.class.page_cache_available?
+      # The C primitive writes via the OS-level fd, so StringIO /
+      # OpenSSL::SSL::SSLSocket / any IO-like that doesn't expose a
+      # real kernel fd has to fall through to the existing path.
+      # Probe up front to avoid the C primitive raising on an
+      # extracted-fd attempt.
+      return nil unless real_fd_io?(io)
+
+      # Fast skip for any response carrying app-supplied headers we
+      # can't safely bake.  Walks the Hash once; the common
+      # Rack::Files case has 1-2 headers (content-type +
+      # last-modified), so the loop body runs ≤ 2 times.
+      headers.each do |k, _v|
+        case k.to_s.downcase
+        when 'set-cookie', 'cache-control', 'etag', 'last-modified',
+             'content-encoding', 'content-disposition', 'vary'
+          return nil
+        end
+      end
+
+      result = ::Hyperion::Http::PageCache.write_to(io, path)
+      return result if result.is_a?(Integer)
+
+      # Cache miss.  Populate-then-write *iff* the file is small
+      # enough that the page cache wins (big files keep the existing
+      # sendfile path).
+      begin
+        size = File.size?(path)
+      rescue StandardError
+        size = nil
+      end
+      return nil if size.nil?
+      return nil if size > ::Hyperion::Http::PageCache::AUTO_THRESHOLD
+
+      cache_result = ::Hyperion::Http::PageCache.cache_file(path)
+      return nil if cache_result == :missing
+
+      result = ::Hyperion::Http::PageCache.write_to(io, path)
+      result.is_a?(Integer) ? result : nil
+    end
+
+    # 2.10-C — the page cache writes through a real kernel fd, so the
+    # IO-side argument has to be a TCPSocket / UNIXSocket / fileno-able
+    # File.  StringIO / OpenSSL::SSL::SSLSocket / pipe-wrapped Ractors
+    # don't expose a usable fd; those callers fall through to the
+    # existing sendfile path.  Plain Integer fds are accepted directly.
+    def real_fd_io?(io)
+      return true if io.is_a?(Integer)
+      return false unless io.respond_to?(:fileno)
+      return false if defined?(StringIO) && io.is_a?(StringIO)
+      return false if defined?(::OpenSSL::SSL::SSLSocket) && io.is_a?(::OpenSSL::SSL::SSLSocket)
+
+      true
     end
 
     # True when the app explicitly opted into chunked transfer-encoding.

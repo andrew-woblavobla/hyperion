@@ -1294,6 +1294,17 @@ void Init_hyperion_http(void) {
     extern void Init_hyperion_sendfile(void);
     Init_hyperion_sendfile();
 
+    /* 2.10-C — sibling C unit owns Hyperion::Http::PageCache.
+     * Pre-built static-response cache mirrored on agoo's agooPage:
+     * each cached asset's full HTTP/1.1 response (status line +
+     * Content-Type + Content-Length + body) lives in ONE contiguous
+     * heap buffer.  The hot path issues a single write() syscall
+     * with zero Ruby-side allocation.  See ext/hyperion_http/page_cache.c
+     * for design notes; the Ruby façade lives in
+     * lib/hyperion/http/page_cache.rb. */
+    extern void Init_hyperion_page_cache(void);
+    Init_hyperion_page_cache();
+
     /* WS-3 (2.1.0) — sibling C unit owns Hyperion::WebSocket::CFrame.
      * RFC 6455 frame parse/build + GVL-releasing unmask. Same single-.so
      * link arrangement as sendfile. */
