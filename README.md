@@ -156,6 +156,38 @@ container required. HTTP/1.1 only this release; WS-over-HTTP/2 (RFC 8441
 Extended CONNECT) and permessage-deflate (RFC 7692) defer to 2.2.x.
 See [`docs/WEBSOCKETS.md`](docs/WEBSOCKETS.md).
 
+## gRPC on Hyperion (2.12-F+)
+
+Hyperion's HTTP/2 path supports gRPC unary calls via the Rack 3 trailers
+contract: any response body that exposes `:trailers` gets a final
+HEADERS frame (with END_STREAM=1) carrying the trailer map after the
+DATA frames. That's the wire shape gRPC clients expect for the
+`grpc-status` / `grpc-message` map.
+
+A minimal Rack-shaped gRPC handler:
+
+```ruby
+class GrpcBody
+  def initialize(reply); @reply = reply; end
+  def each; yield @reply; end
+  def trailers; { 'grpc-status' => '0', 'grpc-message' => 'OK' }; end
+  def close; end
+end
+
+run ->(env) {
+  request = env['rack.input'].read # gRPC-framed protobuf bytes
+  reply   = handle(request)        # your service implementation
+  [200, { 'content-type' => 'application/grpc' }, GrpcBody.new(reply)]
+}
+```
+
+What Hyperion handles for you: ALPN negotiation, HTTP/2 framing, HPACK,
+per-stream flow control, the trailer-frame emit, binary-clean
+`env['rack.input']` (gRPC bodies are non-UTF-8), and `te: trailers`
+preserved into `env['HTTP_TE']`. What you handle: protobuf
+marshalling and the `grpc-status` semantics. Streaming RPCs (server /
+client / bidi) are 2.13 candidates — pin to unary for now.
+
 ## Highlights
 
 - **HTTP/1.1 + HTTP/2 + TLS** out of the box (HTTP/2 with per-stream fiber multiplexing, WINDOW_UPDATE-aware flow control, ALPN auto-negotiation).

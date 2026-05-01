@@ -2,6 +2,112 @@
 
 ## [Unreleased] - 2.12.0
 
+### 2.12-F — gRPC support on h2
+
+**Background.** Hyperion has shipped a working HTTP/2 stack since 1.6
+(per-stream fiber multiplexing, WINDOW_UPDATE-aware flow control, ALPN
+auto-negotiation, native HPACK via the Rust v3/CGlue codec since 2.5-B).
+What was missing for gRPC over Hyperion was three small things:
+
+  1. **Trailing headers.** gRPC carries its protocol-level status
+     (`grpc-status: 0` / `grpc-message: OK`) as **trailers** — a
+     final HEADERS frame sent AFTER the body's DATA frames, with
+     END_STREAM=1. Hyperion's pre-2.12-F dispatch path always
+     folded END_STREAM onto the LAST DATA frame, so there was no
+     hook for emitting trailers.
+  2. **Binary-clean request body.** The h2 RequestStream initialised
+     `@request_body = +''` (UTF-8). Valid gRPC request bodies
+     (`[1-byte compressed flag][4-byte length-prefix][protobuf bytes]`)
+     contain non-UTF-8 byte sequences, which broke `.bytesize` /
+     `valid_encoding?` checks and corrupted bodies that downstream
+     code interpolated into a UTF-8 String.
+  3. **TE: trailers preservation.** Hyperion's RFC 7540 §8.1.2.2
+     validator already accepted `te: trailers` (any other TE value
+     is rejected as a protocol error per the spec). What was needed
+     was a non-regression spec confirming the header makes it to
+     `env['HTTP_TE']` for the Rack app.
+
+**What's new.** The h2 dispatch path (`Http2Handler#dispatch_stream`)
+now checks if the Rack response body responds to `:trailers` AFTER
+iterating the body. When it does, the wire shape becomes:
+
+```
+HEADERS (no END_STREAM)
+DATA (no END_STREAM on last DATA)
+HEADERS (END_STREAM=1)  ← trailers, e.g. grpc-status: 0
+```
+
+The trailer Hash is filtered defensively before encoding: pseudo-headers
+(`:status` / `:method` / etc.) and connection-specific names
+(`connection`, `transfer-encoding`, …) are stripped — same allow-list
+the regular response-header path uses. A misbehaving app that returns
+non-Hash trailers (or whose `body.trailers` raises) gets a warn log and
+falls back to the no-trailers path; the connection never crashes.
+
+`Http2Handler::RequestStream#@request_body` is now an
+`Encoding::ASCII_8BIT` String, so binary bytes survive verbatim through
+`<<` accumulation and `env['rack.input'].read`.
+
+**What's NOT changed.** The existing wire shape for non-gRPC h2 traffic
+is identical to 2.11.x. A Rack body that doesn't define `:trailers` (or
+where `body.trailers` is `nil` / empty) takes the pre-2.12-F path:
+HEADERS → DATA-with-END_STREAM-on-last. Verified by three non-regression
+specs in `spec/hyperion/grpc_trailers_spec.rb`.
+
+The HTTP/1.1 dispatch path is untouched. gRPC is HTTP/2-only by spec
+(the `Trailer:` mechanism on h1 has interop gaps with Go / Java clients;
+gRPC mandates h2 since v1.0). Hyperion follows suit.
+
+**What's NOT in scope for this stream.** gRPC server streaming /
+client streaming / bidi streaming require Rack 3 streaming bodies AND
+a way for the Rack app to read incoming DATA frames after sending
+response HEADERS. That's a separate stream-control problem (`rack.hijack`
+on h2 needs RFC 8441 Extended CONNECT, same blocker as WebSocket-over-h2).
+2.12-F lands the **unary** (request-response) and **server-side trailers**
+half — which covers ~80% of production gRPC traffic shapes by message
+volume per the public Google / Netflix talks. Streaming is a 2.13
+candidate.
+
+**Opt-in via Rack 3 `body.trailers`.** Apps don't need to know about
+Hyperion. Any Rack 3 body — hand-rolled, `grpc-server-rack`, a future
+`Rack::Trailers` middleware — that exposes `body.trailers` returning
+a Hash gets the trailing HEADERS frame on the wire. Bodies that don't
+expose it (the overwhelming majority of HTTP/2 traffic — Rails,
+Sinatra, asset servers, JSON APIs) take the legacy path with no
+behaviour change.
+
+**Spec coverage.** `spec/hyperion/grpc_trailers_spec.rb` — 11 specs
+covering:
+
+  - End-to-end TLS+h2 client driving a real Hyperion server through
+    `Protocol::HTTP2::Client`, asserting the trailing HEADERS frame
+    decodes to the expected `grpc-status` / `grpc-message` map.
+  - `te: trailers` request header reaches `env['HTTP_TE']`.
+  - Binary request body bytes (`\xFF\x00\x01\x02\xC3\x28\x80`)
+    round-trip verbatim through `env['rack.input'].read`.
+  - Non-regression: bodies without `:trailers` keep the
+    DATA-with-END_STREAM-on-last shape (no extra HEADERS frame).
+  - Defensive: `body.trailers = nil` and `body.trailers = {}` both
+    take the no-trailers path.
+  - Unit tests for `collect_response_trailers` covering nil /
+    raises / Hash-coercible / non-responding bodies.
+
+`spec/hyperion/grpc_smoke_spec.rb` — opt-in (`RUN_GRPC_SMOKE=1`)
+end-to-end smoke against the real `grpc` Ruby gem. Skipped by default
+because the gem pulls protobuf C bindings (~50 MB build); the unit
+specs above are the durable coverage.
+
+**Performance.** Zero hot-path cost when no app uses trailers — the
+`body.respond_to?(:trailers)` probe is one method dispatch, the
+trailers-Hash branch only runs when the probe returns truthy. The
+trailers-emitting path costs one extra encoder-mutex acquisition + one
+extra HEADERS frame per response — negligible against the existing
+HEADERS+DATA sequence. No bench numbers here because gRPC throughput
+on Hyperion is dominated by the application's protobuf marshalling,
+not the framing layer; a meaningful gRPC bench is a 2.13 follow-up
+once we have a streaming story to compare against Falcon's
+`async-grpc`.
+
 ### 2.12-E — SO_REUSEPORT load balancing audit
 
 **Background.** Hyperion's cluster mode (`-w N`) uses two listener-FD

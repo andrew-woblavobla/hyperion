@@ -275,7 +275,16 @@ module Hyperion
       def initialize(*)
         super
         @request_headers = []
-        @request_body = +''
+        # 2.12-F — gRPC carries opaque protobuf bytes
+        # ([1-byte compressed flag][4-byte length-prefix][message bytes]) in the
+        # request body. The default UTF-8 encoding on a `+''` literal would
+        # break valid_encoding? on byte sequences that don't form UTF-8
+        # codepoints, leading to a Rack app reading `body.string` and getting
+        # a String that misreports its bytesize / corrupts when string-
+        # interpolated. ASCII_8BIT (binary) preserves bytes verbatim and is
+        # the encoding gRPC Ruby clients expect. Same change is applied to
+        # the HTTP/1.1 path as a separate concern; see Connection.
+        @request_body = String.new(encoding: Encoding::ASCII_8BIT)
         @request_body_bytes = 0
         @request_complete = false
         @window_available = ::Async::Notification.new
@@ -1164,8 +1173,17 @@ module Hyperion
         end
       end
 
-      payload = +''
+      # 2.12-F — gRPC support: bodies that respond to `:trailers` carry a
+      # final HEADERS frame (with END_STREAM=1) right after the DATA frames.
+      # The Rack 3 contract is "iterate body first, then call body.trailers"
+      # — so we materialise the payload, then *before* `body.close`
+      # (`Rack::BodyProxy` clears state on close) snapshot the trailers Hash.
+      # `nil` / empty Hash → no trailing frame. Non-Hash values are coerced
+      # to a Hash defensively; a misbehaving app must not be able to crash
+      # the connection.
+      payload = String.new(encoding: Encoding::ASCII_8BIT)
       body_chunks.each { |c| payload << c.to_s }
+      response_trailers = collect_response_trailers(body_chunks)
       body_chunks.close if body_chunks.respond_to?(:close)
 
       # Hotfix C2: empty-body responses (RFC 7230 §3.3.3 — 204/304 + HEAD)
@@ -1174,10 +1192,21 @@ module Hyperion
       # one writer-fiber wakeup instead of two. Any body the app returned
       # for HEAD is discarded here per spec (the bytes were already
       # built — that's a Rack-app smell, not our problem to fix).
+      #
+      # Trailers on body-suppressed responses (HEAD/204/304) are dropped:
+      # the response is end-of-stream after HEADERS, with no place to put
+      # a trailing HEADERS frame. This matches what curl --http2 / grpc
+      # clients do (HEAD + gRPC isn't a meaningful combination).
       if body_suppressed?(method, status)
         writer_ctx.encode_mutex.synchronize do
           stream.send_headers(out_headers, ::Protocol::HTTP2::END_STREAM)
         end
+      elsif have_trailers?(response_trailers)
+        # gRPC / Rack-3-trailers path: HEADERS (no END_STREAM), DATA frames
+        # (no END_STREAM on last DATA), final HEADERS with END_STREAM=1.
+        writer_ctx.encode_mutex.synchronize { stream.send_headers(out_headers) }
+        send_body(stream, payload, writer_ctx, end_stream: false)
+        send_trailers(stream, response_trailers, writer_ctx)
       else
         writer_ctx.encode_mutex.synchronize { stream.send_headers(out_headers) }
         send_body(stream, payload, writer_ctx)
@@ -1238,9 +1267,24 @@ module Hyperion
     #
     # The encode_mutex protects HPACK state and per-stream frame ordering;
     # the actual socket write happens off-fiber via the writer task.
-    def send_body(stream, payload, writer_ctx)
+    #
+    # 2.12-F — `end_stream:` controls whether the LAST DATA frame carries
+    # the END_STREAM flag. The default `true` preserves pre-2.12-F semantics
+    # (final DATA frame closes the stream). Callers that intend to send a
+    # trailing HEADERS frame after the body pass `end_stream: false` so the
+    # final DATA frame leaves the stream half-open from the server side
+    # and the trailer HEADERS frame can carry END_STREAM=1.
+    def send_body(stream, payload, writer_ctx, end_stream: true)
       if payload.empty?
-        writer_ctx.encode_mutex.synchronize { stream.send_data('', ::Protocol::HTTP2::END_STREAM) }
+        if end_stream
+          writer_ctx.encode_mutex.synchronize do
+            stream.send_data('', ::Protocol::HTTP2::END_STREAM)
+          end
+        end
+        # When end_stream is false AND payload is empty, we deliberately
+        # send NO DATA frame at all — gRPC trailers-only responses (the
+        # error-without-payload shape) are HEADERS → trailer-HEADERS, no
+        # DATA in between. send_trailers handles the closing END_STREAM.
         return
       end
 
@@ -1259,9 +1303,74 @@ module Hyperion
 
         chunk = payload.byteslice(offset, available)
         offset += chunk.bytesize
-        flags = offset >= bytesize ? ::Protocol::HTTP2::END_STREAM : 0
+        last_chunk = offset >= bytesize
+        flags = last_chunk && end_stream ? ::Protocol::HTTP2::END_STREAM : 0
 
         writer_ctx.encode_mutex.synchronize { stream.send_data(chunk, flags) }
+      end
+    end
+
+    # 2.12-F — pull a trailers Hash off the response body if Rack 3
+    # `body.trailers` is implemented. Called AFTER the body has been
+    # fully iterated (Rack 3 contract: trailers are computed by the body
+    # while it streams; reading them before iteration is undefined).
+    # Returns nil when the body doesn't expose trailers, when the call
+    # raises, or when the result isn't a Hash-coercible map. Defensive
+    # by design: a misbehaving app must not crash the dispatch loop.
+    def collect_response_trailers(body)
+      return nil unless body.respond_to?(:trailers)
+
+      raw = body.trailers
+      return nil if raw.nil?
+      return raw if raw.is_a?(Hash)
+      return raw.to_h if raw.respond_to?(:to_h)
+
+      nil
+    rescue StandardError => e
+      @logger.warn do
+        { message: 'h2 body.trailers raised; ignoring',
+          error: e.message, error_class: e.class.name }
+      end
+      nil
+    end
+
+    # 2.12-F — predicate for "we have trailers worth sending". Defined as
+    # a method (rather than the more idiomatic `!h.nil? && !h.empty?` /
+    # `h&.any?`) because rubocop-rails on the hot path autocorrects both
+    # of those forms to `h.present?`, which raises NoMethodError on a
+    # plain Hash outside ActiveSupport. Hyperion is a stand-alone gem;
+    # we don't depend on ActiveSupport, so we route through this helper
+    # to keep the rubocop-rails formatter quiet without adding a Cop
+    # disable comment everywhere a nil-or-empty Hash check appears.
+    def have_trailers?(trailers)
+      return false if trailers.nil?
+      return false if trailers.respond_to?(:empty?) && trailers.empty?
+
+      true
+    end
+
+    # 2.12-F — emit the final HEADERS frame carrying response trailers.
+    # The wire shape is one HEADERS frame with END_STREAM=1; HPACK
+    # encodes the trailer block exactly like a regular HEADERS frame.
+    # Trailer keys MUST be lowercased (RFC 7540 §8.1.2) — same rule as
+    # regular HTTP/2 headers. We strip CR/LF from values defensively
+    # (a header-injection guard) and split multi-line values on \n the
+    # same way the regular response-header path does.
+    def send_trailers(stream, trailers, writer_ctx)
+      pairs = []
+      trailers.each do |k, v|
+        name = k.to_s.downcase
+        # Pseudo-headers and forbidden names cannot appear in trailers.
+        next if name.empty?
+        next if name.start_with?(':')
+        next if RequestStream::FORBIDDEN_HEADERS.include?(name)
+
+        Array(v).each do |val|
+          val.to_s.split("\n").each { |line| pairs << [name, line] }
+        end
+      end
+      writer_ctx.encode_mutex.synchronize do
+        stream.send_headers(pairs, ::Protocol::HTTP2::END_STREAM)
       end
     end
 
