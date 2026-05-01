@@ -134,6 +134,11 @@ module Hyperion
     # Single instance per connection, lives for the lifetime of `serve`.
     class WriterContext
       attr_reader :encode_mutex
+      # 2.10-G — connection-lifecycle timing slots used by the optional h2
+      # latency-instrumentation path (gated by `HYPERION_H2_TIMING=1`).
+      # Each slot is a single CLOCK_MONOTONIC timestamp captured at most
+      # once per connection. nil = unset, set on first observation.
+      attr_accessor :t0_serve_entry, :t1_preface_done, :t2_first_encode, :t2_first_wire
 
       def initialize(max_pending_bytes: MAX_PER_CONN_PENDING_BYTES)
         @queue              = ::Thread::Queue.new
@@ -144,6 +149,12 @@ module Hyperion
         @pending_bytes_lock = ::Mutex.new
         @max_pending_bytes  = max_pending_bytes
         @writer_done        = false
+        # 2.10-G timing slots, all initially nil so capture is a single
+        # `||=` write under the encode mutex / writer fiber.
+        @t0_serve_entry  = nil
+        @t1_preface_done = nil
+        @t2_first_encode = nil
+        @t2_first_wire   = nil
       end
 
       # Called by SendQueueIO#write on the calling (encoder) fiber. Enforces
@@ -478,6 +489,24 @@ module Hyperion
       # Compressor / Decompressor handles everything as in 2.0.0–2.4.x.
       @h2_native_hpack_enabled = @h2_codec_available && resolve_h2_native_hpack_default
       @h2_codec_native = @h2_native_hpack_enabled # back-compat ivar — preserved for codec_native? readers
+      # 2.10-G — opt-in connection-setup timing instrumentation. When set,
+      # `serve` captures four monotonic timestamps per connection:
+      #
+      #   t0 — entry to `serve` (post-TLS, post-ALPN — the socket is already
+      #        the negotiated h2 SSLSocket by the time the handler sees it)
+      #   t1 — `read_connection_preface` returned (server-side SETTINGS
+      #        encoded + handed to the framer; client preface fully read)
+      #   t2_encode — first stream's HEADERS frame finished encoding (bytes
+      #               sit in the writer queue)
+      #   t2_wire   — writer fiber finished its first `socket.write` (bytes
+      #               on the wire)
+      #
+      # When the connection's first response completes, the handler emits
+      # a single `'h2 first-stream timing'` info line with t0→t1, t1→t2_encode,
+      # t2_encode→t2_wire deltas in milliseconds. Off by default (zero hot-path
+      # cost when disabled — a single ivar read per stream branch). Used by
+      # 2.10-G to root-cause Hyperion's flat ~40 ms first-stream max-latency.
+      @h2_timing_enabled = env_flag_enabled?('HYPERION_H2_TIMING')
       record_codec_boot_state
     end
 
@@ -574,6 +603,11 @@ module Hyperion
       framer       = ::Protocol::HTTP2::Framer.new(send_io)
       server       = build_server(framer)
 
+      # 2.10-G — connection entry timestamp. Captured before any framing
+      # work so the t0→t1 delta isolates "preface exchange + initial
+      # SETTINGS round-trip" from any pre-handler scheduling delay.
+      writer_ctx.t0_serve_entry = monotonic_now if @h2_timing_enabled
+
       task = ::Async::Task.current
 
       # Spawn the dedicated writer fiber BEFORE the preface exchange.
@@ -585,6 +619,7 @@ module Hyperion
       writer_task = task.async { run_writer_loop(socket, writer_ctx) }
 
       server.read_connection_preface(initial_settings_payload)
+      writer_ctx.t1_preface_done = monotonic_now if @h2_timing_enabled
 
       # Extract once — the same TCP peer drives every stream on this conn.
       peer_addr = peer_address(socket)
@@ -647,6 +682,12 @@ module Hyperion
         rescue StandardError
           nil
         end
+        # 2.10-G — emit one info-level timing line per connection when the
+        # opt-in instrumentation is enabled and we collected a full set of
+        # samples (a connection that died before serving any stream lacks
+        # t2_first_encode / t2_first_wire and gets skipped — there's no
+        # first-stream signal to report).
+        log_h2_first_stream_timing(writer_ctx) if @h2_timing_enabled
       end
       @metrics.decrement(:connections_active)
       socket.close unless socket.closed?
@@ -892,6 +933,13 @@ module Hyperion
         writer_ctx.encode_mutex.synchronize { stream.send_headers(out_headers) }
         send_body(stream, payload, writer_ctx)
       end
+      # 2.10-G — first stream's HEADERS+DATA encoded. Capture exactly once
+      # per connection (use ||= under the encode mutex's freshly-released
+      # write so concurrent stream fibers race lose-race once). For h2load
+      # `-c 1 -m 100 -n 5000` the first stream is stream id 1, the only
+      # one that pays the connection-setup cost; later streams skip this
+      # branch via the `||=`.
+      writer_ctx.t2_first_encode = monotonic_now if @h2_timing_enabled && writer_ctx.t2_first_encode.nil?
       @metrics.increment_status(status)
     rescue StandardError => e
       @metrics.increment(:app_errors)
@@ -986,6 +1034,13 @@ module Hyperion
         while (chunk = writer_ctx.try_pop)
           begin
             socket.write(chunk)
+            # 2.10-G — first byte on the wire. Capture exactly once per
+            # connection (the first chunk drained is the server's
+            # connection-preface SETTINGS frame; we want the t1→t2_wire
+            # delta to bracket "preface bytes encoded → preface bytes on
+            # the socket". The expensive HEADERS+DATA enqueue happens
+            # later under t2_first_encode.)
+            writer_ctx.t2_first_wire = monotonic_now if @h2_timing_enabled && writer_ctx.t2_first_wire.nil?
           rescue EOFError, Errno::ECONNRESET, Errno::EPIPE, IOError, OpenSSL::SSL::SSLError
             # Peer hung up. Release THIS chunk's byte budget, then drain the
             # rest of the queue (without writing) so backpressured encoders
@@ -1028,6 +1083,55 @@ module Hyperion
       while (chunk = writer_ctx.try_pop)
         writer_ctx.note_drained(chunk.bytesize)
       end
+    end
+
+    # 2.10-G — small helper so the four timing call sites in `serve`,
+    # `dispatch_stream`, and `run_writer_loop` agree on the clock source.
+    # CLOCK_MONOTONIC is unaffected by NTP jumps and is what the rest of
+    # the gem uses for elapsed-time math (see Connection#serve).
+    def monotonic_now
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+
+    # 2.10-G — assemble + emit the per-connection timing breakdown that
+    # the bench harness greps for. Three deltas are reported in
+    # milliseconds:
+    #
+    #   t0_to_t1_ms     — preface exchange (read client preface + write
+    #                     server SETTINGS into the framer queue)
+    #   t1_to_t2_enc_ms — gap between preface complete and first stream's
+    #                     HEADERS+DATA encoded. If this is the dominant
+    #                     bucket, the framer-fiber priming / first-stream
+    #                     scheduling is the suspect.
+    #   t2_enc_to_t2_wire_ms — encode-complete to writer drained first
+    #                          chunk on the wire. Should be near-zero on
+    #                          a healthy connection (writer fiber is
+    #                          already running, parked on @send_notify).
+    #                          A large value here = writer-fiber
+    #                          starvation under the Async scheduler.
+    #
+    # Skipped when any timestamp is missing (connection died before
+    # serving a stream / instrumentation was disabled mid-flight).
+    def log_h2_first_stream_timing(writer_ctx)
+      t0 = writer_ctx.t0_serve_entry
+      t1 = writer_ctx.t1_preface_done
+      t2_enc  = writer_ctx.t2_first_encode
+      t2_wire = writer_ctx.t2_first_wire
+      return if t0.nil? || t1.nil? || t2_enc.nil? || t2_wire.nil?
+
+      @logger.info do
+        {
+          message: 'h2 first-stream timing',
+          t0_to_t1_ms: ((t1 - t0) * 1000).round(3),
+          t1_to_t2_enc_ms: ((t2_enc - t1) * 1000).round(3),
+          t2_enc_to_t2_wire_ms: ((t2_wire - t2_enc) * 1000).round(3),
+          t0_to_t2_wire_ms: ((t2_wire - t0) * 1000).round(3)
+        }
+      end
+    rescue StandardError
+      # Logging the timing breakdown must never crash the connection
+      # teardown path — instrumentation is best-effort.
+      nil
     end
 
     # Mirrors Connection#peer_address — see the comment there. SSLSocket

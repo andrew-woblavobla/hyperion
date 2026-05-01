@@ -246,6 +246,105 @@ drains.
 green on macOS arm64; Linux x86_64 verified via the bench host
 boot.
 
+### 2.10-G — Investigate Hyperion h2 max-lat ~40 ms ceiling (instrumentation, fix deferred)
+
+**Status: instrumentation landed, bench-host re-run deferred to next bench
+window — operator SSH key was rejected from the controller workstation
+during this sprint (the same `Permission denied (publickey)` wall 2.9-E
+documented for subagents, manifest here on the human-driven path).
+Non-blocking; the instrumentation makes the next bench window's
+investigation a single command rather than a code-archaeology dig.**
+
+**Background (filed by 2.9-B).** The Falcon h2 head-to-head bench
+(`bench/h2_falcon_compare.sh`, `h2load -c 1 -m 100 -n 5000`) found
+Hyperion's max-latency suspiciously **flat at ~40 ms** across all three
+rows (hello / h2_post / h2_rails_shape) while Falcon's max-latency on
+the same workloads is **5-10 ms**. RPS is fine — 1,778-2,198 r/s — so
+this is a tail-latency problem on the **first** stream of each h2
+connection, not a throughput problem.
+
+**Hypothesis.** The bench drives 5,000 streams over ONE connection;
+only stream #1 pays the connection-setup cost. The flat 40 ms ceiling
+across rows reads as a fixed-cost first-stream setup delay — most
+likely TLS handshake completion + initial SETTINGS round-trip +
+framer-fiber priming all serialized on the first stream's response
+path. Once the connection is warm, subsequent streams should land at
+~5 ms and the median+p99 stay healthy; the **max** comes entirely
+from the cold first stream.
+
+**What landed (instrumentation only).** Four monotonic timestamps on
+every h2 connection, gated by `HYPERION_H2_TIMING=1` (off by default —
+zero hot-path overhead when disabled, single ivar read per branch
+when enabled):
+
+| Slot | Captured at |
+|---|---|
+| `t0_serve_entry`  | `Http2Handler#serve` entry (post-TLS, post-ALPN — the SSL handshake completed before the handler was reached) |
+| `t1_preface_done` | After `server.read_connection_preface(initial_settings_payload)` returns (server SETTINGS encoded + handed to framer queue; client preface fully read) |
+| `t2_first_encode` | After the **first** stream's `send_headers` + `send_body` finish encoding (bytes sit in writer queue) |
+| `t2_first_wire`   | After the writer fiber's first successful `socket.write` (first chunk on the wire — typically the server's preface SETTINGS frame) |
+
+Stored on the per-connection `WriterContext`. Captured exactly once
+per connection via simple `nil?` guards (no mutex needed — the encode
+mutex around `send_headers` plus the single-writer-fiber invariant
+already serialize the writes that matter). Emits one info-level line
+on connection close:
+
+```text
+{"ts":"...","level":"info","source":"hyperion",
+ "message":"h2 first-stream timing",
+ "t0_to_t1_ms":<preface exchange>,
+ "t1_to_t2_enc_ms":<first stream encode>,
+ "t2_enc_to_t2_wire_ms":<encode→wire>,
+ "t0_to_t2_wire_ms":<total cold-stream cost>}
+```
+
+**Next bench window (the 60-second drill).** SSH to the bench host,
+enable instrumentation, re-run `h2load -c 1 -m 100 -n 5000`, grep for
+`'h2 first-stream timing'`. Three diagnostic shapes:
+
+1. `t0_to_t1_ms` ≈ 40 ms, others ~0 → fix is to parallelize the
+   server-preface SETTINGS write with the kernel TLS handshake
+   completion (currently they're serial — TLS handshake completes
+   inside `Hyperion::Tls`, then `Http2Handler#serve` runs, then
+   preface is written).
+2. `t1_to_t2_enc_ms` ≈ 40 ms, others ~0 → fix is to **pre-spawn the
+   stream-dispatch fiber pool** at connection accept rather than
+   lazily on the first `ready_ids` tick. Today the first dispatch
+   fiber is spawned by `task.async { dispatch_stream(...) }` only
+   AFTER the first complete HEADERS frame is read; an Async scheduler
+   tick is needed before that fiber runs and reaches `send_headers`.
+3. Spread across both → both fixes apply. Either way the deltas tell
+   the operator exactly where to cut.
+
+**Files touched (instrumentation-only commit).**
+
+| File | Change |
+|---|---|
+| `lib/hyperion/http2_handler.rb` | Added 4 timing slots to `WriterContext` + capture sites in `serve` (t0/t1), `dispatch_stream` (t2_encode), `run_writer_loop` (t2_wire). New private helpers `monotonic_now` and `log_h2_first_stream_timing`. All gated by `@h2_timing_enabled` (resolved once at handler-construction from `HYPERION_H2_TIMING`). |
+| `spec/hyperion/http2_first_stream_timing_spec.rb` | 8 new specs locking the contract: env-flag gating (3 cases — default off, truthy-on, truthy-off), nil-default WriterContext slots, log-emit shape (deltas in ms, non-negative, ordered), partial-capture short-circuit (nil timestamp → no log), best-effort error swallow. **No assertion on absolute latency** (would be CI-flaky). |
+
+**Spec count.** 989 → 997 (+8). All green on macOS arm64.
+
+**Why no fix this sprint.** Step 2 / step 4 of the investigation plan
+required SSH to `openclaw-vm` for live h2load runs to read the
+breakdown. That access path is currently rejecting the operator's
+on-disk SSH key from this workstation (same root cause class as 2.9-E
+documented — environmental, not code). Rather than guess at the right
+fix from a hypothesis (and risk a regression on the 2.5-B Rust HPACK
+win or the 1.6.0 writer-fiber refactor), the instrumentation is
+landing standalone so the bench window after this can resolve it in
+one shot. The 40 ms is a tail-latency knob; the median + p99 stay
+healthy and 2.10's 4-way bench results stand as published.
+
+**Filed forward to 2.11.** "h2 max-lat fix based on 2.10-G timing
+breakdown" — owner runs the timing bench, reads the dominant bucket,
+implements one of the two candidate fixes above (or files a third if
+the breakdown reveals something unexpected). The instrumentation
+itself is durable infrastructure beyond this single investigation:
+any future "first-stream slow" / "cold-connection latency" bug hits
+the same probe and gets the same diagnostic shape.
+
 ### Filed for later 2.10 streams
 
 (populated as 2.10-D..H land)
