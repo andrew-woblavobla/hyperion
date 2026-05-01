@@ -506,6 +506,10 @@ module Hyperion
         @logger  = Hyperion.logger
       end
       @h2_admission       = h2_admission
+      # 2.12-E — per-worker request counter label. Identical caching
+      # rationale to Connection#initialize: process-constant ID, looked
+      # up once and held in the ivar.
+      @worker_id          = Process.pid.to_s
       @h2_codec_available = Hyperion::H2Codec.available?
       # 2.5-B [breaking-default-change]: native HPACK now defaults to ON
       # when the Rust crate is available. The 2026-04-30 Rails-shape
@@ -1121,6 +1125,11 @@ module Hyperion
 
       @metrics.increment(:requests_total)
       @metrics.increment(:requests_in_flight)
+      # 2.12-E — per-worker request counter, ticked once per h2 stream.
+      # Same family as Connection#serve so the audit metric reflects
+      # cluster distribution across BOTH transports without operators
+      # needing to alert on two separate counters.
+      @metrics.tick_worker_request(@worker_id)
       # 2.1.0 (WS-1): HTTP/2 hijack is intentionally NOT plumbed here.
       # Rack 3 hijack over HTTP/2 requires Extended CONNECT (RFC 8441 +
       # RFC 9220) — a separate feature with its own SETTINGS handshake,

@@ -476,6 +476,11 @@ static int hyp_iu_drain_cqes(hyp_iu_loop_t *L) {
             /* Full response written. Lifecycle hook fires here so
              * observers see a finished request. */
             L->served++;
+            /* 2.12-E — feed the per-process atomic so the SO_REUSEPORT
+             * audit harness can scrape `c_loop_requests_total` without
+             * caring whether the worker landed on the accept4 or
+             * io_uring path. Lock-free; no GVL re-acquisition. */
+            pc_internal_tick_request();
             if (pc_internal_lifecycle_active()) {
                 hyp_iu_hook_args_t args = {
                     .method = c->rbuf + c->method_off, .mlen = c->method_len,
@@ -615,6 +620,10 @@ static VALUE rb_pc_run_static_io_uring_loop(VALUE self, VALUE rb_listen_fd) {
      * `stop_accept_loop` doesn't immediately tear us down. The 2.12-C
      * loop does the same dance at entry — see `rb_pc_run_static_accept_loop`. */
     pc_internal_reset_stop();
+    /* 2.12-E — reset the per-process served-request counter on entry so
+     * `c_loop_requests_total` reflects THIS loop's served count. Mirrors
+     * the 2.12-C accept4 entry path. */
+    pc_internal_reset_requests_served();
 
     /* Clear O_NONBLOCK on the listener — io_uring drives accept itself
      * and we want the kernel to park us in the ring rather than spin

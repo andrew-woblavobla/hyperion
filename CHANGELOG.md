@@ -2,6 +2,92 @@
 
 ## [Unreleased] - 2.12.0
 
+### 2.12-E — SO_REUSEPORT load balancing audit
+
+**Background.** Hyperion's cluster mode (`-w N`) uses two listener-FD
+models depending on platform:
+
+  - **Linux:** `SO_REUSEPORT`. Every worker calls `bind()` on the same
+    port; the kernel does in-kernel load balancing across connected
+    workers based on a 4-tuple hash. Documented as the
+    production-recommended setup since rc15.
+  - **Darwin / BSD:** master-bind + worker-fd-share. The master process
+    binds the listener and passes the fd to workers via `fork()`;
+    workers race to `accept()`. Darwin's `SO_REUSEPORT` doesn't
+    load-balance — it just lets multiple sockets bind without
+    `EADDRINUSE` — so we deliberately do NOT use it on Darwin.
+
+The Linux path was built on the assumption that the kernel hash
+distributes uniformly across workers under sustained load. We had no
+**measurement** of that — only theory. 2.12-E fixes the gap.
+
+**New per-worker request counter.** `Hyperion::Metrics#tick_worker_request`
+ticks the labeled counter family
+`hyperion_requests_dispatch_total{worker_id="<pid>"}` once per
+dispatched request, regardless of which dispatch shape served it:
+
+  - Rack-via-`Connection#serve` (the threadpool / inline / async-io
+    paths).
+  - HTTP/2 stream dispatch in `Http2Handler`.
+  - The 2.12-C `accept4` C accept loop.
+  - The 2.12-D io_uring accept loop.
+
+The C-loop variants tick a process-global atomic counter
+(`Hyperion::Http::PageCache.c_loop_requests_total`) that the
+`PrometheusExporter.render_full` pass folds into the
+per-worker series at scrape time — so operators see one consistent
+per-PID count even on the C-only fast path that bypasses
+`Connection#serve`. Hot-path cost on the C loops is one
+`__atomic_add_fetch` (relaxed) — negligible against the 134k r/s
+2.12-D bench peak.
+
+The label value is `Process.pid.to_s` — matches the 2.4-C
+`hyperion_io_uring_workers_active` and
+`hyperion_per_conn_rejections_total` labeling convention; lets
+operators correlate cluster-mode rows with `ps`/`/proc` data without
+a separate worker_id ↔ pid mapping table.
+
+**New bench harness.** `bench/cluster_distribution.sh` boots
+Hyperion `-w 4 -t 1 -p 9292 bench/hello_static.ru` (4 workers,
+sharp imbalance signal), runs `wrk -t8 -c200 -d30s` against `/`,
+then scrapes `/-/metrics` repeatedly until all 4 workers have
+responded. Reports the per-worker request distribution
+(pid + count + share-%), mean / stddev / max-vs-min ratio, and a
+verdict:
+
+  - `balanced` (max/min ≤ 1.10): kernel hash is doing its job.
+  - `mild` (1.10 < max/min ≤ 1.50): note here, no fix.
+  - `severe` (max/min > 1.50): file follow-up; do not ship as-is.
+
+Three runs back-to-back so noise is visible; aggregate verdict is
+the worst per-run verdict (one severe run is enough to fail the
+audit).
+
+**Bench result.** See `docs/BENCH_HYPERION_2_11.md`'s "Cluster
+distribution audit" section. Headline number lands in the
+`[bench][2.12.0] 2.12-E — bench result: …` follow-up commit.
+
+**Darwin caveat.** The Darwin master-bind/worker-fd-share path is
+documented as known-imbalanced and is NOT covered by this audit
+(no kernel SO_REUSEPORT distributor to measure). The metric
+infrastructure is platform-independent; any operator running on
+Darwin can read their own per-worker imbalance via `/-/metrics` and
+the same `hyperion_requests_dispatch_total{worker_id}` series.
+
+**Spec coverage.** `spec/hyperion/metrics_per_worker_request_count_spec.rb`
+asserts:
+
+  - `Metrics#tick_worker_request` registers the labeled family with
+    `worker_id` label and increments the right series.
+  - `Connection#serve` ticks the counter once per request from any
+    dispatch shape (regular Rack, direct dispatch, StaticEntry fast
+    path).
+  - `PrometheusExporter.render_full` emits the merged
+    `hyperion_requests_dispatch_total{worker_id="<pid>"}` line.
+  - The C accept4 loop's atomic counter ticks per request and is
+    reset on `run_static_accept_loop` entry. (Gated on the C ext
+    being available; same gating pattern 2.12-D specs use.)
+
 ### 2.12-D — io_uring accept loop (Linux 5.x)
 
 The 2.12-C `accept4` loop closed most of the gap to Agoo on the

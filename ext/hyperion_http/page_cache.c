@@ -1139,6 +1139,45 @@ static int    hyp_cl_lifecycle_active   = 0;
  * check it before the next read. */
 static volatile sig_atomic_t hyp_cl_stop = 0;
 
+/* 2.12-E — per-process served-request counter, ticked once per request
+ * served by `hyp_cl_serve_connection` (2.12-C accept4 loop) AND by the
+ * 2.12-D io_uring loop (via the `pc_internal_*` shim). Read by Ruby at
+ * scrape time via `Hyperion::Http::PageCache.c_loop_requests_total` —
+ * the PrometheusExporter folds it into the
+ * `hyperion_requests_dispatch_total{worker_id=PID}` series for the
+ * current worker, so operators see one consistent per-worker number
+ * regardless of which dispatch shape served the request.
+ *
+ * Atomicity: accessed via `__atomic_*` builtins (gcc/clang both
+ * support these on every target this gem builds for). The hot-path
+ * cost is one `lock add`-style instruction per request, well below
+ * the ~10μs per-request budget at 134k r/s.
+ *
+ * Reset semantics: zeroed on `run_static_accept_loop` /
+ * `run_static_io_uring_loop` entry so a previous loop's count from a
+ * test-suite respawn doesn't leak into the new loop's snapshot.
+ * Specs use `reset_c_loop_requests_total!` to assert from-zero
+ * behaviour without driving a full loop.
+ *
+ * Type: `unsigned long long` to match the Integer marshalling
+ * (`ULL2NUM`) on Ruby's side; signed wraparound is undefined behaviour
+ * and we want defined unsigned-rollover semantics for the audit
+ * counter (which would only matter at ~10^19 total requests).
+ */
+static volatile unsigned long long hyp_cl_requests_served_total = 0;
+
+static inline void hyp_cl_tick_request(void) {
+    __atomic_add_fetch(&hyp_cl_requests_served_total, 1ULL, __ATOMIC_RELAXED);
+}
+
+static inline unsigned long long hyp_cl_load_requests_served(void) {
+    return __atomic_load_n(&hyp_cl_requests_served_total, __ATOMIC_RELAXED);
+}
+
+static inline void hyp_cl_reset_requests_served(void) {
+    __atomic_store_n(&hyp_cl_requests_served_total, 0ULL, __ATOMIC_RELAXED);
+}
+
 /* Header-section size cap. Anything bigger is rejected: the request
  * is malformed or hostile, and either way Ruby's full parser is
  * the right place to produce an error response. Mirrors
@@ -1663,6 +1702,10 @@ static long hyp_cl_serve_connection(int client_fd, int *handed_off) {
         }
 
         served++;
+        /* 2.12-E — per-process tick. Lock-free atomic so the SO_REUSEPORT
+         * audit harness can scrape `c_loop_requests_total` mid-bench
+         * without serialising on a Ruby-side mutex. */
+        hyp_cl_tick_request();
 
         /* Lifecycle hooks fire AFTER the wire write so observers see a
          * completed request. Keep this off the no-hook hot path via
@@ -1723,6 +1766,12 @@ static VALUE rb_pc_run_static_accept_loop(VALUE self, VALUE rb_listen_fd) {
         rb_raise(rb_eArgError, "listen_fd must be >= 0");
     }
     hyp_cl_stop = 0;
+    /* 2.12-E — reset the per-process served-request counter on entry
+     * so the audit metric reflects THIS loop's served count (not
+     * leftovers from a prior loop in the same process — primarily a
+     * test-suite concern; production has at most one loop per process
+     * lifetime). */
+    hyp_cl_reset_requests_served();
 
     /* Ruby's `TCPServer.new` sets O_NONBLOCK on the listening fd so
      * `IO.select` + `accept_nonblock` works naturally on the Ruby
@@ -1840,6 +1889,49 @@ static VALUE rb_pc_stop_accept_loop(VALUE self) {
     return Qnil;
 }
 
+/* PageCache.c_loop_requests_total -> Integer
+ *
+ * 2.12-E — the running per-process count of requests served by either
+ * the 2.12-C accept4 loop or the 2.12-D io_uring loop since the
+ * loop-entry reset. Read at /-/metrics scrape time so the
+ * `hyperion_requests_dispatch_total{worker_id=PID}` family reflects
+ * C-loop-served requests in addition to Ruby-side ones. Lock-free
+ * via the same atomic the loop bumps on each request. */
+static VALUE rb_pc_c_loop_requests_total(VALUE self) {
+    (void)self;
+    return ULL2NUM(hyp_cl_load_requests_served());
+}
+
+/* PageCache.reset_c_loop_requests_total! -> 0
+ *
+ * 2.12-E — spec/operator escape hatch for clearing the per-process
+ * counter between bench runs without restarting the worker. Production
+ * has no need for this; the loop-entry path resets implicitly. */
+static VALUE rb_pc_reset_c_loop_requests_total_bang(VALUE self) {
+    (void)self;
+    hyp_cl_reset_requests_served();
+    return INT2NUM(0);
+}
+
+/* PageCache.bump_c_loop_requests_total_for_test!(n) -> Integer
+ *
+ * 2.12-E — spec-only counter primer. Lets the PrometheusExporter
+ * fold-in test assert the merge logic without needing a live C loop
+ * (which would tie the spec to listener bind + accept timing).
+ * NOT documented as public surface; the name's `_for_test!` suffix
+ * is the contract. */
+static VALUE rb_pc_bump_c_loop_requests_total_for_test_bang(VALUE self, VALUE rb_n) {
+    (void)self;
+    long n = NUM2LONG(rb_n);
+    if (n < 0) {
+        rb_raise(rb_eArgError, "n must be >= 0");
+    }
+    for (long i = 0; i < n; i++) {
+        hyp_cl_tick_request();
+    }
+    return ULL2NUM(hyp_cl_load_requests_served());
+}
+
 /* PageCache.handoff_to_ruby(client_fd, _partial_buffer, _partial_len) -> Integer
  *
  * Echo helper — exposed for spec parity with the bench-time API
@@ -1948,6 +2040,17 @@ void pc_internal_reset_stop(void) {
     hyp_cl_stop = 0;
 }
 
+/* 2.12-E — io_uring loop sibling tick / reset entry points. Forward to
+ * the file-local helpers so the atomic stays a single-source-of-truth
+ * for both loop variants. */
+void pc_internal_tick_request(void) {
+    hyp_cl_tick_request();
+}
+
+void pc_internal_reset_requests_served(void) {
+    hyp_cl_reset_requests_served();
+}
+
 /* Belt-and-suspenders: keep the io_uring sibling's view of the header
  * cap in sync with this file's. Compile-time check via array sizing
  * (we deliberately avoid C11 `_Static_assert` for portability with the
@@ -2012,6 +2115,18 @@ void Init_hyperion_page_cache(void) {
                                rb_pc_set_handoff_callback, 1);
     rb_define_singleton_method(rb_mHyperionHttpPageCache, "handoff_to_ruby",
                                rb_pc_handoff_to_ruby, 3);
+
+    /* 2.12-E — per-process served-request counter for the SO_REUSEPORT
+     * load-balancing audit. Read at /-/metrics scrape time and folded
+     * into `hyperion_requests_dispatch_total{worker_id=PID}` so
+     * operators see a single per-worker number across every dispatch
+     * shape (Rack via Connection, h2, the C loops). */
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "c_loop_requests_total",
+                               rb_pc_c_loop_requests_total, 0);
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "reset_c_loop_requests_total!",
+                               rb_pc_reset_c_loop_requests_total_bang, 0);
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "bump_c_loop_requests_total_for_test!",
+                               rb_pc_bump_c_loop_requests_total_for_test_bang, 1);
 
     /* Mark-protect the lifecycle / handoff callback slots so the GC
      * doesn't collect them while the C loop is running. */

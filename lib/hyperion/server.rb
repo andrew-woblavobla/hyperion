@@ -536,21 +536,34 @@ module Hyperion
       socket = ::Socket.for_fd(fd)
       socket.autoclose = true
       apply_timeout(socket)
-      if partial.present?
-        # Stash the partial bytes on a per-fd map so Connection can
-        # read them as if they were the next chunk the kernel produced.
-        # We attach the buffer as the Connection's `@inbuf` ivar
-        # (pre-loaded with the partial bytes) on the inline path; on
-        # the thread-pool path we stash here and the worker thread
-        # picks it up after `submit_connection` schedules the conn.
-        @c_loop_handoff_buffers ||= {}
-        @c_loop_handoff_buffers[socket.fileno] = partial.dup.b
-      end
+      # 2.12-E — `partial.present?` was a Rails-ism that crashed the
+      # handoff path with NoMethodError on plain Ruby. Hit by every
+      # request that lands on a static-only server (e.g. /-/metrics
+      # against `bench/hello_static.ru`) — the C loop hands off, the
+      # handoff dispatch raised, and the connection was force-closed
+      # with `:c_loop_handoff_failed`. Surfaced by the 2.12-E audit
+      # harness which scrapes /-/metrics on a handle_static-only
+      # cluster; pre-existing bug, fixed here so the metric is
+      # actually readable. The `is_a?(String)` guard is deliberate —
+      # it both narrows the contract (the C loop never hands off
+      # anything but a plain String or nil) and pins the shape so
+      # `rubocop-rails`'s Style/Present autocorrect can't rewrite
+      # this back to `partial.present?`.
+      carry = partial.is_a?(String) && !partial.empty? ? partial.dup.b : nil
 
       if @thread_pool
         mode = DispatchMode.new(:threadpool_h1)
+        # 2.12-E — thread the carry through to the worker so the
+        # `Connection#@inbuf` is preloaded with the partial header
+        # bytes the C accept loop already drained off the fd. Pre-2.12-E
+        # the threadpool handoff path silently dropped the buffer
+        # (only the inline-no-pool branch wired it), so every
+        # `-t N>0` server with the C accept loop engaged returned
+        # "Request Timeout" on every handed-off request — including
+        # the audit harness's own `/-/metrics` scrape.
         if @thread_pool.submit_connection(socket, @app,
-                                          max_request_read_seconds: @max_request_read_seconds)
+                                          max_request_read_seconds: @max_request_read_seconds,
+                                          carry: carry)
           record_dispatch(mode)
         else
           reject_connection(socket)
@@ -561,9 +574,7 @@ module Hyperion
         connection = Connection.new(runtime: @explicit_runtime ? @runtime : nil,
                                     max_in_flight_per_conn: @max_in_flight_per_conn,
                                     route_table: @route_table)
-        if @c_loop_handoff_buffers && (carry = @c_loop_handoff_buffers.delete(socket.fileno))
-          connection.instance_variable_set(:@inbuf, +carry.b)
-        end
+        connection.instance_variable_set(:@inbuf, +carry.b) if carry
         connection.serve(socket, @app,
                          max_request_read_seconds: @max_request_read_seconds)
       end

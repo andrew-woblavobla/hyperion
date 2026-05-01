@@ -450,3 +450,53 @@ without re-booting the harness.
   (PG-bound, intentional 50 ms wait per request); the next worst
   is 4.63 ms (1 MiB static). Puma's worst is 85.78 ms; Falcon's
   worst is 553.43 ms; Agoo's worst is 720.19 ms.
+
+## Cluster distribution audit (2.12-E)
+
+**Question.** Hyperion's Linux cluster mode (`-w N`) uses
+`SO_REUSEPORT`: each worker calls `bind()` on the same port, and the
+kernel hashes incoming 4-tuples to one connected worker. Documented
+since rc15 as production-recommended; **not measured** until 2.12-E.
+Open question: *does the kernel hash actually distribute uniformly
+under sustained load against a 4-worker Hyperion cluster?*
+
+**Method.** `bench/cluster_distribution.sh`. Boots
+`bin/hyperion -w 4 -t 1 -p 9292 bench/hello_static.ru` (4 workers,
+the imbalance signal sharpest at the smallest reasonable cluster
+size). 30s of `wrk -t8 -c200 -d30s http://127.0.0.1:9292/` per run,
+three runs. After each run, scrapes `/-/metrics` until all 4 worker
+PIDs respond, parses the
+`hyperion_requests_dispatch_total{worker_id="<pid>"}` series, and
+computes per-worker share + max/min ratio. Verdict thresholds:
+
+  - `balanced`  max/min ≤ 1.10
+  - `mild`      1.10 < max/min ≤ 1.50
+  - `severe`    max/min > 1.50
+
+**Wire-up.** The metric ticks once per dispatched request from every
+shape — Rack via `Connection#serve`, h2 streams, the 2.12-C `accept4`
+C accept loop, the 2.12-D io_uring loop. The C-loop variants tick a
+process-global `__atomic_add_fetch` (RELAXED), folded into the
+labeled family at scrape time by `PrometheusExporter.render_full`.
+So the audit metric is true regardless of which dispatch path was
+hot during the bench run.
+
+**Bench result.** Headline numbers + per-PID breakdown land in the
+`[bench][2.12.0] 2.12-E — bench result: …` commit. The script's
+output is captured at `/tmp/2.12-E-cluster-distribution.log` on the
+bench host so future audits can diff against the baseline. Read
+that commit for run-1 / run-2 / run-3 distribution tables and the
+aggregate verdict.
+
+**Darwin path.** Not benched here — the Darwin worker model is
+master-bind + worker-fd-share, NOT SO_REUSEPORT. Workers race to
+`accept(2)` on the inherited fd; Darwin's kernel does not load-balance
+between them, so the result is dominated by whichever child wakes up
+first. We've documented Darwin as known-imbalanced since rc15 (see
+`Master.detect_worker_model`); the per-worker request counter still
+ticks correctly there, so a Darwin operator running production who
+wants to see their own imbalance can read
+`hyperion_requests_dispatch_total{worker_id="<pid>"}` from
+`/-/metrics` exactly the same way. The metric is platform-independent;
+the bench harness is Linux-specific because the question being asked
+(SO_REUSEPORT distributor uniformity) is.

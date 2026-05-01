@@ -74,8 +74,21 @@ module Hyperion
       hyperion_threadpool_queue_depth: {
         help: 'In-flight count in the worker ThreadPool inbox (snapshot at scrape time)',
         type: 'gauge'
+      },
+      # 2.12-E — per-worker request counter for the SO_REUSEPORT
+      # load-balancing audit. One series per worker (label_value =
+      # `Process.pid.to_s`); ticks on every dispatched request from
+      # every dispatch shape. Operators scrape /-/metrics N times in
+      # cluster mode to gather distribution across workers.
+      hyperion_requests_dispatch_total: {
+        help: 'Requests dispatched per worker (PID-labeled), across all dispatch modes',
+        type: 'counter'
       }
     }.freeze
+
+    # 2.12-E — name of the per-worker request counter family. Hoisted to
+    # a constant so the C-loop fold-in below stays declarative.
+    REQUESTS_DISPATCH_TOTAL = :hyperion_requests_dispatch_total
 
     def render(stats)
       buf = +''
@@ -129,8 +142,77 @@ module Hyperion
       buf << render(metrics_sink.snapshot)
       buf << render_histograms(metrics_sink.histogram_snapshot)
       buf << render_gauges(metrics_sink.gauge_snapshot)
-      buf << render_labeled_counters(metrics_sink.labeled_counter_snapshot)
+      labeled = metrics_sink.labeled_counter_snapshot
+      # 2.12-E — fold in the C-loop counter ONLY for the process-wide
+      # default Metrics sink (the one the C accept loop's served
+      # requests are conceptually attributed to). Arbitrary spec-only
+      # `Metrics.new` fixtures aren't connected to the C loop, so
+      # surfacing a process-global atomic on them would let a counter
+      # bumped by a previous test leak into a "fresh-sink, empty-body"
+      # assertion. Production paths (AdminMiddleware,
+      # AdminListener) read `Hyperion.metrics` which IS the default
+      # sink, so the fold-in still fires there.
+      labeled = merge_c_loop_into_dispatch_snapshot(labeled) if owns_c_loop_counter?(metrics_sink)
+      buf << render_labeled_counters(labeled)
       buf
+    end
+
+    def owns_c_loop_counter?(metrics_sink)
+      return false unless defined?(::Hyperion::Runtime)
+
+      metrics_sink.equal?(::Hyperion::Runtime.default.metrics)
+    rescue StandardError
+      false
+    end
+
+    # 2.12-E — merge `Hyperion::Http::PageCache.c_loop_requests_total`
+    # (process-global atomic ticked by the C accept4 + io_uring loops)
+    # into the `hyperion_requests_dispatch_total{worker_id=PID}` series
+    # for the current worker. Without this fold-in, a `-w 4` cluster
+    # serving from the C accept loop would scrape zeros from every
+    # worker even though the loop's atomic counter is ticking — the
+    # loop bypasses `Connection#serve`, so no Ruby-side
+    # `tick_worker_request` call ever lands.
+    #
+    # Idempotent on snapshots that already contain a series for the
+    # current PID (the Connection-served + h2 requests from this same
+    # worker are added to the C-loop count). Pure on the input — we
+    # build a deep-enough copy of the snapshot so the live Hash
+    # behind `Metrics#labeled_counter_snapshot` isn't mutated.
+    #
+    # Defensive: when the C ext isn't loaded (JRuby / TruffleRuby) we
+    # silently skip — the snapshot stays Ruby-only.
+    def merge_c_loop_into_dispatch_snapshot(snap)
+      c_loop_count = c_loop_requests_total
+      return snap if c_loop_count <= 0
+
+      pid_label = Process.pid.to_s
+      family = snap[REQUESTS_DISPATCH_TOTAL] || {
+        meta: { label_keys: %w[worker_id].freeze },
+        series: {}
+      }
+      merged_series = family[:series].dup
+      key = [pid_label].freeze
+      existing_key = merged_series.keys.find { |k| k.first == pid_label } || key
+      merged_series[existing_key] = (merged_series[existing_key] || 0) + c_loop_count
+
+      merged = snap.dup
+      merged[REQUESTS_DISPATCH_TOTAL] = {
+        meta: family[:meta] || { label_keys: %w[worker_id].freeze },
+        series: merged_series
+      }
+      merged
+    end
+
+    def c_loop_requests_total
+      return 0 unless defined?(::Hyperion::Http::PageCache)
+      return 0 unless ::Hyperion::Http::PageCache.respond_to?(:c_loop_requests_total)
+
+      ::Hyperion::Http::PageCache.c_loop_requests_total.to_i
+    rescue StandardError
+      # The scrape path must never raise — observability code degrades
+      # to "no fold-in" rather than failing the metrics endpoint.
+      0
     end
 
     def render_histograms(snap)

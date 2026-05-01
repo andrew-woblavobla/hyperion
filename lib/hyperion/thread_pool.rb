@@ -85,10 +85,20 @@ module Hyperion
     # not strict. Off-by-one over the configured cap during a thundering
     # accept burst is acceptable; the cost of stricter sync would be a
     # mutex on every enqueue, which we won't pay on the hot path.
-    def submit_connection(socket, app, max_request_read_seconds: 60)
+    def submit_connection(socket, app, max_request_read_seconds: 60, carry: nil)
       return false if @max_pending && @inbox.size >= @max_pending
 
-      @inbox << [:connection, socket, app, max_request_read_seconds]
+      # 2.12-E — `carry:` carries any partial header bytes the C accept
+      # loop already read off the fd before deciding to hand the
+      # connection off to Ruby. The worker thread pre-loads them into
+      # `Connection#@inbuf` so the parser sees the full request, not a
+      # short read that times out. Pre-2.12-E the threadpool handoff
+      # path silently dropped the partial buffer (the inline-no-pool
+      # path was the only one wired) — a server with `-t N>0` and the
+      # C accept loop engaged returned "Request Timeout" on every
+      # handed-off request, including the audit harness's own
+      # `/-/metrics` scrape.
+      @inbox << [:connection, socket, app, max_request_read_seconds, carry]
       true
     end
 
@@ -139,17 +149,23 @@ module Hyperion
 
           case job[0]
           when :connection
-            _, socket, app, max_request_read_seconds = job
+            _, socket, app, max_request_read_seconds, carry = job
             # Worker thread owns the connection for its full lifetime. Pass
             # thread_pool: nil so Connection#call_app inlines Adapter::Rack.call
             # — the worker IS the pool, no further hop required. 2.3-B
             # threads `max_in_flight_per_conn` so the per-conn fairness
             # cap (if configured) takes effect on this worker's serve loop.
             begin
-              Hyperion::Connection
-                .new(max_in_flight_per_conn: @max_in_flight_per_conn,
-                     route_table: @route_table)
-                .serve(socket, app, max_request_read_seconds: max_request_read_seconds)
+              connection = Hyperion::Connection
+                           .new(max_in_flight_per_conn: @max_in_flight_per_conn,
+                                route_table: @route_table)
+              # 2.12-E — preload `@inbuf` with the partial buffer the C
+              # accept loop already drained off the fd, mirroring the
+              # inline-no-pool branch in `Server#dispatch_handed_off`.
+              # `carry` is nil on the regular accept path; only the C
+              # loop's handoff path supplies it.
+              connection.instance_variable_set(:@inbuf, +carry.b) if carry.is_a?(String) && !carry.empty?
+              connection.serve(socket, app, max_request_read_seconds: max_request_read_seconds)
             rescue StandardError => e
               Hyperion.logger.error do
                 {

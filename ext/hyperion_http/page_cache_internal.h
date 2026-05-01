@@ -106,6 +106,19 @@ int pc_internal_stop_requested(void);
  * loop resets inline; the io_uring sibling needs the same surface. */
 void pc_internal_reset_stop(void);
 
+/* 2.12-E — bump the per-process served-request counter (atomic; safe
+ * to call from any thread / fiber / accept-loop context). Both the
+ * 2.12-C accept4 loop and the 2.12-D io_uring loop call this after
+ * a successful response write so the SO_REUSEPORT distribution audit
+ * (`PageCache.c_loop_requests_total`) sees ticks regardless of which
+ * loop variant is active. */
+void pc_internal_tick_request(void);
+
+/* 2.12-E — reset the per-process served-request counter. Mirrors the
+ * stop-flag reset rationale: loop entry points call this so a prior
+ * invocation's count doesn't bleed into the new loop's snapshot. */
+void pc_internal_reset_requests_served(void);
+
 /* The 64 KiB header-cap shared with `page_cache.c`. Re-declared here
  * so io_uring_loop.c doesn't need to mirror the magic number. */
 #ifndef PC_INTERNAL_MAX_HEADER_BYTES

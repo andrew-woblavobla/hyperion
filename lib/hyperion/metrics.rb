@@ -113,6 +113,39 @@ module Hyperion
       increment(:"responses_#{code}")
     end
 
+    # 2.12-E — labeled counter family that observes which worker
+    # process a given request landed on. Ticks once per dispatched
+    # request from every dispatch shape (Connection#serve, h2 streams,
+    # the C accept4 + io_uring loops; see PrometheusExporter for the
+    # C-loop fold-in at scrape time).
+    #
+    # `worker_id` is conventionally `Process.pid.to_s` — matches the
+    # 2.4-C `hyperion_io_uring_workers_active` and
+    # `hyperion_per_conn_rejections_total` labeling convention; lets
+    # operators correlate distribution rows with `ps`/`/proc` data
+    # without a separate worker_id <-> pid mapping table.
+    #
+    # Hot-path cost: one `@hg_mutex` acquisition per tick. That's
+    # acceptable for the audit metric: contention shows up only on
+    # the `tick + render` overlap, never inside the C accept loop
+    # (which uses its own atomic counter folded in at scrape time).
+    # Worth the simplicity over an extra lock-free per-thread cache.
+    REQUESTS_DISPATCH_TOTAL = :hyperion_requests_dispatch_total
+    WORKER_ID_LABEL_KEYS = %w[worker_id].freeze
+
+    def tick_worker_request(worker_id)
+      label = worker_id.nil? || worker_id.to_s.empty? ? '0' : worker_id.to_s
+      ensure_worker_request_family_registered!
+      increment_labeled_counter(REQUESTS_DISPATCH_TOTAL, [label])
+    end
+
+    private def ensure_worker_request_family_registered!
+      return if @worker_request_family_registered
+
+      register_labeled_counter(REQUESTS_DISPATCH_TOTAL, label_keys: WORKER_ID_LABEL_KEYS)
+      @worker_request_family_registered = true
+    end
+
     def snapshot
       result = Hash.new(0)
       counters_snapshot = @counters_mutex.synchronize { @thread_counters.dup }

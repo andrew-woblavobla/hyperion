@@ -135,6 +135,12 @@ module Hyperion
       # keep the existing pattern of caching boot-time refs as ivars so
       # the per-request observe stays a single Hash lookup.
       @path_templater = path_templater || Hyperion::Metrics.default_path_templater
+      # 2.12-E — per-worker request counter label. Cached once per
+      # Connection (Process.pid is process-constant — re-reading it per
+      # request would allocate the to_s String every time the operator
+      # asked Ruby for the symbol/label). Each Connection lives in
+      # exactly one process, so the cache is tight and never stale.
+      @worker_id = Process.pid.to_s
       # 2.10-D — direct-dispatch route table.  The hot-path lookup
       # is `@route_table&.lookup(method, path)` so the nil-default
       # case (no operator-registered direct routes — the
@@ -307,6 +313,14 @@ module Hyperion
         @metrics.increment(:bytes_read, body_end)
         @metrics.increment(:requests_total)
         @metrics.increment(:requests_in_flight)
+        # 2.12-E — per-worker request counter for the SO_REUSEPORT
+        # load-balancing audit. Worker_id is the OS pid (matches the
+        # 2.4-C `hyperion_io_uring_workers_active` convention). Single
+        # location for every Ruby-side dispatch shape: regular Rack
+        # via `dispatch_request`, direct dispatch via `dispatch_direct!`,
+        # and the StaticEntry fast path via `dispatch_direct_static!`
+        # all flow through this point in `serve`.
+        @metrics.tick_worker_request(@worker_id)
         # 2.4-C: capture start time for the per-route duration histogram.
         # Same Process.clock_gettime that the access-log path was already
         # paying — at default-ON log_requests the second call here is
