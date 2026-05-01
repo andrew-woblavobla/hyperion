@@ -2,6 +2,46 @@
 
 ## [Unreleased] - 2.9.0
 
+### 2.9-E — Fix recurring SSH "Permission denied (publickey)" subagent gap
+
+Fixes the recurring "Permission denied (publickey)" gap that has
+blocked subagent bench runs against `openclaw-vm` since at least
+Phase 9 (2.2.x) — every bench-running subagent from Phase 9/10/11,
+2.2.x fix-A..E, 2.3-A..D, 2.5-B/D, 2.6-A..D, 2.7-A/C/D/F, 2.8-A and
+2.9-B has reported "SSH not available, deferred to maintainer".
+
+**Root cause.** The maintainer's `~/.ssh/config` had `Host openclaw-vm`
++ `IdentityFile ~/.ssh/id_ed25519_woblavobla` but no `IdentitiesOnly yes`
+and no explicit `User ubuntu`. Interactive shells worked because
+macOS Keychain loaded the key into `ssh-agent`, but subagent shells
+inherited an empty `SSH_AUTH_SOCK` (or one populated with other
+host keys), so OpenSSH offered the wrong identities and the bench
+host rejected them before falling through to the on-disk file.
+
+**Fix.** Add `IdentitiesOnly yes` + `User ubuntu` + `HostName
+192.168.31.14` to the workstation's `~/.ssh/config` block. With
+`IdentitiesOnly yes`, OpenSSH ignores the agent entirely for that
+host and uses only the listed `IdentityFile`, making the config
+robust to any process-environment state (no agent, empty agent,
+agent-with-other-keys).
+
+**Verification.** Hermetic-shell SSH works with the new config:
+
+```sh
+env -i HOME=$HOME PATH=$PATH ssh -o ConnectTimeout=5 ubuntu@openclaw-vm date
+# → Fri May  1 08:36:47 UTC 2026
+```
+
+This is the same execution context every subagent inherits, so
+future bench tasks no longer hit the "deferred to maintainer" wall.
+
+**No code changes.** 2.9-E is operator-setup + docs only:
+new `docs/BENCH_HOST_SETUP.md` documents the gap, the fix, and the
+verification command for any future maintainer who hits the same
+`Permission denied (publickey)` wall. The actual `~/.ssh/config`
+edit happens on the controller workstation; the in-repo doc is the
+durable record.
+
 ### 2.9-D — Matched-config PG bench (honest ratio quantified)
 
 The 2.0.0 BENCH row 7's "PG +378% / 4.78×" was apples-to-oranges
