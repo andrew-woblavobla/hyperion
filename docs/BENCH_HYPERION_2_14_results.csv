@@ -1,0 +1,11 @@
+row,label,tool,rackup,rps_med,p99_med,trials
+1,hyperion_handle_static_iouring,wrk,bench/hello_static.ru,122777.99,1.11ms,122777.99|108380.20|134572.90
+2,hyperion_handle_static_accept4,wrk,bench/hello_static.ru,16725.10,90.00us,15970.30|16725.10|16816.71
+3,hyperion_handle_block,wrk,bench/hello_handle_block.ru,8955.56,190.00us,9286.68|8955.56|8843.95
+4,hyperion_rack_hello,wrk,bench/hello.ru,4231.01,2.33ms,4418.87|4231.01|4189.98
+5,hyperion_cpu_json,wrk,bench/work.ru,5455.50,327.00us,5641.26|5390.89|5455.50
+7,ref_agoo,wrk,bench/hello.ru,18325.62,10.54ms,19515.57|17358.03|18325.62
+8,ref_falcon,wrk,bench/hello.ru,6393.73,408.83ms,6216.93|6393.73|6475.03
+9,ref_puma,wrk,bench/hello.ru,6239.56,408.77ms,6239.56|6253.07|6169.07
+6,hyperion_grpc_unary,ghz,bench/grpc_stream.ru,1731.52,29.87ms,1731.5|1717.5|1790.8
+6b,hyperion_grpc_streaming,ghz,bench/grpc_stream.ru,133.73,5615.32ms,133.7|134.7|131.9
