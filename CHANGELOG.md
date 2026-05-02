@@ -2,7 +2,36 @@
 
 ## [Unreleased] - 2.14.0
 
-### 2.14-D — gRPC streaming ghz numbers (closes 2.13-D)
+### 2.14-E — Complete README rework
+
+**Why.** Eight rounds of "What's new in N.X.0" subsections had stacked at
+the top of `README.md` going back to 2.4.0; the actual headline (what
+Hyperion IS, what it DOES, why a 30-second reader should care) was buried
+under ~400 lines of release notes plus 100+ lines of bench caveats. The
+benches section interleaved drift notes, "the comparison is fair if..."
+paragraphs, and stale numbers from `BENCH_HYPERION_2_0.md`.
+
+**What 2.14-E ships.** A from-scratch rewrite. New shape: title +
+30-second pitch leading with the **134,084 r/s** headline → quick start
+→ a single 6-row headline-bench table (no inline caveats) → scannable
+feature subsections (HTTP/1.1+h2, WebSockets, gRPC, `Server.handle`,
+cluster, async I/O, observability, io_uring) → configuration table →
+operator guidance distilled to four short tables → release-history
+one-liner pointing at `CHANGELOG.md` → links + credits + license.
+Length 949 → 445 lines (−53%); H2 sections 14+ → 13. All historical
+"What's new" content collapsed into the release-history paragraph;
+no information lost — just relocated to its source-of-truth in
+`CHANGELOG.md` and `docs/BENCH_*`.
+
+**Structural choices** documented for the controller's review:
+the 6-row bench table sits before the features list (so the headline
+number lands inside the first screen of scrolling); operator guidance
+moved AFTER configuration (operators reach for the flag table first);
+the gRPC subsection kept its three example blocks compressed into
+"unary + one paragraph on streaming" since the streaming examples are
+already in `bench/grpc_stream.ru`.
+
+
 
 **Background.** 2.13-D shipped the streaming RPC support in
 `Hyperion::Http2Handler` (server-streaming = one DATA frame per yielded
