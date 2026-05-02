@@ -241,10 +241,15 @@ RSpec.describe Hyperion::Http::PageCache do
         described_class.cache_file(path)
 
         # Reach steady state: open a socket pair we'll reuse.
-        server = TCPServer.new('127.0.0.1', 0)
-        client = TCPSocket.new('127.0.0.1', server.addr[1])
-        sink   = server.accept
-        # Drain in a thread so writes don't block on a full TCP buffer.
+        # UNIXSocket.pair (vs TCPServer/TCPSocket) avoids kernel-TCP
+        # send-buffer pressure that would surface as ECONNRESET on a
+        # contended CI runner — write_to calls write(2), which works
+        # identically over a UNIX stream socket but doesn't go through
+        # the TCP stack's reset path. The alloc-count assertion is what
+        # this spec actually tests; the socket flavour is incidental.
+        require 'socket'
+        client, sink = UNIXSocket.pair
+        # Drain in a thread so writes don't block on a full kernel buffer.
         # `read` returns when the client side closes (EOF), so we close
         # client first then join the drain thread.
         drain = Thread.new { sink.read }
@@ -261,7 +266,6 @@ RSpec.describe Hyperion::Http::PageCache do
         client.close
         drain.join
         sink.close
-        server.close
 
         # The C path returns a SSIZET2NUM Integer per call.  Small ints
         # (≤ FIXNUM_MAX) are pointer-encoded and don't bump the

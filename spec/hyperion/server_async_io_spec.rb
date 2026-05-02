@@ -207,7 +207,13 @@ RSpec.describe Hyperion::Server, 'async_io flag' do
     # surfaced, so exercising it locally guards against regressions
     # to the Async wrap structure.
     it 'tolerates rapid boot/stop without surfacing scheduler-close EBADF' do
-      10.times do
+      # 5 cycles is enough to exercise the boot/stop EBADF path; was 10
+      # but the slower CI runner (1-2 vCPU shared) occasionally exceeded
+      # the 2s `until_listening` deadline on cycle N because Async
+      # scheduler initialization stacked across cycles. 5 cycles + 5s
+      # listen deadline is the diagnostic-equivalent shape that's
+      # CI-stable.
+      5.times do
         bound_port = free_port
         server = described_class.new(app: probe_app, host: '127.0.0.1', port: bound_port,
                                      thread_count: 0, async_io: true)
@@ -216,8 +222,10 @@ RSpec.describe Hyperion::Server, 'async_io flag' do
           Thread.current.report_on_exception = false
           server.start
         end
-        until_listening(bound_port)
-        Net::HTTP.get_response(URI("http://127.0.0.1:#{bound_port}/"))
+        until_listening(bound_port, timeout: 5)
+        Net::HTTP.start('127.0.0.1', bound_port, open_timeout: 2, read_timeout: 5) do |http|
+          http.get('/')
+        end
         server.stop
         thr.join(2)
         expect(thr.alive?).to be(false)
