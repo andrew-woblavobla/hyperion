@@ -6,10 +6,17 @@
 # response head, cached date, frozen header keys) which a `SELECT 1` workload
 # hides behind network round-trip noise.
 #
+# 2.14-A — registered via the block form of `Server.handle` so the
+# C accept loop dispatches: accept + recv + parse + write release the
+# GVL, only the JSON-generate work itself holds it. The Rack `run`
+# lambda below stays as the fallback for any path NOT registered
+# (smoke harnesses hitting alternate URLs).
+#
 # To run:
 #   bundle exec bin/hyperion -w 4 -t 5 -p 9292 bench/work.ru
 #   wrk -t4 -c200 -d15s -H 'Cookie: a=1; b=2; c=3; d=4; e=5; f=6' \
-#     http://127.0.0.1:9292/api/items
+#     http://127.0.0.1:9292/
+require 'hyperion'
 require 'json'
 
 PAYLOAD = (1..50).each_with_object({}) do |i, h|
@@ -25,7 +32,7 @@ end.freeze
 
 PAYLOAD_JSON_BYTES = JSON.generate(PAYLOAD).bytesize
 
-run lambda { |env|
+WORK_HANDLER = lambda do |env|
   # Force the Rack adapter to actually look at headers (cookies / accept) so
   # any header-handling cost shows up.
   cookie_count = env['HTTP_COOKIE'].to_s.count(';') + 1
@@ -50,4 +57,8 @@ run lambda { |env|
     },
     [body]
   ]
-}
+end
+
+Hyperion::Server.handle(:GET, '/', &WORK_HANDLER)
+
+run WORK_HANDLER
