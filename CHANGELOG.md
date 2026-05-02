@@ -1,5 +1,76 @@
 # Changelog
 
+## [Unreleased] - 2.15.0
+
+### 2.15-A — Fresh bench, README split, CI flake fix
+
+**Why.** Three coordinated changes for one consolidated milestone.
+First, the README's headline numbers were a stitched collection
+across sprints 2.10–2.14 — the 134k claim from 2.12-D, the 4-hour
+soak from 2.14-C, the gRPC numbers from 2.14-D — captured on
+different days under different host conditions. Operators wanted
+one coherent snapshot they could trust. Second, the README sat at
+445 lines after the 2.14-E rework; with feature-deep-dive material
+inline it was still longer than a 30-second reader will tolerate.
+Third, GitHub Actions flaked on the `2.14-E` commit (1700426) with
+`Errno::EBADF: select_internal_with_gvl:epoll_wait` raised from
+inside `Async::Scheduler#close` on Ruby 3.4 + async 2.39 — the
+existing `child.wait rescue StandardError` only protected the
+inner block.
+
+**What 2.15-A ships.**
+
+1. **CI flake fix.** `lib/hyperion/server.rb#start_async_loop`
+   gains an outer `rescue Errno::EBADF, IOError` around the entire
+   `Async do ... end` block. Two regression specs added — one
+   deterministic (stubs `run_accept_fiber` to raise EBADF
+   synchronously), one integration-shape (10-cycle rapid boot/stop
+   on `thread_count: 0 + async_io: true`). 10/10 clean local runs.
+
+2. **Fresh bench.** Single coherent run on the bench host on a
+   single day captures all 9 headline rows. New driver script
+   `bench/run_all.sh` boots one server per row, runs `wrk` (or
+   `ghz` for gRPC), kills it, moves on — designed to be
+   re-runnable: any future maintainer can `./bench/run_all.sh` and
+   reproduce the published numbers within bench-host drift.
+   Numbers preserved in `docs/BENCH_HYPERION_2_14.md` (table +
+   reproduction commands) and `docs/BENCH_HYPERION_2_14_results.csv`
+   (raw CSV for archaeology).
+
+3. **README split.** `README.md` shrunk 445 → 163 lines. Feature
+   deep-dives moved to `docs/HTTP2_AND_TLS.md`,
+   `docs/HANDLE_STATIC_AND_HANDLE_BLOCK.md`,
+   `docs/CLUSTER_AND_SO_REUSEPORT.md`, `docs/ASYNC_IO.md`,
+   `docs/CONFIGURATION.md`, `docs/OPERATOR_GUIDANCE.md`,
+   `docs/LOGGING.md`, `docs/GRPC.md` (`docs/WEBSOCKETS.md` and
+   `docs/OBSERVABILITY.md` already existed). README structure now:
+   title + tagline → 30-second pitch → quick start → headline
+   bench table (one tight row per workload, fresh numbers) →
+   features (8 bullets, each linking into `docs/<feature>.md`) →
+   compatibility → documentation index → reproducing benchmarks →
+   release history → contributing → credits + license.
+
+**Headline bench numbers (median of 3 trials, captured 2026-05-02).**
+
+| # | Workload | r/s | p99 |
+|--:|---|---:|---:|
+| 1 | Hyperion `handle_static` + io_uring | **122,778** (peak 134,573) | 1.11 ms |
+| 2 | Hyperion `handle_static` + accept4 | 16,725 | 90 µs |
+| 3 | Hyperion `Server.handle` block | 8,956 | 190 µs |
+| 4 | Hyperion generic Rack hello | 4,231 | 2.33 ms |
+| 5 | Hyperion CPU JSON block | 5,456 | 327 µs |
+| 6 | Hyperion gRPC unary (h2/TLS) | 1,732 | 29.87 ms |
+| 7 | Reference Agoo hello | 18,326 | 10.54 ms |
+| 8 | Reference Falcon hello | 6,394 | 408.83 ms |
+| 9 | Reference Puma hello | 6,240 | 408.77 ms |
+
+The peak trial on row 1 (134,573 r/s) is consistent with the
+2.14-D 134,084 headline; median 122,778 is the conservative honest
+number, both cited in README.
+
+**Spec count.** 1145 → 1147 / 0 / 16 (+2 regression specs from
+the flake fix). All on macOS arm64 + Ruby 3.3.3.
+
 ## 2.14.0 — 2026-05-02
 
 ### 2.14-E — Complete README rework
