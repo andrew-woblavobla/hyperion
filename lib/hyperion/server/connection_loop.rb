@@ -34,6 +34,92 @@ module Hyperion
     module ConnectionLoop
       module_function
 
+      # 2.14-B — bound applied to the wake-connect dial inside
+      # `Server#stop`. The listener is local — a successful connect
+      # is sub-millisecond — so the cap exists purely as a sanity
+      # bound for the pathological case where the listener was
+      # already torn down (Errno::ECONNREFUSED is fast) or the
+      # kernel netstack is somehow stuck (e.g. CI under heavy load).
+      WAKE_CONNECT_TIMEOUT_SECONDS = 1.0
+
+      # 2.14-B — number of wake-connect dials issued per `Server#stop`.
+      # In single-server / `:share` cluster mode (Darwin/BSD), one dial
+      # is enough — the listener is shared and any wake races to a
+      # parked accept call. In `:reuseport` cluster mode (Linux), the
+      # kernel hashes incoming SYNs across each worker's per-process
+      # listener fd; one dial may hash to a sibling whose stop hasn't
+      # progressed, leaving THIS worker's accept thread parked. K=8
+      # drops the miss probability to <1% for realistic worker counts
+      # (≤32 workers per host) and adds at most ~8ms to a stop call —
+      # well below the master-side `graceful_timeout` (30s default).
+      WAKE_CONNECT_BURST = 8
+
+      # 2.14-B — Wake any thread parked in `accept(2)` on the listener
+      # bound at `host:port` by dialing one (or `count`) throwaway TCP
+      # connections.
+      #
+      # Background. On Linux ≥ 6.x, calling `close()` on a listening
+      # socket from one thread does NOT interrupt another thread that
+      # is currently blocked in `accept(2)` on that same fd — the
+      # kernel silently dropped the close-wake guarantee that
+      # `Server#stop` (and 2.13-C's spec teardown) had relied on.
+      # Without this helper, the C accept loop stays parked until a
+      # real connection arrives, which during a SIGTERM-driven graceful
+      # shutdown means "until SIGKILL".
+      #
+      # The fix is structural: dial a throwaway TCP connection at the
+      # listener's bound address. The accept call returns with the new
+      # fd, the C loop services it (a 0-byte read drops it), then
+      # re-checks `hyp_cl_stop` between accepts and exits cleanly. The
+      # 2.13-C connection_loop_spec helper does the same thing in spec
+      # land — this is the production-side mirror.
+      #
+      # Burst semantics. With SO_REUSEPORT (Linux cluster mode), the
+      # kernel hashes each SYN to one of the N still-open per-worker
+      # listeners. A single dial from worker A may hash to worker B —
+      # leaving A's parked accept un-woken. Dialing K times (default
+      # `WAKE_CONNECT_BURST`) drives the miss probability down to
+      # negligible for typical worker counts.
+      #
+      # Failure-tolerant by construction:
+      # * `Errno::ECONNREFUSED` — listener already closed (the close
+      #   raced ahead of us). Nothing to wake; bail out of the burst
+      #   so we don't spend the timeout budget on doomed dials.
+      # * `Errno::EADDRNOTAVAIL` — interface gone. Same.
+      # * Connect timeout — kernel netstack is stuck; we tried, the
+      #   caller's `thread.join(timeout)` will surface the symptom.
+      # * Any other socket error — log nothing (we may be running
+      #   inside a signal handler thread); just swallow.
+      def wake_listener(host, port, connect_timeout: WAKE_CONNECT_TIMEOUT_SECONDS,
+                        count: 1)
+        return unless host && port
+        return if count <= 0
+
+        count.times do
+          break unless dial_wake_once(host, port, connect_timeout)
+        end
+        nil
+      end
+
+      # 2.14-B — single dial. Returns true on success (continue
+      # bursting), false on a "listener gone" outcome (abort the burst
+      # so we don't waste the timeout budget on N×ECONNREFUSED).
+      def dial_wake_once(host, port, connect_timeout)
+        ::Socket.tcp(host, port, connect_timeout: connect_timeout, &:close)
+        true
+      rescue Errno::ECONNREFUSED, Errno::EADDRNOTAVAIL, Errno::EHOSTUNREACH,
+             Errno::ENETUNREACH
+        # Listener gone — no point retrying, the kernel will refuse
+        # every dial in this burst the same way.
+        false
+      rescue Errno::ETIMEDOUT, Errno::ECONNRESET, Errno::EPIPE,
+             Errno::EBADF, IOError, SocketError
+        # Transient — keep bursting in case a later dial races into a
+        # still-open sibling listener (REUSEPORT cluster mode).
+        true
+      end
+      private_class_method :dial_wake_once
+
       # Whether the C accept loop is available and the env didn't
       # disable it.
       def available?

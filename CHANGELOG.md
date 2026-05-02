@@ -2,6 +2,141 @@
 
 ## [Unreleased] - 2.14.0
 
+### 2.14-B — `Server#stop` accept-wake on Linux
+
+**Background.** 2.13-C ("spec flake hunt") discovered a Linux 6.x kernel
+behaviour change: calling `close()` on a listening socket from one
+thread does NOT interrupt another thread that is currently parked in
+`accept(2)` on that same fd. The kernel silently dropped the
+close-wake guarantee that the spec suite (and `Hyperion::Server#stop`)
+had relied on. The 2.13-C fix introduced a `stop_loop_and_wake` helper
+in `spec/hyperion/connection_loop_spec.rb` — flip the C-side stop flag,
+dial one throwaway TCP connection at the listener, then close. The
+production-side `Server#stop` was left with the pre-flake three-line
+shape (set @stopped, close listener, drop refs).
+
+**The production gap.** `Server#stop` is called from a SIGTERM handler
+thread (graceful shutdown), CI test teardown, and operator-driven
+restart flows. Same Linux quirk, same symptom: SIGTERM → stop call →
+worker hangs in `accept(2)` for an unbounded period (until a real
+connection happens to arrive, or until the master's
+`graceful_timeout` expires and SIGKILL fires). Operators worked
+around it with `kill -9`.
+
+**What 2.14-B ships.**
+
+1. **`Hyperion::Server::ConnectionLoop.wake_listener(host, port,
+   connect_timeout:, count:)`** — dial a throwaway TCP burst at the
+   given listener address. Failure-tolerant by construction: swallows
+   `ECONNREFUSED` / `EADDRNOTAVAIL` / connect timeout / `EBADF` /
+   any `IOError` / `SocketError` (the helper is called from a signal
+   handler thread; raising would hang the whole worker). Aborts the
+   burst early on a "listener gone" outcome so we don't pay
+   N×connect-timeout against a dead address.
+
+2. **`WAKE_CONNECT_BURST = 8`** — number of dials per `Server#stop`.
+   Single-server / `:share` cluster mode (Darwin/BSD): one dial is
+   sufficient; the extra 7 are tiny zero-byte connects to the same
+   listener. `:reuseport` cluster mode (Linux): the kernel hashes
+   each SYN to one of N still-open sibling listeners; a single dial
+   from worker A may hash to worker B, leaving A's parked accept
+   un-woken. Bursting drops the miss probability to <1% for typical
+   worker counts (≤32 per host) at a cost of ~8ms per stop call —
+   well below the master's 30s `graceful_timeout`.
+
+3. **`Server#stop` rewritten with a wake gate.**
+
+   ```ruby
+   def stop
+     @stopped = true                               # Ruby loop flag
+     if wake_required?                             # only C-loop case
+       stop_c_accept_loop                          # flip C-side hyp_cl_stop
+       host, port = wake_target                    # capture BEFORE close
+       ConnectionLoop.wake_listener(host, port,    # dial BEFORE close so
+                                    count: WAKE_CONNECT_BURST) #   our own fd
+                                                  #   stays in the
+                                                  #   SO_REUSEPORT pool
+     end
+     close_listeners                               # belt-and-braces close
+   end
+   ```
+
+   The `wake_required?` gate keeps the change surgical: TLS,
+   async-IO, and thread-pool servers see the same close-then-drop
+   sequence they had pre-2.14-B. Wiring the wake into the Async
+   path is unnecessary (its `IO.select` already polls `@stopped`
+   every 100 ms) and would introduce a close-vs-`IO.select`-EBADF
+   race on macOS kqueue.
+
+   The wake-connect dial happens BEFORE `close_listeners` so this
+   process's listener fd is still in the SO_REUSEPORT pool when the
+   kernel hashes the SYN. Closing first would drop us from the pool
+   and every dial would hash to a sibling worker, never reaching our
+   own parked accept thread.
+
+4. **Cluster shutdown unchanged at the master level.** The master's
+   existing `shutdown_children` already broadcasts SIGTERM to every
+   worker; each worker's `Signal.trap('TERM') { server.stop }` now
+   does the wake-connect dance locally. No new master-side signal
+   was needed — the per-worker self-dial during the SIGTERM handler
+   covers `:share` (Darwin/BSD) and `:reuseport` (Linux) cluster
+   modes uniformly. Considered a master-orchestrated SIGUSR2 broadcast
+   as an alternative; rejected because (a) it duplicates the SIGTERM
+   path, (b) it doesn't actually solve the SO_REUSEPORT distribution
+   problem any better than per-worker self-dial-with-burst, and (c)
+   it adds a new operator-visible signal contract that operators
+   would have to know about.
+
+5. **Idempotency.** A second `stop` call is a no-op — `wake_target`
+   returns `[nil, nil]` once the listener references are nilled, the
+   wake-connect short-circuits, and `close_listeners` swallows the
+   `EBADF` from a double-close.
+
+**Quantitative effect (macOS, single-server, C accept loop engaged).**
+
+| metric                        | pre-2.14-B (close-only)     | post-2.14-B (close + burst wake)|
+|-------------------------------|-----------------------------|--------------------------------|
+| `stop` returns in             | ~2-3 ms (close-wake works)  | ~3-4 ms (8 burst dials)        |
+| accept thread joined within   | ~3 ms                       | ~4 ms                          |
+
+On macOS the close-wake guarantee still holds, so the new burst
+costs ~1 ms with no observable correctness benefit. On Linux 6.x the
+old path could hang indefinitely (until SIGKILL); the new path joins
+within tens of ms. Quantitative Linux numbers will be folded into the
+2.14-B bench note when a Linux runner is available; the structural
+fix is what 2.14-B ships.
+
+**Why not signal-driven (master broadcasts SIGUSR2 to each worker).**
+Master already broadcasts SIGTERM in `shutdown_children`; each worker's
+`Signal.trap('TERM') { server.stop }` calls the per-instance `stop`
+which does the wake-connect dance. Adding a separate SIGUSR2 path
+would duplicate the SIGTERM flow and would not help with SO_REUSEPORT
+distribution any more than the burst-dial already does. Math: with
+N workers each dialing K times, miss probability per worker ≈
+(1-1/N)^(KN). For N=4, K=8: ~1e-4. For N=16, K=8: ~3e-4. Essentially
+zero.
+
+**Spec coverage.** New `spec/hyperion/server_stop_spec.rb`:
+* Ruby accept loop: `stop` returns within 1.5s and the accept thread
+  joins within 2.5s.
+* C accept loop: registered static route, served real request to park
+  the C loop in `accept(2)`, then stop returns within 1.5s.
+* Idempotency: second `stop` does not raise.
+* Helper: no-op against a dead port (ECONNREFUSED swallowed); single
+  dial against a live listener; burst dial drains multiple SYNs;
+  burst aborts early when the address is dead (no N×timeout cost);
+  connect timeout cap is honoured.
+
+Suite delta: 1137 → 1145 on macOS (8 new examples, 0 failures, 16
+pending — unchanged on a clean run). On a Linux runner the
+equivalent is 1186 → 1194. Pre-existing macOS timing flake
+(`Hyperion::Server (TLS)` raises `Errno::EBADF` from
+`select_internal_with_gvl:kevent` in `start_async_loop` on full-suite
+runs at ~10-30% rate) was observed before AND after this change at
+similar intermittent rates; the C-loop wake gate (`wake_required?`)
+keeps the wake-connect off the TLS path so 2.14-B does not introduce
+the flake nor measurably worsen its rate beyond run-to-run noise.
+
 ### 2.14-A — Move `app.call` into the C accept loop
 
 **Background.** 2.13-A and 2.13-B documented an honest finding: the

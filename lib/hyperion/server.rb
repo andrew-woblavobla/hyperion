@@ -390,12 +390,149 @@ module Hyperion
       @admin_listener&.stop
     end
 
+    # 2.14-B — graceful stop sequence.
+    #
+    # Pre-2.14-B this was three lines: flip the Ruby `@stopped` flag,
+    # `close()` the listener, drop the references. That was enough
+    # for the Ruby/Async accept loops on every kernel — those poll
+    # `@stopped` every 100 ms via the `IO.select` timeout in
+    # `accept_or_nil` and exit at the next tick. It was NOT enough
+    # for the C accept loop introduced by 2.12-C: that loop calls a
+    # blocking `accept(2)` with the GVL released and only checks
+    # `hyp_cl_stop` between accepts. On Linux ≥ 6.x, calling
+    # `close()` on a listening socket from one thread does NOT
+    # interrupt another thread that is currently parked in
+    # `accept(2)` on that same fd — so the C loop stayed parked
+    # until a real connection arrived. SIGTERM-driven graceful
+    # shutdown then hung until the master's `graceful_timeout`
+    # (default 30 s) expired and SIGKILL fired. See CHANGELOG
+    # ### 2.13-C for the full discovery story.
+    #
+    # Fix surface: only the C accept loop needs the wake-connect
+    # dance. The wake gate (`wake_required?`) keeps the change
+    # surgical: TLS, async-IO, and thread-pool servers see the same
+    # close-then-drop sequence they had pre-2.14-B; only the C-loop
+    # server pays the burst cost. Wiring the wake into the Async
+    # path would be unnecessary (it polls @stopped) and would
+    # introduce a close-vs-`IO.select`-EBADF race on macOS kqueue.
+    #
+    # Order rationale (C-loop case).
+    # 1. The wake-connect dial happens BEFORE `close_listeners` so
+    #    THIS process's listener fd is still in the SO_REUSEPORT
+    #    pool when the kernel hashes the SYN. Closing first would
+    #    drop us from the pool — every dial would hash to a sibling
+    #    worker (in `:reuseport` cluster mode) and never reach our
+    #    own parked accept thread.
+    # 2. The burst (`WAKE_CONNECT_BURST` dials) drives the miss
+    #    probability down for the SO_REUSEPORT-distributes-unevenly
+    #    case. Single-server / `:share` cluster mode (Darwin/BSD)
+    #    just sees K extra zero-byte connects — cheap.
+    # 3. `close_listeners` runs last as a belt-and-braces close on
+    #    macOS / *BSD where the close-on-accept-wake guarantee still
+    #    holds, and to release the bound port to the OS promptly.
+    #
+    # Idempotent: a second `stop` call is a no-op — `wake_target`
+    # returns `[nil, nil]` once the listener references are nilled,
+    # and `close_listeners` swallows the EBADF.
     def stop
       @stopped = true
+      if wake_required?
+        # C-loop path: flip the C-side flag, dial the wake-connect
+        # burst, THEN close. The wake makes any thread parked in
+        # `accept(2)` return; the loop checks the flag, exits cleanly.
+        stop_c_accept_loop
+        host, port = wake_target
+        ConnectionLoop.wake_listener(host, port, count: ConnectionLoop::WAKE_CONNECT_BURST) \
+          if host && port
+      end
+      # Pre-2.14-B `close` path. For TLS / async-IO / thread-pool
+      # servers this is the entire stop sequence and matches the
+      # behaviour the spec suite (and operators) have been observing
+      # since 1.0 — the wake-connect dance is a no-op for them and
+      # has been deliberately gated out via `wake_required?`.
+      close_listeners
+      nil
+    end
+
+    private
+
+    # 2.14-B — predicate: is the wake-connect needed for THIS server
+    # instance? Only servers driving the C accept loop need it; the
+    # Ruby/Async paths poll `@stopped` and exit on the next 100 ms
+    # `IO.select` tick. We piggyback on the existing
+    # `engage_c_accept_loop?` predicate so the wake gate stays in
+    # sync with engagement: if the runtime ever changes the C-loop
+    # eligibility rules, both call sites update together.
+    #
+    # Async-IO path explicitly excluded: even if the route table
+    # would otherwise be C-loop-eligible, `start_async_loop` runs
+    # the Ruby accept fibers (the C loop never engages alongside
+    # Async). Adding wake-connect there would race close()-on-fd
+    # vs. an IO.select that's already parked on the listener — on
+    # macOS kqueue that surfaces as `Errno::EBADF` from
+    # `select_internal_with_gvl:kevent`, propagating up through
+    # `start_async_loop`'s rescue-wait.
+    def wake_required?
+      return false if @tls
+      return false if @async_io
+
+      engage_c_accept_loop?
+    end
+
+    # Capture the bound `(host, port)` of the listener BEFORE we close
+    # it. We deliberately read `@host` (the configured bind addr —
+    # `127.0.0.1` / `0.0.0.0` / a real interface IP) rather than
+    # `@server.addr` because:
+    #
+    # 1. Once `close()` lands the addr struct is gone — we'd dial
+    #    against a stale value.
+    # 2. The wake-connect target only needs to reach this kernel's
+    #    listener fd; localhost works for any bound address (the
+    #    kernel routes locally).
+    #
+    # Special case: bind addr `0.0.0.0` / `::` / empty — dial 127.0.0.1
+    # (loopback always reaches the worker's own listener). Same trick
+    # the spec helper uses.
+    def wake_target
+      return [nil, nil] unless @port && @port.positive?
+
+      host = @host
+      host = '127.0.0.1' if host.nil? || host.empty? || host == '0.0.0.0'
+      host = '::1' if host == '::'
+      [host, @port]
+    end
+
+    # Flip the C-side stop flag so the C accept loop (2.12-C / 2.12-D
+    # / 2.14-A variants) drops out at the next `accept(2)` return.
+    # Idempotent — flipping the flag twice is harmless. The C ext may
+    # be absent on JRuby / TruffleRuby; the `respond_to?` guard keeps
+    # those builds working.
+    def stop_c_accept_loop
+      pc = defined?(::Hyperion::Http::PageCache) ? ::Hyperion::Http::PageCache : nil
+      pc.stop_accept_loop if pc.respond_to?(:stop_accept_loop)
+    rescue StandardError
+      # Best-effort. Stop must never raise — it's called from a signal
+      # handler thread, where an unhandled exception would hang the
+      # whole worker.
+      nil
+    end
+
+    # Close + nil-out both listener references. The pre-2.14-B
+    # `close` is preserved as the primary signal for non-Linux
+    # platforms and as a belt-and-braces measure on Linux for the
+    # case where the wake-connect raced ahead of us.
+    def close_listeners
       @server&.close
+    rescue IOError, Errno::EBADF
+      # Listener already closed — `stop` was called twice or the
+      # C accept loop tore it down via its own error path.
+      nil
+    ensure
       @server = nil
       @tcp_server = nil
     end
+
+    public
 
     # 2.10-E — Walk every configured preload directory, populate
     # `Hyperion::Http::PageCache`, and mark every entry immutable when
