@@ -161,5 +161,56 @@ RSpec.describe Hyperion::Server, 'async_io flag' do
         runner_thread.join(2)
       end
     end
+
+    # 2.15-A — regression: `Async::Scheduler#close` previously surfaced
+    # `Errno::EBADF: select_internal_with_gvl:epoll_wait` past the
+    # inner `child.wait rescue StandardError` in `start_async_loop`.
+    # CI on Ruby 3.4 + async 2.39 hit it ~1-in-N on the existing
+    # `boots cleanly with thread_count: 0` example; the inner rescue
+    # only protected the child-wait, not the implicit scheduler close
+    # the `Async do ... end` block runs on exit.
+    #
+    # The deterministic test below stubs `run_accept_fiber` to raise
+    # `Errno::EBADF` synchronously, on the same code path the CI
+    # stack trace pointed at. With the 2.15-A outer rescue the call
+    # returns nil; pre-2.15-A the same input raised past the caller.
+    it 'swallows Errno::EBADF raised by the Async block on shutdown' do
+      server = described_class.new(app: probe_app, host: '127.0.0.1', port: port,
+                                   thread_count: 0, async_io: true)
+      allow(server).to receive(:run_accept_fiber) do
+        raise Errno::EBADF, 'select_internal_with_gvl:epoll_wait (test injection)'
+      end
+      # `start_async_loop` is private; verify the outer rescue exists
+      # by `send`-ing the method directly. The accept fiber raises
+      # EBADF immediately; without the outer rescue this would
+      # propagate (the inner rescue is only on `child.wait`, but the
+      # Async scheduler may also re-raise on close). With the
+      # 2.15-A rescue, `send` returns `nil` cleanly.
+      expect { server.send(:start_async_loop) }.not_to raise_error
+    end
+
+    # And the integration-shape variant: rapid boot/stop, asserts the
+    # worker thread exits without exception. Fast on macOS (~50 ms
+    # for 10 cycles); this is the shape CI was running when the flake
+    # surfaced, so exercising it locally guards against regressions
+    # to the Async wrap structure.
+    it 'tolerates rapid boot/stop without surfacing scheduler-close EBADF' do
+      10.times do
+        bound_port = free_port
+        server = described_class.new(app: probe_app, host: '127.0.0.1', port: bound_port,
+                                     thread_count: 0, async_io: true)
+        server.listen
+        thr = Thread.new do
+          Thread.current.report_on_exception = false
+          server.start
+        end
+        until_listening(bound_port)
+        Net::HTTP.get_response(URI("http://127.0.0.1:#{bound_port}/"))
+        server.stop
+        thr.join(2)
+        expect(thr.alive?).to be(false)
+        expect { thr.value }.not_to raise_error
+      end
+    end
   end
 end

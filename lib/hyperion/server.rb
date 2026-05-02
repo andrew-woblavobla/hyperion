@@ -821,6 +821,33 @@ module Hyperion
     # workers (Linux) the kernel hashes connections fairly across siblings;
     # on `:share` (Darwin) the knob is silently honoured but shows no
     # scaling benefit — operators already know Darwin is special.
+    # 2.15-A — outer rescue for `Errno::EBADF` / `IOError`.
+    #
+    # Background: prior to 2.15-A this was just the inner
+    # `task.children.each { child.wait rescue StandardError; nil }`
+    # pattern. That handles raises from the accept fiber bodies, but
+    # NOT from `Async::Scheduler#close`, which runs implicitly when the
+    # `Async do ... end` block exits and which itself parks in
+    # `epoll_wait` / `kevent`. If `stop` closed the listener fd while
+    # the scheduler still had it registered, the scheduler-close
+    # surfaces `Errno::EBADF: Bad file descriptor —
+    # select_internal_with_gvl:epoll_wait` and re-raises it past the
+    # inner rescue (the inner rescue is only on `child.wait`).
+    #
+    # Symptom in CI: `async_io: true` boot/stop integration specs flake
+    # on Ruby 3.4 + async 2.39 with EBADF bubbling out of the worker
+    # thread. The race window is widest with `thread_count: 0` because
+    # the entire dispatch path runs on the same fiber as the accept
+    # loop, so there's no thread-pool synchronization barrier between
+    # `stop` and scheduler close.
+    #
+    # Fix: catch `Errno::EBADF`/`IOError` at the outer `Async do` scope.
+    # These are exclusively shutdown signals (the listener fd only goes
+    # bad when `close_listeners` has run); swallowing them here is
+    # equivalent to the C-loop path, which already swallows them inside
+    # `accept_or_nil`. The change is intentionally narrow — other
+    # `StandardError` from inside the loop bodies still propagates out
+    # so genuine accept-loop bugs are not masked.
     def start_async_loop
       Async do |task|
         n = @accept_fibers_per_worker
@@ -834,6 +861,11 @@ module Hyperion
           nil
         end
       end
+    rescue Errno::EBADF, IOError
+      # Listener fd already closed by `stop` — scheduler close-time
+      # epoll_wait / kevent saw the bad fd. Benign at this point;
+      # the server is shutting down by design.
+      nil
     end
 
     # Single accept fiber's run loop. Called N times (default 1) from
