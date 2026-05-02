@@ -88,8 +88,28 @@ module Hyperion
     # On a non-match (any path / method not registered here) the
     # request falls through to the regular Rack adapter dispatch
     # — existing behaviour for un-handled routes is unchanged.
-    def self.handle(method_sym, path, handler)
-      route_table.register(method_sym, path, handler)
+    def self.handle(method_sym, path, handler = nil, &block)
+      raise ArgumentError, 'pass a handler OR a block, not both' if handler && block
+      raise ArgumentError, 'must pass a handler or block' if handler.nil? && block.nil?
+
+      if block
+        # 2.14-A — block form: `Server.handle(:GET, '/x') { |env| ... }`.
+        # Wraps the block in a `DynamicBlockEntry` so the C accept loop
+        # (when engaged) can recognise the entry and dispatch via the
+        # registered C-loop helper. The block receives a Rack env hash
+        # — same shape Rack apps see — and must return a `[status,
+        # headers, body]` triple per the Rack spec.
+        method_key = method_sym.to_s.upcase.to_sym
+        entry = RouteTable::DynamicBlockEntry.new(method_key, path.dup.freeze, block).freeze
+        route_table.register(method_sym, path, entry)
+        entry
+      else
+        # Legacy 2.10-D handler form: `handler#call(request)` returning
+        # a `[status, headers, body]` triple. The C accept loop does
+        # NOT engage on these — they fall through to the Connection
+        # path so the Hyperion::Request shape contract holds.
+        route_table.register(method_sym, path, handler)
+      end
     end
 
     # 2.10-D — register a direct-dispatch route whose response is
@@ -460,6 +480,13 @@ module Hyperion
       pc.set_lifecycle_callback(ConnectionLoop.build_lifecycle_callback(@runtime))
       pc.set_lifecycle_active(@runtime.has_request_hooks?)
       pc.set_handoff_callback(ConnectionLoop.build_handoff_callback(self))
+
+      # 2.14-A — wire up the dynamic-block dispatch surface. Registers
+      # every `RouteTable::DynamicBlockEntry` with the C-side path
+      # registry and stashes the bound dispatch closure on the C loop
+      # so per-request hits can call back into Ruby with the right
+      # runtime context.
+      register_dynamic_blocks_with_c_loop(pc) if pc.respond_to?(:register_dynamic_block)
       # 2.12-E — register the per-worker request counter family on the
       # runtime's metrics sink BEFORE the C loop starts ticking. The
       # PrometheusExporter's C-loop fold-in is gated on the family
@@ -528,8 +555,44 @@ module Hyperion
       pc&.set_lifecycle_active(false) if defined?(pc)
       pc&.set_lifecycle_callback(nil) if defined?(pc)
       pc&.set_handoff_callback(nil) if defined?(pc)
+      # 2.14-A — also clear dynamic block registrations + dispatch
+      # callback so a re-engage with a different runtime / route
+      # table starts clean.
+      if defined?(pc) && pc.respond_to?(:clear_dynamic_blocks!)
+        pc.clear_dynamic_blocks!
+        pc.set_dynamic_dispatch_callback(nil)
+      end
     end
     private :run_c_accept_loop
+
+    # 2.14-A — Walk `@route_table` and push every `DynamicBlockEntry`
+    # into the C-side path registry. Also installs the dispatch
+    # callback that the C loop invokes per dynamic-block hit; the
+    # callback closes over `@runtime` so per-tenant Hyperion::Runtime
+    # observers see the right server's hooks fire.
+    def register_dynamic_blocks_with_c_loop(pc)
+      runtime = @runtime
+      pc.set_dynamic_dispatch_callback(
+        lambda do |method_str, path_str, query_str, host_str,
+                   headers_blob, remote_addr, block, keep_alive|
+          ::Hyperion::Adapter::Rack.dispatch_for_c_loop(
+            method_str, path_str, query_str, host_str,
+            headers_blob, remote_addr, block, keep_alive, runtime
+          )
+        end
+      )
+      pc.clear_dynamic_blocks!
+      @route_table.instance_variable_get(:@routes).each do |method_sym, path_table|
+        next unless %i[GET HEAD].include?(method_sym)
+
+        path_table.each do |path, handler|
+          next unless handler.is_a?(::Hyperion::Server::RouteTable::DynamicBlockEntry)
+
+          pc.register_dynamic_block(path, method_sym, handler.block)
+        end
+      end
+    end
+    private :register_dynamic_blocks_with_c_loop
 
     # Dispatch a connection that the C accept loop handed off to Ruby
     # because it couldn't be served from the static cache (path miss,

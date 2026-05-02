@@ -151,6 +151,291 @@ module Hyperion
           nil
         end
 
+        # 2.14-A — C-accept-loop dispatch helper.
+        #
+        # The C accept loop (`PageCache.run_static_accept_loop`) calls
+        # this helper, under the GVL, when a request matches a
+        # `RouteTable::DynamicBlockEntry`. The C side has already done
+        # accept + recv + parse without holding the GVL; this helper
+        # owns the `app.call(env)` slice and returns the fully-formed
+        # HTTP/1.1 response bytes for C to write (also without the GVL).
+        #
+        # Args (all positional, all Strings except `block` and
+        # `keep_alive` and `runtime`):
+        #   * `method_str`     — e.g. "GET"
+        #   * `path_str`       — request path, no query
+        #   * `query_str`      — query (no leading '?'), or "" if none
+        #   * `host_str`       — `Host:` header value, or ""
+        #   * `headers_blob`   — raw header section as bytes
+        #     (the slice between request-line CRLF and the closing
+        #     CRLFCRLF, terminated by a CRLF on the last header). The
+        #     helper parses this in Ruby — header parse is a few µs
+        #     even for the 30-header case, dwarfed by `app.call`.
+        #   * `remote_addr`    — peer IP as a String, or "" if unknown
+        #   * `block`          — the registered Proc / lambda
+        #   * `keep_alive`     — true to emit `connection: keep-alive`
+        #     in the response head, false for `connection: close`
+        #   * `runtime`        — the `Hyperion::Runtime` instance the
+        #     server was constructed with (for lifecycle hooks); the
+        #     C loop captures this once at boot via the registered
+        #     callback closure
+        #
+        # Returns a single binary String of HTTP/1.1 response bytes
+        # (status line + response headers + CRLF + body). The C loop
+        # writes this verbatim. On exception, returns a 500 envelope
+        # so the C loop can still respond to the peer (better UX than
+        # closing the fd silently).
+        def dispatch_for_c_loop(method_str, path_str, query_str,
+                                host_str, headers_blob, remote_addr,
+                                block, keep_alive, runtime)
+          env, input = build_c_loop_env(method_str, path_str, query_str,
+                                        host_str, headers_blob, remote_addr)
+          request = nil
+          response = nil
+          error = nil
+
+          rt = runtime || Hyperion::Runtime.default
+          if rt.has_request_hooks?
+            request = c_loop_request_for(env)
+            rt.fire_request_start(request, env)
+          end
+
+          begin
+            response = block.call(env)
+          rescue StandardError => e
+            error = e
+          end
+
+          if rt.has_request_hooks?
+            request ||= c_loop_request_for(env)
+            rt.fire_request_end(request, env, response, error)
+          end
+
+          if error
+            ::Hyperion.metrics.increment(:app_errors)
+            ::Hyperion.logger.error do
+              {
+                message: 'app raised (c-accept-loop dispatch)',
+                error: error.message,
+                error_class: error.class.name,
+                backtrace: (error.backtrace || []).first(20).join(' | ')
+              }
+            end
+            response = [500, { 'content-type' => 'text/plain' }, ['Internal Server Error']]
+          end
+
+          render_c_loop_response(response, keep_alive)
+        ensure
+          ENV_POOL.release(env) if env
+          INPUT_POOL.release(input) if input
+        end
+
+        # 2.14-A — assemble the Rack env for a C-accept-loop dispatch.
+        # Mirrors the constants `build_env` sets on the regular path
+        # but skips the `connection`/hijack branches: the C accept
+        # loop owns the fd; full-hijack semantics are out of scope
+        # for this dispatch shape (h1 keep-alive is handled in C).
+        # Returns `[env, input]` so the caller can release both back
+        # to their pools after the response is rendered.
+        def build_c_loop_env(method_str, path_str, query_str,
+                             host_str, headers_blob, remote_addr)
+          server_name, server_port = split_host(host_str || '')
+
+          env = ENV_POOL.acquire
+          input = INPUT_POOL.acquire
+          input.string = EMPTY_INPUT_BUFFER
+          input.rewind
+
+          env['REQUEST_METHOD']  = method_str
+          env['PATH_INFO']       = path_str
+          env['QUERY_STRING']    = query_str || ''
+          env['SERVER_PROTOCOL'] = 'HTTP/1.1'
+          env['HTTP_VERSION']    = 'HTTP/1.1'
+          env['SERVER_NAME']     = server_name
+          env['SERVER_PORT']     = server_port
+          env['SERVER_SOFTWARE'] = SERVER_SOFTWARE_VALUE
+          env['REMOTE_ADDR']     = remote_addr.nil? || remote_addr.empty? ? '127.0.0.1' : remote_addr
+          env['rack.url_scheme'] = 'http'
+          env['rack.errors']     = $stderr
+          env['rack.version']    = RACK_VERSION
+          env['rack.multithread'] = true
+          env['rack.multiprocess'] = false
+          env['rack.run_once']   = false
+          env['rack.hijack?']    = false
+          env['SCRIPT_NAME']     = ''
+          env['rack.input']      = input
+          # 2.14-A — guarded `is_a?(String) && !empty?` (rather than
+          # `present?`) so rubocop-rails's Style/Present autocorrect
+          # can't rewrite the branch to a Rails-only API. Same pattern
+          # `Server#dispatch_handed_off` uses for `partial`.
+          env['HTTP_HOST'] = host_str if host_str.is_a?(String) && !host_str.empty?
+
+          parse_c_loop_headers!(env, headers_blob) if headers_blob.is_a?(String) && !headers_blob.empty?
+
+          [env, input]
+        end
+
+        # 2.14-A — parse the raw header block the C accept loop hands
+        # us into the env hash. Each line is `name: value\r\n`; the
+        # final empty line is already trimmed by the caller (the C
+        # loop slices between request-line-end and the closing
+        # CRLFCRLF and passes the inner bytes verbatim).
+        #
+        # We honour the same HTTP_KEY_CACHE the regular adapter path
+        # uses, so `equal?` pointer-compares from upstream Rack code
+        # (Rack::Attack et al.) keep working.
+        def parse_c_loop_headers!(env, headers_blob)
+          return if headers_blob.empty?
+
+          c_upcase = c_upcase_available?
+          # The Ruby parser walks line-by-line; allocations are 1
+          # String per header (the value). Header names go through
+          # the cache hit (no alloc) or the C-ext upcase_underscore
+          # (single-call alloc).
+          start = 0
+          blen = headers_blob.bytesize
+          while start < blen
+            eol = headers_blob.index("\r\n", start) || blen
+            line = headers_blob.byteslice(start, eol - start)
+            start = eol + 2
+            next if line.empty?
+
+            colon = line.index(':')
+            next unless colon
+
+            name = line.byteslice(0, colon).downcase
+            # Skip the colon, then any leading whitespace.
+            v_start = colon + 1
+            v_start += 1 while v_start < line.bytesize && [32, 9].include?(line.getbyte(v_start))
+            v_end = line.bytesize
+            v_end -= 1 while v_end > v_start && [32, 9].include?(line.getbyte(v_end - 1))
+            value = line.byteslice(v_start, v_end - v_start)
+
+            key = HTTP_KEY_CACHE[name] ||
+                  (c_upcase ? ::Hyperion::CParser.upcase_underscore(name) : "HTTP_#{name.upcase.tr('-', '_')}")
+            env[key] = value
+          end
+
+          env['CONTENT_TYPE']   = env['HTTP_CONTENT_TYPE']   if env.key?('HTTP_CONTENT_TYPE')
+          env['CONTENT_LENGTH'] = env['HTTP_CONTENT_LENGTH'] if env.key?('HTTP_CONTENT_LENGTH')
+          nil
+        end
+
+        # 2.14-A — minimal `Hyperion::Request` value for lifecycle
+        # hook observers. Only built when hooks are active (the
+        # `has_request_hooks?` guard skips the alloc on the no-hook
+        # hot path).
+        def c_loop_request_for(env)
+          ::Hyperion::Request.new(
+            method: env['REQUEST_METHOD'],
+            path: env['PATH_INFO'],
+            query_string: env['QUERY_STRING'],
+            http_version: 'HTTP/1.1',
+            headers: {},
+            body: nil
+          )
+        end
+
+        # 2.14-A — render a Rack `[status, headers, body]` triple to
+        # the wire bytes for the C loop. Honours:
+        #   * `keep_alive` — emit `connection: keep-alive` vs
+        #     `connection: close`. The C loop honours the
+        #     `connection: close` request header by passing
+        #     `keep_alive=false`; ditto on Rack apps that opt in via
+        #     the response header.
+        #   * `content-length` — auto-computed from the body bytes
+        #     unless the app set it explicitly. Required for
+        #     keep-alive correctness.
+        #   * `body.each` — collected into a single binary blob; the
+        #     C loop writes head + body in one syscall.
+        #   * `body.close` — invoked after iteration per Rack spec.
+        #
+        # Streaming bodies (Rack 3 `body.call(stream)` shape) are NOT
+        # supported in the C-loop dispatch. Apps that need streaming
+        # must register via the legacy `Connection#serve` path
+        # (don't use the block form of `Server.handle`); the
+        # `eligible_route_table?` check refuses to engage the C loop
+        # for tables containing those handlers.
+        def render_c_loop_response(response, keep_alive)
+          unless response.is_a?(Array) && response.length == 3
+            response = [500, { 'content-type' => 'text/plain' }, ['Invalid Rack response']]
+          end
+          status, headers, body = response
+
+          body_bytes = collect_body_bytes(body)
+          headers_out = normalize_response_headers(headers, body_bytes.bytesize, keep_alive)
+          head = build_status_line(status) + headers_out + "\r\n"
+
+          buf = String.new(capacity: head.bytesize + body_bytes.bytesize, encoding: Encoding::ASCII_8BIT)
+          buf << head.b << body_bytes
+          buf
+        ensure
+          begin
+            body.close if body.respond_to?(:close)
+          rescue StandardError
+            nil
+          end
+        end
+
+        # 2.14-A — drain a Rack body into a single binary blob.
+        # Honours both Array bodies (the common case — `[body_str]`)
+        # and `each`-yielding bodies. Rack 3 streaming bodies (the
+        # `call(stream)` variant) raise here; the eligibility check
+        # is supposed to refuse them at registration time.
+        def collect_body_bytes(body)
+          return body[0].b if body.is_a?(Array) && body.length == 1 && body[0].is_a?(String)
+
+          buf = String.new(encoding: Encoding::ASCII_8BIT)
+          body.each { |chunk| buf << chunk.to_s.b } if body.respond_to?(:each)
+          buf
+        end
+
+        # 2.14-A — Build the response header lines including
+        # `content-length`, `connection`, and `server`. Skips any
+        # header named `connection`/`content-length`/`transfer-encoding`
+        # the app set (we own those in the C-loop path).
+        def normalize_response_headers(headers, body_len, keep_alive)
+          out = String.new(encoding: Encoding::ASCII_8BIT)
+          if headers.is_a?(Hash)
+            headers.each do |name, value|
+              ln = name.to_s.downcase
+              next if %w[connection content-length transfer-encoding].include?(ln)
+
+              # Multi-value headers (Rack 3: Array of values, or
+              # newline-joined String) — emit one line per value.
+              vals = value.is_a?(Array) ? value : value.to_s.split("\n")
+              vals.each do |v|
+                out << ln << ': ' << v.to_s << "\r\n"
+              end
+            end
+          end
+          out << 'content-length: ' << body_len.to_s << "\r\n"
+          out << (keep_alive ? "connection: keep-alive\r\n" : "connection: close\r\n")
+          out
+        end
+
+        # 2.14-A — minimal status line builder. Covers the canonical
+        # 200/201/204/301/302/304/400/401/403/404/500 by name; everything
+        # else falls back to a generic reason phrase since the Rack
+        # body still wins at the protocol level.
+        STATUS_LINES = {
+          200 => "HTTP/1.1 200 OK\r\n",
+          201 => "HTTP/1.1 201 Created\r\n",
+          204 => "HTTP/1.1 204 No Content\r\n",
+          301 => "HTTP/1.1 301 Moved Permanently\r\n",
+          302 => "HTTP/1.1 302 Found\r\n",
+          304 => "HTTP/1.1 304 Not Modified\r\n",
+          400 => "HTTP/1.1 400 Bad Request\r\n",
+          401 => "HTTP/1.1 401 Unauthorized\r\n",
+          403 => "HTTP/1.1 403 Forbidden\r\n",
+          404 => "HTTP/1.1 404 Not Found\r\n",
+          500 => "HTTP/1.1 500 Internal Server Error\r\n"
+        }.freeze
+
+        def build_status_line(status)
+          STATUS_LINES[status] || "HTTP/1.1 #{status} OK\r\n"
+        end
+
         # 2.1.0 (WS-1): `connection:` is the Hyperion::Connection that owns
         # the underlying socket for this request. When non-nil, the env hash
         # advertises Rack 3 full-hijack support — the app can call

@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'stringio'
+
 module Hyperion
   class Server
     # 2.10-D — direct-dispatch route registry.  Mirrors agoo's
@@ -83,6 +85,68 @@ module Hyperion
         # mirror that `PageCache.register_prebuilt` records.
         def headers_bytesize
           headers_len || buffer.bytesize
+        end
+      end
+
+      # 2.14-A — wrapper for a Rack-style block registered via
+      # `Server.handle(:GET, '/path') { |env| [...] }`.  Differs from
+      # `StaticEntry` in that the response is computed per-request
+      # rather than baked at registration time — but the route table
+      # entry shape is uniform, so the C accept loop can branch on
+      # `is_a?(DynamicBlockEntry)` AFTER the StaticEntry check and
+      # invoke the block via the registered C-loop dispatch helper.
+      #
+      # The struct holds:
+      #   * `method` — request-method symbol (`:GET`, `:POST`, ...)
+      #   * `path`   — exact-match path String (frozen)
+      #   * `block`  — the registered Proc / lambda; receives a Rack
+      #     env hash and must return a `[status, headers, body]`
+      #     triple per the Rack spec.  The C accept loop hands it a
+      #     populated env via the `Adapter::Rack.dispatch_for_c_loop`
+      #     helper; the block sees the same env shape Rack apps
+      #     normally see (HTTP_*, REQUEST_METHOD, PATH_INFO, etc.).
+      #
+      # Calling the entry directly (the legacy fall-through path used
+      # when the C accept loop is NOT engaged — TLS listeners, mixed
+      # tables, operator escape hatch via `HYPERION_C_ACCEPT_LOOP=0`)
+      # delegates straight to the block with a freshly-built env via
+      # the existing `Adapter::Rack#call` machinery.  The Connection
+      # path's direct-route dispatcher already handles
+      # `respond_to?(:call)` entries by invoking them with a
+      # `Hyperion::Request` value object — we route through that
+      # surface so the legacy fallback stays bit-identical to a
+      # 2.13-shape `Server.handle` registration.
+      DynamicBlockEntry = Struct.new(:method, :path, :block) do
+        # Legacy direct-route surface: `RouteTable#lookup` → handler →
+        # `handler.call(request)` returning a `[status, headers, body]`
+        # triple. Used by the Connection path when the C accept loop is
+        # disengaged (TLS, mixed tables). We hand the block a minimal
+        # env hash so it sees the same Rack-style API regardless of
+        # which dispatch shape served the request.
+        def call(request)
+          env = build_legacy_env(request)
+          block.call(env)
+        end
+
+        private
+
+        def build_legacy_env(request)
+          headers = request.respond_to?(:headers) ? (request.headers || {}) : {}
+          env = {
+            'REQUEST_METHOD' => request.method,
+            'PATH_INFO' => request.path,
+            'QUERY_STRING' => request.query_string.to_s,
+            'SERVER_NAME' => 'localhost',
+            'SERVER_PORT' => '80',
+            'rack.input' => StringIO.new(request.body.to_s),
+            'rack.errors' => $stderr,
+            'rack.url_scheme' => 'http'
+          }
+          headers.each do |name, value|
+            key = "HTTP_#{name.to_s.upcase.tr('-', '_')}"
+            env[key] = value
+          end
+          env
         end
       end
 

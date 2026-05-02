@@ -357,7 +357,7 @@ RSpec.describe 'Hyperion::Http::PageCache.run_static_accept_loop (2.12-C)' do
       thread.join(5)
     end
 
-    it 'falls back to the Ruby loop when a dynamic handler is registered alongside' do
+    it 'falls back to the Ruby loop when a legacy-handler dynamic route is registered alongside' do
       Hyperion::Server.handle_static(:GET, '/static', "s\n")
       Hyperion::Server.handle(:GET, '/dynamic', ->(_req) { [200, {}, ['dynamic']] })
 
@@ -366,8 +366,10 @@ RSpec.describe 'Hyperion::Http::PageCache.run_static_accept_loop (2.12-C)' do
       server.listen
       port = server.port
 
-      # The C-loop engagement check should refuse: dynamic handler
-      # present.
+      # The C-loop engagement check should refuse: legacy-handler
+      # dynamic route present (handler takes a Hyperion::Request,
+      # not a Rack env hash). DynamicBlockEntry-shaped registrations
+      # ARE C-loop eligible — see the next example.
       expect(server.send(:engage_c_accept_loop?)).to be(false)
 
       thread = Thread.new { server.start }
@@ -380,6 +382,46 @@ RSpec.describe 'Hyperion::Http::PageCache.run_static_accept_loop (2.12-C)' do
 
       server.stop
       thread.join(5)
+    end
+
+    # 2.14-A — DynamicBlockEntry registrations (block form of
+    # `Server.handle`) are C-loop eligible. A mixed table with
+    # both StaticEntry and DynamicBlockEntry stays eligible; both
+    # shapes serve from the C loop.
+    it 'engages the C loop when StaticEntry and DynamicBlockEntry coexist (2.14-A)' do
+      Hyperion::Server.handle_static(:GET, '/static', "s\n")
+      Hyperion::Server.handle(:GET, '/dyn-block') { |_env| [200, { 'content-type' => 'text/plain' }, ["d\n"]] }
+
+      app = ->(_env) { [404, { 'content-type' => 'text/plain' }, ['no']] }
+      server = Hyperion::Server.new(host: '127.0.0.1', port: 0, app: app, thread_count: 0)
+      server.listen
+      port = server.port
+
+      expect(server.send(:engage_c_accept_loop?)).to be(true)
+
+      Hyperion::Http::PageCache.reset_c_loop_requests_total!
+      thread = Thread.new { server.start }
+      sleep 0.1
+
+      static_response = http_get(port, '/static')
+      dyn_response = http_get(port, '/dyn-block')
+      expect(static_response).to end_with("s\n")
+      expect(dyn_response).to end_with("d\n")
+
+      Hyperion::Http::PageCache.stop_accept_loop
+      begin
+        TCPSocket.new('127.0.0.1', port).close
+      rescue StandardError
+        nil
+      end
+      server.stop
+      thread.join(5)
+
+      # Both requests served by the C loop — counter should reflect
+      # at least 2 ticks (the wake-connect from `stop_loop_and_wake`
+      # may add one more 0-byte handoff that does NOT tick the
+      # counter, so the floor is exactly 2).
+      expect(Hyperion::Http::PageCache.c_loop_requests_total).to be >= 2
     end
   end
 

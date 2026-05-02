@@ -1130,6 +1130,57 @@ static VALUE  hyp_cl_lifecycle_callback = Qnil;
 static VALUE  hyp_cl_handoff_callback   = Qnil;
 static int    hyp_cl_lifecycle_active   = 0;
 
+/* 2.14-A — dynamic block registry. Path → Ruby Proc for routes
+ * registered via `Server.handle(:GET, '/path') { |env| ... }`. The
+ * C accept loop's `hyp_cl_serve_connection` checks this list AFTER
+ * the static page cache lookup misses; on hit, it invokes
+ * `hyp_dyn_dispatch_callback` (registered once at server boot) with
+ * the request shape data + the registered block, gets back the
+ * fully-formed HTTP/1.1 response bytes, and writes them outside the
+ * GVL.
+ *
+ * The registry is small (16 entries default, capped at 256) — apps
+ * with hundreds of dynamic routes belong on a Rails router, not on
+ * the C accept loop's exact-match dispatch. The fixed-size array is
+ * walked linearly because (a) modern CPUs blast through 256 cache
+ * lines in tens of nanoseconds and (b) avoiding a hash table keeps
+ * the C surface tiny. */
+#define HYP_DYN_MAX_ROUTES 256
+
+typedef struct {
+    char  *path;       /* heap-owned, NUL-terminated */
+    size_t path_len;
+    VALUE  block;      /* the Ruby Proc; gc-protected via the
+                        * registry-wide rb_gc_register_address slot
+                        * `hyp_dyn_routes_mark_anchor` (see below). */
+    int    method;     /* PC_INTERNAL_METHOD_GET / HEAD; 2.14-A
+                        * accepts only GET (HEAD support is a future
+                        * extension — apps rarely need a custom HEAD
+                        * handler distinct from GET). */
+} hyp_dyn_route_t;
+
+static hyp_dyn_route_t hyp_dyn_routes[HYP_DYN_MAX_ROUTES];
+static size_t          hyp_dyn_route_count = 0;
+static pthread_mutex_t hyp_dyn_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* The dispatch callback is the single bridge between the C loop and
+ * Ruby for dynamic-block requests. Set once via
+ * `set_dynamic_dispatch_callback`; cleared at server stop. The C loop
+ * passes the registered block as the 7th positional arg so the
+ * callback can call into the right Proc without re-doing the path
+ * lookup on the Ruby side. */
+static VALUE hyp_dyn_dispatch_callback = Qnil;
+
+/* 2.14-A — GC anchor for every Block VALUE we hold in the registry.
+ * `rb_gc_register_address(&hyp_dyn_routes_mark_anchor)` keeps the
+ * anchor alive; the registry's `mark` is performed via the
+ * `hyp_dyn_routes_mark` GC mark function we wire into the
+ * Hyperion::Http::PageCache module via `rb_define_module` plus a
+ * small mark wrapper class. The simpler alternative — call
+ * `rb_gc_register_address` once per registered block — works too;
+ * we use that approach in `register_dynamic_block` below. */
+static VALUE hyp_dyn_routes_mark_anchor = Qnil;
+
 /* Stop flag — flipped from Ruby via `stop_accept_loop` when the
  * listener should drop out of the loop voluntarily (graceful
  * shutdown). The accept syscall is still blocking; the operator's
@@ -1471,6 +1522,57 @@ static int hyp_cl_scan_headers(const char *buf, size_t start, size_t end,
     return -1;
 }
 
+/* 2.14-A — extract the `Host:` header value from a parsed header
+ * block. Returns 0 on success and writes `*h_off`/`*h_len` (offsets
+ * relative to `buf`); -1 if not found. The implementation mirrors
+ * `hyp_cl_scan_headers` (case-insensitive name compare, trim
+ * whitespace), but only matches Host. The C loop calls this only on
+ * a dynamic-block hit — the static-fast-path doesn't read Host. */
+static int hyp_cl_extract_host(const char *buf, size_t start, size_t end,
+                               size_t *h_off, size_t *h_len) {
+    *h_off = 0;
+    *h_len = 0;
+    size_t i = start;
+    while (i + 2 <= end) {
+        if (i + 1 < end && buf[i] == '\r' && buf[i+1] == '\n') {
+            return -1; /* end of headers; not found */
+        }
+        size_t name_start = i;
+        while (i < end && buf[i] != ':' && buf[i] != '\r') {
+            i++;
+        }
+        if (i >= end || buf[i] != ':') {
+            return -1;
+        }
+        size_t name_end = i;
+        i++;
+        while (i < end && (buf[i] == ' ' || buf[i] == '\t')) {
+            i++;
+        }
+        size_t val_start = i;
+        while (i < end && buf[i] != '\r') {
+            i++;
+        }
+        if (i + 1 >= end || buf[i+1] != '\n') {
+            return -1;
+        }
+        size_t val_end = i;
+        i += 2;
+
+        size_t nlen = name_end - name_start;
+        if (hyp_cl_iequals(buf + name_start, nlen, "host", 4)) {
+            /* Trim trailing whitespace. */
+            while (val_end > val_start && (buf[val_end - 1] == ' ' || buf[val_end - 1] == '\t')) {
+                val_end--;
+            }
+            *h_off = val_start;
+            *h_len = val_end - val_start;
+            return 0;
+        }
+    }
+    return -1;
+}
+
 /* Lifecycle fire helper: rb_funcall into the registered callback
  * with (method_str, path_str). Wrapped in rb_protect so a misbehaving
  * Ruby hook can't take down the C loop. */
@@ -1551,6 +1653,140 @@ static void hyp_cl_apply_tcp_nodelay(int fd) {
     int one = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
+
+/* ============================================================
+ * 2.14-A — Dynamic block dispatch from inside the C accept loop.
+ * ============================================================
+ *
+ * `hyp_dyn_lookup_block(path, plen, method)` walks the registered
+ * dynamic-block table and returns the registered block VALUE on
+ * exact-match hit, or `Qnil` on miss. Linear scan (capped at
+ * HYP_DYN_MAX_ROUTES = 256 entries); the alternative — a hash map
+ * inside C — would push more state into the C side without buying
+ * meaningful throughput at the route counts the C accept loop
+ * targets.
+ *
+ * The lookup grabs a lightweight pthread mutex; the registry is
+ * almost always read-only after server boot, so contention is
+ * negligible (one cmpxchg-style instruction per request). */
+static VALUE hyp_dyn_lookup_block(const char *path, size_t plen,
+                                  hyp_pc_method_t method) {
+    if (plen == 0 || method == HYP_PC_METHOD_OTHER) {
+        return Qnil;
+    }
+    pthread_mutex_lock(&hyp_dyn_lock);
+    VALUE found = Qnil;
+    for (size_t i = 0; i < hyp_dyn_route_count; i++) {
+        hyp_dyn_route_t *r = &hyp_dyn_routes[i];
+        if (r->path_len == plen && memcmp(r->path, path, plen) == 0) {
+            /* GET-registered entries also serve HEAD (the dispatcher
+             * could trim the body; for 2.14-A we just call the block
+             * and let it return whatever it returns — operators that
+             * want a HEAD-specific shape register a separate route). */
+            if ((int)method == r->method ||
+                ((int)method == PC_INTERNAL_METHOD_HEAD && r->method == PC_INTERNAL_METHOD_GET)) {
+                found = r->block;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&hyp_dyn_lock);
+    return found;
+}
+
+/* Args for the rb_protect-wrapped Ruby dispatch call. The 8-arg
+ * Ruby callable is invoked under the GVL (we re-acquire it via
+ * rb_thread_call_with_gvl from the no-GVL outer frame); the result
+ * is a single binary String — the fully-formed HTTP/1.1 response. */
+typedef struct {
+    VALUE callback;
+    VALUE method_str;
+    VALUE path_str;
+    VALUE query_str;
+    VALUE host_str;
+    VALUE headers_blob;
+    VALUE remote_addr;
+    VALUE block;
+    VALUE keep_alive;
+} hyp_dyn_dispatch_args_t;
+
+static VALUE hyp_dyn_dispatch_invoke(VALUE raw) {
+    hyp_dyn_dispatch_args_t *a = (hyp_dyn_dispatch_args_t *)raw;
+    VALUE argv[8];
+    argv[0] = a->method_str;
+    argv[1] = a->path_str;
+    argv[2] = a->query_str;
+    argv[3] = a->host_str;
+    argv[4] = a->headers_blob;
+    argv[5] = a->remote_addr;
+    argv[6] = a->block;
+    argv[7] = a->keep_alive;
+    return rb_funcallv(a->callback, rb_intern("call"), 8, argv);
+}
+
+/* Drive one dynamic-block request through the registered Ruby
+ * dispatch helper. On success, returns a freshly malloc'd byte
+ * buffer containing the full HTTP/1.1 response (caller must free()
+ * it) and writes the byte length into *out_len. On failure (no
+ * callback, exception, return-shape error), returns NULL — the
+ * caller will hand off to Ruby so the connection still gets a
+ * response.
+ *
+ * MUST be called under the GVL. */
+static char *hyp_dyn_dispatch_under_gvl(const char *method, size_t mlen,
+                                        const char *path,   size_t plen,
+                                        const char *query,  size_t qlen,
+                                        const char *host,   size_t hlen,
+                                        const char *hdrs,   size_t hdrs_len,
+                                        const char *peer,   size_t peer_len,
+                                        VALUE block, int keep_alive,
+                                        size_t *out_len) {
+    *out_len = 0;
+    if (NIL_P(hyp_dyn_dispatch_callback) || NIL_P(block)) {
+        return NULL;
+    }
+
+    hyp_dyn_dispatch_args_t a;
+    a.callback     = hyp_dyn_dispatch_callback;
+    a.method_str   = rb_str_new(method, (long)mlen);
+    a.path_str     = rb_str_new(path,   (long)plen);
+    a.query_str    = (qlen > 0) ? rb_str_new(query, (long)qlen) : rb_str_new("", 0);
+    a.host_str     = (hlen > 0) ? rb_str_new(host, (long)hlen)  : rb_str_new("", 0);
+    a.headers_blob = (hdrs_len > 0) ? rb_str_new(hdrs, (long)hdrs_len) : rb_str_new("", 0);
+    a.remote_addr  = (peer_len > 0) ? rb_str_new(peer, (long)peer_len) : rb_str_new("", 0);
+    a.block        = block;
+    a.keep_alive   = keep_alive ? Qtrue : Qfalse;
+
+    int state = 0;
+    VALUE result = rb_protect(hyp_dyn_dispatch_invoke, (VALUE)&a, &state);
+    if (state) {
+        rb_set_errinfo(Qnil);
+        return NULL;
+    }
+    if (!RB_TYPE_P(result, T_STRING)) {
+        return NULL;
+    }
+    long len = RSTRING_LEN(result);
+    if (len <= 0) {
+        return NULL;
+    }
+    char *snapshot = (char *)malloc((size_t)len);
+    if (snapshot == NULL) {
+        return NULL;
+    }
+    memcpy(snapshot, RSTRING_PTR(result), (size_t)len);
+    *out_len = (size_t)len;
+    return snapshot;
+}
+
+/* The accept-loop thread holds the GVL by default; only releases it
+ * around the blocking syscalls (accept, recv, write). The dynamic
+ * dispatch sits between the recv (which restored the GVL on return)
+ * and the write (which drops it again), so no rb_thread_call_with_gvl
+ * round-trip is needed — `hyp_dyn_dispatch_under_gvl` is called with
+ * the GVL already held. The `_under_gvl` suffix is documentation:
+ * the function MUST NOT be called from a `rb_thread_call_without_gvl`
+ * frame (no Ruby VM access without the GVL). */
 
 /* Pre-built `404 Not Found` response, written to the socket when the
  * C loop sees a method/path it can answer with a definite negative
@@ -1662,57 +1898,166 @@ static long hyp_cl_serve_connection(int client_fd, int *handed_off) {
             return served;
         }
 
+        /* 2.14-A — split request-target into path + query. The path
+         * registry uses the path-only key so an entry registered as
+         * `/echo` matches `/echo?x=1`. */
+        size_t path_only_len = path_len;
+        size_t query_off = 0;
+        size_t query_len = 0;
+        for (size_t qi = 0; qi < path_len; qi++) {
+            if (buf[path_off + qi] == '?') {
+                path_only_len = qi;
+                query_off = path_off + qi + 1;
+                query_len = path_len - qi - 1;
+                break;
+            }
+        }
+
         pthread_mutex_lock(&hyp_pc_lock);
         int was_stale = 0;
-        hyp_page_slot_t *slot = hyp_pc_lookup_locked(buf + path_off, path_len, &was_stale);
-        if (slot == NULL) {
+        hyp_page_slot_t *slot = hyp_pc_lookup_locked(buf + path_off, path_only_len, &was_stale);
+        if (slot != NULL) {
+            size_t write_len = (kind == HYP_PC_METHOD_HEAD)
+                                   ? slot->page->headers_len
+                                   : slot->page->response_len;
+            char *snapshot = (char *)malloc(write_len);
+            if (snapshot == NULL) {
+                pthread_mutex_unlock(&hyp_pc_lock);
+                /* OOM mid-loop — hand off so Ruby can return 500. */
+                hyp_cl_handoff(client_fd, buf, buf_len);
+                *handed_off = 1;
+                return served;
+            }
+            memcpy(snapshot, slot->page->response_buf, write_len);
             pthread_mutex_unlock(&hyp_pc_lock);
-            hyp_cl_handoff(client_fd, buf, buf_len);
-            *handed_off = 1;
-            return served;
-        }
-        size_t write_len = (kind == HYP_PC_METHOD_HEAD)
-                               ? slot->page->headers_len
-                               : slot->page->response_len;
-        char *snapshot = (char *)malloc(write_len);
-        if (snapshot == NULL) {
+
+            hyp_pc_write_args_t wargs;
+            wargs.fd    = client_fd;
+            wargs.buf   = snapshot;
+            wargs.len   = write_len;
+            wargs.total = 0;
+            wargs.err   = 0;
+            rb_thread_call_without_gvl(hyp_pc_write_blocking, &wargs,
+                                       RUBY_UBF_IO, NULL);
+            free(snapshot);
+
+            if (wargs.err != 0 && wargs.total == 0) {
+                /* Write failed — peer most likely gone. Close and exit. */
+                close(client_fd);
+                return served;
+            }
+
+            served++;
+            /* 2.12-E — per-process tick. Lock-free atomic so the SO_REUSEPORT
+             * audit harness can scrape `c_loop_requests_total` mid-bench
+             * without serialising on a Ruby-side mutex. */
+            hyp_cl_tick_request();
+
+            /* Lifecycle hooks fire AFTER the wire write so observers see a
+             * completed request. Keep this off the no-hook hot path via
+             * the integer flag. */
+            if (hyp_cl_lifecycle_active) {
+                hyp_cl_fire_lifecycle(buf + method_off, method_len,
+                                      buf + path_off, path_only_len);
+            }
+        } else {
             pthread_mutex_unlock(&hyp_pc_lock);
-            /* OOM mid-loop — hand off so Ruby can return 500. */
-            hyp_cl_handoff(client_fd, buf, buf_len);
-            *handed_off = 1;
-            return served;
-        }
-        memcpy(snapshot, slot->page->response_buf, write_len);
-        pthread_mutex_unlock(&hyp_pc_lock);
 
-        hyp_pc_write_args_t wargs;
-        wargs.fd    = client_fd;
-        wargs.buf   = snapshot;
-        wargs.len   = write_len;
-        wargs.total = 0;
-        wargs.err   = 0;
-        rb_thread_call_without_gvl(hyp_pc_write_blocking, &wargs,
-                                   RUBY_UBF_IO, NULL);
-        free(snapshot);
+            /* 2.14-A — try the dynamic-block registry. On hit, dispatch
+             * through the registered Ruby callback under the GVL (we
+             * already hold it — the recv() returned and we haven't yet
+             * released for write). The callback returns a fully-formed
+             * HTTP/1.1 response String; we copy to a heap buffer, then
+             * release the GVL for the write so the next accept can
+             * proceed concurrently on another thread. */
+            VALUE block = hyp_dyn_lookup_block(buf + path_off, path_only_len, kind);
+            if (NIL_P(block)) {
+                /* No static, no dynamic — hand off to Ruby. */
+                hyp_cl_handoff(client_fd, buf, buf_len);
+                *handed_off = 1;
+                return served;
+            }
 
-        if (wargs.err != 0 && wargs.total == 0) {
-            /* Write failed — peer most likely gone. Close and exit. */
-            close(client_fd);
-            return served;
-        }
+            /* Pull the Host header for env['HTTP_HOST'] / SERVER_NAME. */
+            size_t host_hdr_off = 0;
+            size_t host_hdr_len = 0;
+            (void)hyp_cl_extract_host(buf, (size_t)req_line_end, (size_t)eoh,
+                                      &host_hdr_off, &host_hdr_len);
 
-        served++;
-        /* 2.12-E — per-process tick. Lock-free atomic so the SO_REUSEPORT
-         * audit harness can scrape `c_loop_requests_total` mid-bench
-         * without serialising on a Ruby-side mutex. */
-        hyp_cl_tick_request();
+            /* Pull peer addr for env['REMOTE_ADDR']. Best-effort; if
+             * getpeername fails (rare on a freshly-accepted fd) we
+             * pass an empty String and let the Ruby helper substitute
+             * 127.0.0.1. */
+            char peer_buf[64];
+            peer_buf[0] = '\0';
+            size_t peer_len = 0;
+            {
+                struct sockaddr_storage ss;
+                socklen_t slen = (socklen_t)sizeof(ss);
+                if (getpeername(client_fd, (struct sockaddr *)&ss, &slen) == 0) {
+                    if (ss.ss_family == AF_INET) {
+                        struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
+                        if (inet_ntop(AF_INET, &sin->sin_addr, peer_buf, sizeof(peer_buf))) {
+                            peer_len = strlen(peer_buf);
+                        }
+                    } else if (ss.ss_family == AF_INET6) {
+                        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
+                        if (inet_ntop(AF_INET6, &sin6->sin6_addr, peer_buf, sizeof(peer_buf))) {
+                            peer_len = strlen(peer_buf);
+                        }
+                    }
+                }
+            }
 
-        /* Lifecycle hooks fire AFTER the wire write so observers see a
-         * completed request. Keep this off the no-hook hot path via
-         * the integer flag. */
-        if (hyp_cl_lifecycle_active) {
-            hyp_cl_fire_lifecycle(buf + method_off, method_len,
-                                  buf + path_off, path_len);
+            /* Header blob: from req_line_end to eoh-2 (strips the
+             * trailing CRLF that delimits headers from the empty
+             * line). The Ruby helper tolerates an extra trailing
+             * CRLF, so a few bytes of slack are safe. */
+            size_t hdrs_blob_off = (size_t)req_line_end;
+            size_t hdrs_blob_len = ((size_t)eoh > hdrs_blob_off + 2)
+                                       ? ((size_t)eoh - hdrs_blob_off - 2)
+                                       : 0;
+
+            int keep_alive = !connection_close;
+            size_t resp_len = 0;
+            char  *resp_buf = hyp_dyn_dispatch_under_gvl(
+                buf + method_off, method_len,
+                buf + path_off,   path_only_len,
+                (query_len > 0) ? buf + query_off : "", query_len,
+                (host_hdr_len > 0) ? buf + host_hdr_off : "", host_hdr_len,
+                (hdrs_blob_len > 0) ? buf + hdrs_blob_off : "", hdrs_blob_len,
+                peer_buf, peer_len,
+                block, keep_alive, &resp_len);
+            if (resp_buf == NULL) {
+                /* Dispatch failed (no callback / exception / shape error).
+                 * Hand off to Ruby so the connection still gets a
+                 * response. */
+                hyp_cl_handoff(client_fd, buf, buf_len);
+                *handed_off = 1;
+                return served;
+            }
+
+            hyp_pc_write_args_t wargs;
+            wargs.fd    = client_fd;
+            wargs.buf   = resp_buf;
+            wargs.len   = resp_len;
+            wargs.total = 0;
+            wargs.err   = 0;
+            rb_thread_call_without_gvl(hyp_pc_write_blocking, &wargs,
+                                       RUBY_UBF_IO, NULL);
+            free(resp_buf);
+
+            if (wargs.err != 0 && wargs.total == 0) {
+                close(client_fd);
+                return served;
+            }
+
+            served++;
+            hyp_cl_tick_request();
+            /* Lifecycle hooks for the dynamic-block path fire INSIDE the
+             * Ruby dispatch helper (it has the env hash in scope), not
+             * via the C-side lifecycle callback. The C-side flag stays
+             * the static-path's hook contract. */
         }
 
         /* Carry pipelined bytes forward into the same buffer. */
@@ -1952,6 +2297,141 @@ static VALUE rb_pc_max_key_len(VALUE self) {
 }
 
 /* ============================================================
+ * 2.14-A — dynamic block registry: Ruby-callable surface.
+ * ============================================================
+ *
+ * `register_dynamic_block(path, method, block)` adds an entry to the
+ * C-side dynamic-block table. Called once per registered route at
+ * server boot from `Server#run_c_accept_loop`. Returns the new entry
+ * count.
+ *
+ * `clear_dynamic_blocks!` empties the table — used by specs and on
+ * server stop so a subsequent boot doesn't see stale entries.
+ *
+ * `set_dynamic_dispatch_callback(callable)` registers the single
+ * Ruby callable the C loop invokes for every dynamic-block hit;
+ * typically a small closure built by the server that captures the
+ * runtime + delegates to `Adapter::Rack.dispatch_for_c_loop`.
+ */
+static VALUE rb_pc_register_dynamic_block(VALUE self, VALUE rb_path,
+                                          VALUE rb_method, VALUE rb_block) {
+    (void)self;
+    Check_Type(rb_path, T_STRING);
+    if (NIL_P(rb_block) || !rb_respond_to(rb_block, rb_intern("call"))) {
+        rb_raise(rb_eArgError, "block must respond to #call");
+    }
+
+    const char *path     = RSTRING_PTR(rb_path);
+    size_t      path_len = (size_t)RSTRING_LEN(rb_path);
+    if (path_len == 0 || path_len > HYP_PC_MAX_KEY_LEN) {
+        rb_raise(rb_eArgError, "path must be 1..%d bytes", HYP_PC_MAX_KEY_LEN);
+    }
+
+    int method_kind = PC_INTERNAL_METHOD_GET;
+    if (SYMBOL_P(rb_method)) {
+        ID m = SYM2ID(rb_method);
+        if (m == rb_intern("HEAD")) method_kind = PC_INTERNAL_METHOD_HEAD;
+        else if (m == rb_intern("GET")) method_kind = PC_INTERNAL_METHOD_GET;
+        else method_kind = PC_INTERNAL_METHOD_OTHER;
+    } else if (RB_TYPE_P(rb_method, T_STRING)) {
+        const char *ms = RSTRING_PTR(rb_method);
+        long mslen = RSTRING_LEN(rb_method);
+        if (mslen == 4 && (ms[0] == 'H' || ms[0] == 'h')) method_kind = PC_INTERNAL_METHOD_HEAD;
+        else if (mslen == 3 && (ms[0] == 'G' || ms[0] == 'g')) method_kind = PC_INTERNAL_METHOD_GET;
+        else method_kind = PC_INTERNAL_METHOD_OTHER;
+    }
+    if (method_kind == PC_INTERNAL_METHOD_OTHER) {
+        rb_raise(rb_eArgError, "2.14-A only supports :GET / :HEAD dynamic blocks");
+    }
+
+    pthread_mutex_lock(&hyp_dyn_lock);
+    if (hyp_dyn_route_count >= HYP_DYN_MAX_ROUTES) {
+        pthread_mutex_unlock(&hyp_dyn_lock);
+        rb_raise(rb_eRuntimeError,
+                 "dynamic-block registry full (max %d entries)",
+                 HYP_DYN_MAX_ROUTES);
+    }
+
+    /* If a registration for the same (path, method) already exists,
+     * replace it — last writer wins, mirrors RouteTable's contract. */
+    int slot_idx = -1;
+    for (size_t i = 0; i < hyp_dyn_route_count; i++) {
+        hyp_dyn_route_t *r = &hyp_dyn_routes[i];
+        if (r->path_len == path_len && r->method == method_kind &&
+            memcmp(r->path, path, path_len) == 0) {
+            slot_idx = (int)i;
+            break;
+        }
+    }
+    if (slot_idx < 0) {
+        slot_idx = (int)hyp_dyn_route_count;
+        hyp_dyn_routes[slot_idx].path = (char *)malloc(path_len + 1);
+        if (hyp_dyn_routes[slot_idx].path == NULL) {
+            pthread_mutex_unlock(&hyp_dyn_lock);
+            rb_raise(rb_eNoMemError, "register_dynamic_block: path alloc");
+        }
+        memcpy(hyp_dyn_routes[slot_idx].path, path, path_len);
+        hyp_dyn_routes[slot_idx].path[path_len] = '\0';
+        hyp_dyn_routes[slot_idx].path_len = path_len;
+        hyp_dyn_route_count++;
+        /* Anchor the block VALUE against GC. We register the slot's
+         * address once per slot; subsequent writes to the same slot
+         * (replacement on duplicate registration) update the VALUE
+         * in place — the address itself stays anchored. */
+        rb_gc_register_address(&hyp_dyn_routes[slot_idx].block);
+    }
+    hyp_dyn_routes[slot_idx].block = rb_block;
+    hyp_dyn_routes[slot_idx].method = method_kind;
+    pthread_mutex_unlock(&hyp_dyn_lock);
+
+    /* Touch the shared anchor so the registration is observable from
+     * Ruby debugging tools (`ObjectSpace.dump` walks the registered
+     * addresses; a non-nil value here proves at least one block is
+     * pinned by the registry). */
+    hyp_dyn_routes_mark_anchor = rb_block;
+
+    return SIZET2NUM(hyp_dyn_route_count);
+}
+
+static VALUE rb_pc_clear_dynamic_blocks_bang(VALUE self) {
+    (void)self;
+    pthread_mutex_lock(&hyp_dyn_lock);
+    for (size_t i = 0; i < hyp_dyn_route_count; i++) {
+        free(hyp_dyn_routes[i].path);
+        hyp_dyn_routes[i].path = NULL;
+        hyp_dyn_routes[i].path_len = 0;
+        hyp_dyn_routes[i].block = Qnil;
+        hyp_dyn_routes[i].method = 0;
+        /* We deliberately do NOT call rb_gc_unregister_address —
+         * the address slots stay registered so they can be reused
+         * by a subsequent register_dynamic_block call. The Qnil
+         * write here is enough to drop the GC pin on the prior
+         * block VALUE; Qnil is statically rooted. */
+    }
+    hyp_dyn_route_count = 0;
+    hyp_dyn_routes_mark_anchor = Qnil;
+    pthread_mutex_unlock(&hyp_dyn_lock);
+    return Qnil;
+}
+
+static VALUE rb_pc_dynamic_block_count(VALUE self) {
+    (void)self;
+    pthread_mutex_lock(&hyp_dyn_lock);
+    size_t n = hyp_dyn_route_count;
+    pthread_mutex_unlock(&hyp_dyn_lock);
+    return SIZET2NUM(n);
+}
+
+static VALUE rb_pc_set_dynamic_dispatch_callback(VALUE self, VALUE callback) {
+    (void)self;
+    if (!NIL_P(callback) && !rb_respond_to(callback, rb_intern("call"))) {
+        rb_raise(rb_eArgError, "callback must respond to #call");
+    }
+    hyp_dyn_dispatch_callback = callback;
+    return callback;
+}
+
+/* ============================================================
  * 2.12-D — sharing surface for io_uring_loop.c.
  *
  * Thin extern wrappers around the static helpers above. The io_uring
@@ -2128,10 +2608,25 @@ void Init_hyperion_page_cache(void) {
     rb_define_singleton_method(rb_mHyperionHttpPageCache, "bump_c_loop_requests_total_for_test!",
                                rb_pc_bump_c_loop_requests_total_for_test_bang, 1);
 
+    /* 2.14-A — dynamic block dispatch surface. */
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "register_dynamic_block",
+                               rb_pc_register_dynamic_block, 3);
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "clear_dynamic_blocks!",
+                               rb_pc_clear_dynamic_blocks_bang, 0);
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "dynamic_block_count",
+                               rb_pc_dynamic_block_count, 0);
+    rb_define_singleton_method(rb_mHyperionHttpPageCache, "set_dynamic_dispatch_callback",
+                               rb_pc_set_dynamic_dispatch_callback, 1);
+
     /* Mark-protect the lifecycle / handoff callback slots so the GC
      * doesn't collect them while the C loop is running. */
     rb_gc_register_address(&hyp_cl_lifecycle_callback);
     rb_gc_register_address(&hyp_cl_handoff_callback);
+    /* 2.14-A — anchor the dynamic dispatch callback + per-route block
+     * VALUEs (those are anchored on first registration; this is the
+     * shared marker the dispatch callback hides behind). */
+    rb_gc_register_address(&hyp_dyn_dispatch_callback);
+    rb_gc_register_address(&hyp_dyn_routes_mark_anchor);
 
     id_fileno_pc = rb_intern("fileno");
     id_to_io_pc  = rb_intern("to_io");

@@ -78,20 +78,32 @@ module Hyperion
         %w[1 on true yes].include?(env.downcase)
       end
 
-      # Whether the route table is C-loop eligible: only `StaticEntry`
-      # handlers, at least one of them, no dynamic handlers anywhere.
+      # Whether the route table is C-loop eligible: every registered
+      # entry is either a `StaticEntry` (2.12-C path) or a
+      # `DynamicBlockEntry` (2.14-A path), and the table has at least
+      # one of either. Legacy `Server.handle(method, path, handler)`
+      # registrations (where `handler` takes a `Hyperion::Request`)
+      # disable the C path — those still flow through `Connection#serve`.
       def eligible_route_table?(route_table)
         return false unless route_table
 
-        any_static = false
+        any_eligible = false
         route_table.instance_variable_get(:@routes).each_value do |path_table|
           path_table.each_value do |handler|
-            return false unless handler.is_a?(::Hyperion::Server::RouteTable::StaticEntry)
+            return false unless eligible_entry?(handler)
 
-            any_static = true
+            any_eligible = true
           end
         end
-        any_static
+        any_eligible
+      end
+
+      # 2.14-A — predicate split out so specs and the engagement check
+      # can introspect single entries. Lives here (rather than on the
+      # entry classes) so the eligibility surface stays in one place.
+      def eligible_entry?(handler)
+        handler.is_a?(::Hyperion::Server::RouteTable::StaticEntry) ||
+          handler.is_a?(::Hyperion::Server::RouteTable::DynamicBlockEntry)
       end
 
       # Build a lifecycle callback that, when invoked from the C loop

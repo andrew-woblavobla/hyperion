@@ -1,5 +1,132 @@
 # Changelog
 
+## [Unreleased] - 2.14.0
+
+### 2.14-A — Move `app.call` into the C accept loop
+
+**Background.** 2.13-A and 2.13-B documented an honest finding: the
+generic-Rack throughput row didn't move much (+3.6% at -c100, neutral
+on multi-thread JSON/work bench) because the bottleneck is single-
+thread Ruby work — `app.call(env)` holds the GVL for the entire
+request lifecycle (accept + recv + parse + write + lifecycle hooks).
+At `-c5` Hyperion drops from 5,800 to 3,563 r/s; Agoo scales 4,384 →
+6,182 because Agoo's pure-C HTTP core releases C threads in parallel
+during I/O slices.
+
+**What 2.14-A ships.** A new C-accept-loop dispatch shape that lets
+Hyperion do the same trick for routes registered via the block form
+of `Server.handle`:
+
+1. **`RouteTable::DynamicBlockEntry`** (new struct in
+   `lib/hyperion/server/route_table.rb`) wraps a `Server.handle(:GET,
+   path) { |env| ... }` registration. Distinct from `StaticEntry`
+   (response baked at boot) and from the legacy 2.10-D
+   `Server.handle(method, path, handler)` shape (where `handler`
+   takes a `Hyperion::Request`, not a Rack env hash).
+
+2. **Block form of `Server.handle`** — `Server.handle(:GET, '/x') {
+   |env| [200, {...}, ['ok']] }` now wraps the block in a
+   `DynamicBlockEntry`. Legacy 3-arg `Server.handle(method, path,
+   handler)` is unchanged: those handlers stay non-C-loop-eligible
+   (they take `Hyperion::Request`, not Rack env) and continue to
+   flow through `Connection#serve`.
+
+3. **`ConnectionLoop.eligible_route_table?`** now accepts a route
+   table whose entries are *each* either `StaticEntry` OR
+   `DynamicBlockEntry`. A mixed table containing one of each is
+   C-loop-eligible; a table containing a legacy-handler entry is
+   not.
+
+4. **C accept loop extension** (`ext/hyperion_http/page_cache.c`):
+   - New per-process registry `hyp_dyn_routes[]` (capped at 256
+     entries; linear-walked under a lightweight pthread mutex) maps
+     paths to block VALUEs.
+   - `hyp_cl_serve_connection` now: after the static page-cache
+     lookup misses, looks up the path against the dynamic registry;
+     on hit, parses Host header + extracts peer addr (`getpeername`)
+     + invokes the registered Ruby dispatch callback with `(method,
+     path, query, host, headers_blob, remote_addr, block,
+     keep_alive)` UNDER the GVL (the loop already holds it between
+     the recv-no-GVL and write-no-GVL frames). The callback returns
+     a fully-formed HTTP/1.1 response String; the C loop copies the
+     bytes to a heap buffer, releases the GVL, and writes them.
+   - Released request-counter ticks (`hyp_cl_tick_request`) include
+     dynamic-block hits so `c_loop_requests_total` reflects the
+     true served count.
+   - Lifecycle hooks for the dynamic-block path fire INSIDE the
+     Ruby dispatch helper (it has the env hash in scope). The
+     C-side `set_lifecycle_callback` flag stays the static-path's
+     hook contract (unchanged 2-arg `(method, path)` signature) so
+     existing specs keep passing.
+
+5. **`Adapter::Rack.dispatch_for_c_loop(...)`** — the Ruby helper
+   that the C loop calls per dynamic-block hit:
+   - Acquires an env Hash from the existing `ENV_POOL` (capacity
+     256, per-thread free-list — same pool the regular Rack adapter
+     path uses).
+   - Populates `REQUEST_METHOD`, `PATH_INFO`, `QUERY_STRING`,
+     `SERVER_PROTOCOL`/`HTTP_VERSION`, `SERVER_NAME`/`PORT` (split
+     from `Host`), `SERVER_SOFTWARE`, `REMOTE_ADDR`, `rack.*` keys,
+     and every `HTTP_*` header (parses the raw header blob the C
+     loop hands us; honours the same `HTTP_KEY_CACHE` so frozen-key
+     pointer-compares from upstream Rack code keep working).
+   - Fires `runtime.fire_request_start(request, env)` and
+     `fire_request_end(request, env, response, error)` when hooks
+     are active — same contract as the regular Rack adapter path,
+     same env shape (lifecycle hooks contract from 2.10-D
+     preserved: env passed to the dynamic-block path, env=nil to
+     the static path).
+   - Calls `block.call(env)`, collects the body chunks via
+     `body.each` (or fast-path `[String]`), builds the response
+     head (status line + headers + content-length +
+     connection: keep-alive/close), returns one binary blob.
+   - Releases env + input back to their pools. Apps that raise
+     produce a `500 Internal Server Error` envelope so the
+     connection still receives a response instead of being
+     dropped.
+   - Streaming bodies (Rack 3 `body.call(stream)` shape) are
+     intentionally NOT supported here — apps that need streaming
+     register via the legacy path and let `Connection#serve` own
+     dispatch.
+
+6. **`bench/hello_handle_block.ru`** — new bench rackup. Same
+   hello-world workload as `bench/hello.ru`, but registers via
+   `Server.handle(:GET, '/') { |env| ... }` so the C-accept-loop
+   dynamic-block path engages. Lets bench harnesses isolate the
+   structural delta the 2.14-A path delivers vs the legacy
+   `Connection#serve` path on the same workload.
+
+**Specs.**
+
+- `spec/hyperion/dynamic_block_in_c_loop_spec.rb` (10 examples, all
+  passing): eligibility predicate; smoke (a registered block is
+  served from C); env shape (REQUEST_METHOD, PATH_INFO,
+  QUERY_STRING, HTTP_HOST, REMOTE_ADDR, HTTP_* headers); mixed
+  StaticEntry + DynamicBlockEntry; sequential burst (100 requests,
+  asserts `c_loop_requests_total >= 100`); GVL release (compute
+  thread completes within 5s while requests are mid-flight);
+  lifecycle hooks fire with the populated env; `app raise → 500`.
+
+- `spec/hyperion/connection_loop_spec.rb` (12 examples, +1): added a
+  "StaticEntry + DynamicBlockEntry mixed table engages the C loop"
+  example covering the new eligibility surface.
+
+**Compat.** Existing `Server.handle(method, path, handler)` semantics
+unchanged: handlers taking `Hyperion::Request` continue to flow
+through `Connection#serve`; the C loop refuses to engage on those
+tables. `Server.handle_static` (2.10-D/F) unchanged. Legacy
+`set_lifecycle_callback` arity (2-arg) preserved — only the new
+dynamic-block path fires hooks via the Ruby dispatch helper.
+
+**Bench rows captured.** See the 2.14-A bench result entry below for
+the median r/s + p99 numbers across `hello.ru`,
+`hello_handle_block.ru`, `work.ru`, and `hello_static.ru` against
+2.13.0 baselines. Targets: 8k-15k r/s on `hello_handle_block` (vs the
+4,031 r/s 2.13-A `hello.ru` baseline) and 5k-7k r/s on `work.ru`
+(from 3,427 r/s). The structural change ships either way; the
+residual gap is documented honestly in the bench result entry rather
+than papered over.
+
 ## 2.13.0 — 2026-05-01
 
 ### 2.13-E — io_uring soak signal + default-ON decision
