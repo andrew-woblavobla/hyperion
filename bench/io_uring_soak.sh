@@ -486,20 +486,30 @@ fi
 # — that's ~70% stddev/mean from quantization alone, with NO real
 # latency drift in the underlying signal.
 #
-# We compute the variance for the CSV / for plotting trend, but ONLY
-# fold it into the verdict when the bucket-derived signal has enough
-# resolution to be trustworthy: at least 3 distinct values across the
-# sampled window. Below that, the histogram is reporting bucket
-# boundary noise rather than tail drift, and the wrk per-run p99
-# (printed in the [wrk] line above) is the right tail-signal source.
+# 2.13-E shipped this gate at "≥ 3 distinct bucket values = trust the
+# variance". 2.14-C raised it to **≥ 6 distinct bucket values** after
+# the first 30m soak run hit the false-positive cleanly: 3 distinct
+# values (1ms / 5ms / 25ms) and a 65% bucket-derived var_pct against
+# wrk's ACTUAL p99 of 1.15 ms STEADY across 30 minutes — pure bucket
+# quantization, no real tail drift. With 7 bucket edges the noise
+# floor lives until at least 6 buckets are simultaneously populated;
+# below that, the variance is dominated by "which-3-of-7-fired-when"
+# rather than intra-bucket distribution shift. For the canonical
+# hello-world soak shape, 6 distinct bucket values is essentially
+# unreachable in steady state — so the bucket-derived check now
+# effectively means "we computed it for the CSV, but the wrk
+# per-run p99 (printed above) is the actual tail-signal source".
+# That's the right outcome: wrk's HdrHistogram-quantile is mm-precise
+# and steady-state; the prom histogram is a coarse trend tool.
 P99_DISTINCT=$(awk -F, 'NR > 1 && $8 != "" { v[$8]=1 } END { print length(v) }' "$CSV")
-if [ -n "$P99_VAR_PCT" ] && [ "${P99_DISTINCT:-0}" -ge 3 ]; then
+P99_DISTINCT_FOLD_THRESHOLD="${P99_DISTINCT_FOLD_THRESHOLD:-6}"
+if [ -n "$P99_VAR_PCT" ] && [ "${P99_DISTINCT:-0}" -ge "$P99_DISTINCT_FOLD_THRESHOLD" ]; then
   if LC_NUMERIC=C awk -v v="$P99_VAR_PCT" -v t="$P99_VAR_PASS_PCT" 'BEGIN { exit !(v > t) }'; then
     VERDICT="SOAK FAIL"
     REASONS="${REASONS}; p99 var ${P99_VAR_PCT}% > ${P99_VAR_PASS_PCT}% (${P99_DISTINCT} distinct bucket values)"
   fi
 elif [ -n "$P99_VAR_PCT" ]; then
-  REASONS="${REASONS}; p99 var SKIPPED (only ${P99_DISTINCT} distinct bucket values — histogram quantization, not latency drift; see wrk p99=${WRK_P99} for tail truth)"
+  REASONS="${REASONS}; p99 var SKIPPED (only ${P99_DISTINCT} distinct bucket values, threshold=${P99_DISTINCT_FOLD_THRESHOLD} — histogram quantization, not latency drift; see wrk p99=${WRK_P99} for tail truth)"
 else
   REASONS="${REASONS}; p99 var SKIPPED (histogram empty)"
 fi
