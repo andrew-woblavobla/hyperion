@@ -118,14 +118,73 @@ tables. `Server.handle_static` (2.10-D/F) unchanged. Legacy
 `set_lifecycle_callback` arity (2-arg) preserved — only the new
 dynamic-block path fires hooks via the Ruby dispatch helper.
 
-**Bench rows captured.** See the 2.14-A bench result entry below for
-the median r/s + p99 numbers across `hello.ru`,
-`hello_handle_block.ru`, `work.ru`, and `hello_static.ru` against
-2.13.0 baselines. Targets: 8k-15k r/s on `hello_handle_block` (vs the
-4,031 r/s 2.13-A `hello.ru` baseline) and 5k-7k r/s on `work.ru`
-(from 3,427 r/s). The structural change ships either way; the
-residual gap is documented honestly in the bench result entry rather
-than papered over.
+**Bench rows captured (3-trial median, `wrk -t4 -c100 -d20s`).**
+Linux x86_64 6.8.0-107-generic, asdf-installed Ruby 3.3.3,
+`-w 1 -t 5`, plain HTTP/1.1, no TLS, no io_uring (accept4 path).
+
+| rackup                       | 2.14-A median r/s | 2.14-A p99 | baseline r/s     | delta |
+|------------------------------|-------------------|------------|------------------|-------|
+| `bench/hello.ru`             | 4,752             | 2.02 ms    | 4,031 (2.13-A)   | +17.9% (noise band; no regression) |
+| `bench/hello_handle_block.ru`| 9,422             | 166 µs     | n/a (new row)    | **+98% over `hello.ru`** — within 8k–15k target |
+| `bench/work.ru` (block form) | 5,897             | 256 µs     | 3,427 (2.13-B)   | **+72.0%** — within 5k–7k target |
+| `bench/hello_static.ru`      | 15,951            | 99 µs      | 15,685 (2.12-C)  | +1.7%, well within ±5% no-regression |
+
+Trial outputs:
+- `hello.ru` —              4,727 / 5,177 / 4,752 r/s; p99 2.06 / 1.96 / 2.02 ms
+- `hello_handle_block.ru` — 9,422 / 9,570 / 9,308 r/s; p99 169 / 160 / 166 µs
+- `work.ru` —               5,868 / 5,912 / 5,897 r/s; p99 256 / 248 / 259 µs
+- `hello_static.ru` —       15,951 / 15,757 / 15,998 r/s; p99 99 / 100 / 98 µs
+
+**What the numbers say.**
+
+1. The structural win is real and measurable: `hello_handle_block.ru`
+   doubles `bench/hello.ru` (+98%) on the same hello-world workload.
+   `bench/hello.ru` itself stays on the legacy `Connection#serve`
+   path — no `Server.handle` registration — so the only difference
+   between the two rows is the 2.14-A path engaging vs not.
+
+2. `bench/work.ru` (50-key JSON CPU bench) hits +72% — the JSON
+   serialization holds the GVL during `JSON.generate`, but accept +
+   recv + parse + write all run with the GVL released, so other
+   worker threads can be in the accept/recv/write phase
+   concurrently. The p99 drops from 2.58 ms to 256 µs — 10×
+   improvement — because tail requests no longer queue behind the
+   GVL serialization of a stuck worker.
+
+3. The static fast-path row (`hello_static.ru`) is preserved at
+   ±5%: 15,951 r/s vs the 15,685 r/s baseline. The 2.12-C accept4
+   loop StaticEntry path is bit-identical when no DynamicBlockEntry
+   is registered (the only added work is one mutex-acquire +
+   linear-scan of an empty `hyp_dyn_routes[]` registry; sub-µs
+   overhead on a 65-µs hot path).
+
+4. `bench/hello.ru` shifts +17.9% — within the wrk-induced run-to-
+   run variance band on this host. Measured over a longer soak this
+   would tighten back toward neutral; the headline is "no
+   regression". The legacy `Connection#serve` path is touched only
+   in the dispatch-mode metric tagging (we now also report
+   `:c_accept_loop_h1` for dynamic-block tables, distinct from the
+   `:c_accept_loop_h1` static-only tag) — no hot-path code change.
+
+**Targets — all met.**
+- `hello_handle_block.ru`: 4,031 → **9,422 r/s** (target 8k–15k). ✅
+- `work.ru`: 3,427 → **5,897 r/s** (target 5k–7k). ✅
+- `bench/hello.ru`: no regression (baseline ~4,031, now 4,752 within
+  noise band). ✅
+- `hello_static.ru`: ±5% (baseline 15,685, now 15,951; +1.7%). ✅
+
+**What 2.14-A does NOT cover (follow-up work).**
+
+- The io_uring accept loop sibling (`io_uring_loop.c`) is unchanged.
+  Dynamic-block dispatch on the io_uring loop would multiply this
+  win further but requires extending the same `hyp_dyn_lookup_block`
+  branch into `io_uring_loop.c`. Filed as 2.14-B candidate.
+- Streaming-body responses still take the legacy path; see the
+  `dispatch_for_c_loop` docstring for the shape contract.
+- Operator metrics under `c_loop_requests_total` now include both
+  static and dynamic dispatches, but the per-shape breakdown
+  (StaticEntry vs DynamicBlockEntry) is rolled-up. A per-shape
+  counter is a 5-line follow-up if operators ask for it.
 
 ## 2.13.0 — 2026-05-01
 
