@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] - 2.15.0
+## 2.15.0 — 2026-05-02
 
 ### 2.15-A — Fresh bench, README split, CI flake fix
 
