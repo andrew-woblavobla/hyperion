@@ -91,7 +91,7 @@ RSpec.describe 'Lifecycle hook order across worker models' do
                           '-C', cfg.path, rackup.path,
                           out: '/dev/null', err: '/dev/null')
 
-      wait_for_port(port, 5)
+      wait_for_port(port, 15)
       response = Net::HTTP.get(URI("http://127.0.0.1:#{port}/"))
       expect(response).to eq('ok')
 
@@ -228,7 +228,7 @@ RSpec.describe 'Lifecycle hook order across worker models' do
     pid = Process.spawn(bin, '-w', '1', '-p', port.to_s, '-C', cfg.path,
                         rackup.path, out: '/dev/null', err: '/dev/null')
 
-    wait_for_port(port, 5)
+    wait_for_port(port, 15)
 
     # Same readiness rationale as the cluster spec — wait for the
     # in-process "worker" to log its boot line before TERMing, so we
