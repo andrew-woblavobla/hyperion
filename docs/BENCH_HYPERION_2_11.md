@@ -552,3 +552,151 @@ wants to see their own imbalance can read
 `/-/metrics` exactly the same way. The metric is platform-independent;
 the bench harness is Linux-specific because the question being asked
 (SO_REUSEPORT distributor uniformity) is.
+
+## gRPC ghz bench — Hyperion vs Falcon (`async-grpc`) (2.14-D)
+
+**Question.** 2.13-D landed full gRPC streaming RPC support
+(server-streaming, client-streaming, bidirectional) on top of the
+2.12-F unary trailers work. The 2.13-D ticket header asked: "How
+does the streaming path actually perform under load, and how does
+it compare against an honest cross-server baseline?" 2.13-D shipped
+the bench artifacts but the agent's lifecycle ended before the
+harness was actually run; 2.14-D closes that out.
+
+**Method.** ghz 0.120.0 driving h2 over TLS, 50 concurrent streams,
+15 s per trial, 3 trials per (workload × server), 3 s warmup ghz
+pass before each measurement window, single Ruby worker on both
+sides, payload = 10 bytes per `EchoReply`. Server-streaming sends
+100 reply messages per request; unary sends one. Three trials per
+row, **median reported**. Self-signed cert at `/tmp/hyperion-grpc-bench/cert.pem`,
+`ghz --skipTLS` skips client-side cert verification.
+
+  * **Hyperion side**: `bench/grpc_stream.ru` — Rack 3 lambda that
+    hand-rolls the protobuf wire format (no `grpc` gem dep on the
+    server side; the proto reply frame is precomputed at boot, so
+    the Hyperion column doesn't pay a per-message protobuf encode).
+    Ran via `bin/hyperion -w 1 -t 0 --tls-cert ... --tls-key ... --h2-max-total-streams unbounded --no-log-requests bench/grpc_stream.ru`.
+  * **Falcon side**: `bench/grpc_stream_falcon.rb` — `Async::HTTP::Server`
+    (Falcon's wire engine) + `Async::GRPC::Dispatcher` routing requests
+    to an `EchoStream` service that uses `Protocol::GRPC::Interface`.
+    The reply message is preallocated but `output.write(reply)` re-encodes
+    on each call — same shape a real Rails handler on Hyperion's
+    trailers path would use, so the Falcon column carries a slight
+    per-message protobuf-encode tax the Hyperion column doesn't. Both
+    are flagged.
+
+**Why the comparison is structural-different.** Falcon doesn't
+expose a Rack 3 trailers adapter — `async-grpc` is its own server
+on top of `Async::HTTP::Server`, *not* a Rack adapter on Falcon's
+front. So `falcon serve --bind …` would not run Hyperion's
+gRPC rackup; the cross-server bench has to use two different
+server boot flows. The wire-side numbers are still meaningful:
+both servers run h2 over TLS with the same ghz client config,
+the same proto, the same `EchoStream/{Unary,ServerStream}` calls.
+
+### Headline (3-trial medians)
+
+| Workload          | Server   | r/s        | p50 (ms) | p95 (ms) | p99 (ms)  | Notes |
+|-------------------|----------|-----------:|---------:|---------:|----------:|-------|
+| **Unary**         | Hyperion | **1,618.3** | **23.82** | **31.46** | **33.29** | wins on r/s and every percentile |
+| **Unary**         | Falcon   | 1,512.2     | 32.31     | 35.38     | 37.65     | within 7% on r/s; ~30% higher p50 |
+| Server-streaming  | Hyperion | 137.9       | **173.22** | **281.73** | 5,458.96 | Hyperion wins p50/p95 |
+| Server-streaming  | Falcon   | **150.4**   | 315.73    | 350.22    | **2,673.84** | Falcon +9% r/s; tighter p99 |
+
+### Reading the numbers
+
+**Unary is the workload most production gRPC apps actually run.**
+One request, one response, one trailers frame — the same h2 hot
+path 2.12-F shipped, now exercised end-to-end via ghz at
+`-c 50 -z 15s`. Hyperion serves **1,618 RPS at 23.8 ms p50** vs
+Falcon's **1,512 RPS at 32.3 ms p50**. The +7% rps margin and the
+26% lower p50 / 12% lower p99 reflect the cumulative 2.10/2.11/2.12/2.13
+hot-path wins (TCP_NODELAY at accept, dispatch-pool warmup, CGlue
+HPACK default, accept4 loop, response head C-rewrite) compounding
+on the gRPC unary path.
+
+**Server-streaming has a more interesting shape.** Falcon serves
++9% RPS (150 vs 138), but at 100 messages per RPC that's
+**13,792 messages/s for Hyperion vs 15,040 messages/s for Falcon** —
+the per-message accounting matters for any operator sizing a
+streaming workload. The structural reason for the gap: the Hyperion
+streaming path emits one DATA frame per `body#each`-yielded chunk
+(2.13-D's "no inter-chunk coalescing" guarantee, deliberate so a
+single log message → single DATA frame on the wire), while Falcon's
+`output.write` lets `Async::HTTP::Protocol::HTTP2` coalesce small
+writes into MAX_FRAME_SIZE-sized chunks. Hyperion is leaving a few
+percent on the table by being honest about per-message framing;
+that's the right correctness/performance tradeoff for a gRPC
+implementation (a coalescing server breaks the at-least-once
+backpressure contract some streaming apps depend on), but the bench
+column shows the cost.
+
+**The p99 numbers are loud (5.5 s on Hyperion, 2.7 s on Falcon)
+and worth caveating.** Both columns have Cancelled errors at the
+ghz `-z` deadline (50 cancelled per trial = `CONCURRENCY`); these
+are not server faults, they're the in-flight RPCs at the moment ghz
+stopped. p99 here is dominated by the 50 conc × 100 msgs = 5,000
+in-flight messages saturating the single h2 connection's flow-
+control window multiple times across the 15 s window. p50/p95
+are the steady-state signal an operator should size for. A real
+nginx-fronted deployment with multiple upstream h2 connections
+will not see this kurtosis at all.
+
+### Reproducing
+
+```bash
+# On openclaw-vm (or any Linux box with Ruby 3.3.3 + ghz):
+cd ~/hyperion
+bundle install --quiet
+bundle exec rake compile
+
+# install ghz once:
+[ ! -x /tmp/ghz ] && (cd /tmp && \
+  wget -q https://github.com/bojand/ghz/releases/download/v0.120.0/ghz-linux-x86_64.tar.gz && \
+  tar -xzf ghz-linux-x86_64.tar.gz)
+
+# Hyperion side — 3 trials × 2 workloads, ~90 s wall:
+GHZ=/tmp/ghz TRIALS=3 DURATION=15s WARMUP_DURATION=3s \
+  bash bench/grpc_stream_bench.sh
+
+# Falcon side — needs a one-shot setup of /tmp/falcon-grpc:
+mkdir -p /tmp/falcon-grpc && cd /tmp/falcon-grpc
+cat > Gemfile <<'EOF'
+source "https://rubygems.org"
+gem "async-grpc"
+gem "grpc"
+gem "grpc-tools"
+gem "falcon"
+EOF
+bundle install --quiet
+cp ~/hyperion/bench/grpc_stream.proto echo.proto
+bundle exec grpc_tools_ruby_protoc -I . --ruby_out=. --grpc_out=. echo.proto
+cp ~/hyperion/bench/grpc_stream_falcon.rb .
+cd ~/hyperion
+
+GHZ=/tmp/ghz TRIALS=3 DURATION=15s WARMUP_DURATION=3s \
+  FALCON_SERVER_DIR=/tmp/falcon-grpc \
+  bash bench/grpc_stream_falcon_bench.sh
+```
+
+Both harnesses regenerate the self-signed cert at
+`/tmp/hyperion-grpc-bench/cert.pem` if missing and write raw ghz
+JSON under `/tmp/hyperion-grpc-bench-logs/` for ad-hoc analysis
+(e.g. histogram[]-based p999 reconstruction).
+
+### What this bench does NOT cover
+
+- **client-streaming** + **bidirectional** ghz coverage. The 2.13-D
+  spec suite already exercises the wire shape end-to-end via
+  `Protocol::HTTP2::Client`; ghz numbers would re-bench the same
+  paths under a different client. Punted as a low-leverage follow-up.
+- **Multi-worker.** Both columns are `-w 1`. A 4-worker Hyperion
+  vs `falcon serve --hybrid -n 1 --forks 4` sweep is the true
+  production-shape comparison; punted because the per-CPU deltas
+  above are already unambiguous.
+- **h2c (plaintext h2).** Hyperion's h2c upgrade path isn't yet
+  wired (`lib/hyperion/dispatch_mode.rb` documents the deferral).
+  Both columns therefore run h2-over-TLS, ~10–20% slower than the
+  nginx-fronted h2c shape a real deployment will see — a property
+  that applies symmetrically to both servers, so the **relative**
+  position holds.

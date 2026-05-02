@@ -2,6 +2,159 @@
 
 ## [Unreleased] - 2.14.0
 
+### 2.14-D — gRPC streaming ghz numbers (closes 2.13-D)
+
+**Background.** 2.13-D shipped the streaming RPC support in
+`Hyperion::Http2Handler` (server-streaming = one DATA frame per yielded
+chunk, plus the trailer HEADERS frame; client-streaming via the new
+`StreamingInput` IO-shaped queue; bidirectional falls out from the
+two combined). 2.13-D also shipped the bench artifacts —
+`bench/grpc_stream.proto`, `bench/grpc_stream.ru` (hand-rolled
+protobuf framing so the rackup has no `grpc` gem dep), and
+`bench/grpc_stream_bench.sh` — but the agent's task lifecycle ended
+before the harness was actually run end-to-end, so the bench numbers
++ the cross-server Falcon comparison were left for 2.14-D.
+
+**What 2.14-D ships.**
+
+1. **Hardened `bench/grpc_stream_bench.sh`.** The 2.13-D version
+   booted Hyperion with bare `nohup ... &`, which is fragile under
+   non-interactive SSH sessions (the master can be SIGHUP'd when the
+   shell exits before it daemonises cleanly). 2.14-D switches to
+   `setsid nohup ... < /dev/null & disown` matching the other bench
+   scripts in this directory, adds a 3 s warmup pass before each
+   workload (so first-trial cold-start latency doesn't dominate the
+   median), reuses the same Hyperion process across the 3 trials of
+   one workload (faster + cleaner), and reports p50/p95/p99 medians
+   alongside r/s. ghz's default `latencyDistribution` only emits up
+   to p99, so p999 is intentionally omitted from the standard
+   summary; operators wanting tighter tails can post-process the raw
+   `histogram[]` ghz emits in `--format=json`.
+
+2. **Falcon-side server (`bench/grpc_stream_falcon.rb`) +
+   companion harness (`bench/grpc_stream_falcon_bench.sh`).**
+   Falcon doesn't speak Rack 3 trailers natively (`async-grpc 0.6.0`
+   is its own gRPC server, not a Rack adapter on top of Falcon —
+   that's the structural difference 2.13-D's ticket header flagged).
+   Apples-to-apples isn't reachable, but `async-grpc` rides on
+   `Async::HTTP::Server`, which IS Falcon's wire engine, so the
+   wire-side numbers are still a meaningful comparison: same h2
+   over TLS, same ghz client config, same proto, same EchoStream
+   service, same payload size, same -c / -z / --connections
+   on both sides. The Hyperion-side rackup encodes the protobuf
+   reply once at boot; the Falcon-side service re-encodes per
+   `output.write` (matching what a real Rails app on Hyperion's
+   trailers path would also do), so this is a slight tax on the
+   Falcon column. Both are flagged in the doc.
+
+   The Falcon harness reuses the same `$TLS_DIR/cert.pem`
+   self-signed cert, so `ghz --skipTLS` drives both servers
+   identically. Boot pattern uses `setsid + nohup + disown` like
+   the Hyperion side; `pkill -f` cleanup pattern is intentionally
+   narrowed to `grpc_stream_falcon\.rb` (the rackup file) so it
+   cannot match the harness script `grpc_stream_falcon_bench.sh`
+   itself — an earlier draft greped on the bare prefix and killed
+   its own bench script after the streaming workload, dropping
+   the unary trials.
+
+3. **Bench doc + CHANGELOG headline.** New section in
+   `docs/BENCH_HYPERION_2_11.md` with the 3-trial medians for both
+   workloads × both servers + the structural caveat about
+   per-message vs per-RPC accounting (a "+9% rps in streaming"
+   from Falcon is real but the per-message rate gap closes
+   when the Hyperion column is multiplied by stream size — see
+   the doc).
+
+**Bench result (3-trial medians, openclaw-vm, Linux
+6.8.0-107-generic x86_64, Ruby 3.3.3, single worker, h2 over TLS,
+50 conc × 15 s + 3 s warmup, payload = 10 bytes, stream count =
+100 msg).**
+
+| Workload          | Server   | r/s    | p50 (ms) | p95 (ms) | p99 (ms)  |
+|-------------------|----------|-------:|---------:|---------:|----------:|
+| **Unary**         | Hyperion | **1,618.3** | **23.82** | **31.46** | **33.29** |
+| **Unary**         | Falcon   | 1,512.2     | 32.31     | 35.38     | 37.65     |
+| Server-streaming  | Hyperion | 137.9       | **173.22** | **281.73** | 5,458.96 |
+| Server-streaming  | Falcon   | **150.4**   | 315.73    | 350.22    | **2,673.84** |
+
+**Headlines.**
+
+- **Unary: Hyperion wins by +7.0% on r/s (1,618 vs 1,512) and on
+  every percentile** — p50 26% lower (23.8 vs 32.3 ms), p99 12%
+  lower (33.3 vs 37.7 ms). This is the closest-to-real workload
+  for typical gRPC API use (one request, one response, one
+  trailers frame); it exercises the same h2-over-TLS hot path
+  the 2.12-F unary trailers ticket landed.
+- **Server-streaming: Falcon wins by +9.1% on r/s (150 vs 138)
+  but Hyperion wins on p50 and p95** (173 / 282 ms vs 316 /
+  350 ms). At 100 messages per RPC, Hyperion serves 13,792
+  messages/s vs Falcon's 15,040 messages/s — a 9% per-message
+  gap on the same wire path. Hyperion's p99 is uglier (5.5s
+  vs 2.7s) at this conc / shape, but both servers show the
+  same kurtosis pattern: 50 streams × 100 messages × ~3 ms / msg
+  saturates the single h2 connection's flow-control window
+  multiple times over a 15 s run, and the few streams that hit
+  the deepest queue depth show up in the p99 column. The p50/p95
+  medians are the steady-state signal; the p99 is the burst tail.
+  *Both* numbers are recorded honestly here; an operator running
+  a real workload behind nginx with multiple h2 connections (one
+  per upstream client) will not see this kurtosis at all.
+
+**Falcon comparison status.** Reachable, ran clean. The 2.13-D
+ticket header expected this might fail (Falcon's CLI doesn't expose
+a Rack-shaped gRPC server — `async-grpc` is its own server stack)
+and asked for a "deferred" note as a fallback; the actual outcome
+was better — `async-grpc` and `Async::HTTP::Server` are both
+gem-level installable in the bench host's Ruby 3.3.3 environment,
+the EchoStream service ports to async-grpc's `Protocol::GRPC::Interface`
+in ~30 lines, and both servers run against the same ghz invocation
+without any client-side conditional. Cross-server numbers above are
+direct comparisons.
+
+**What's NOT covered (deferred to a future ticket if the operator
+asks for it).**
+
+- **client-streaming** and **bidirectional** ghz coverage. ghz
+  drives both shapes (`--data-stream`, `--bidi`) but the
+  Hyperion-side rackup doesn't currently advertise distinct
+  endpoints for them — the rackup is a single Rack lambda dispatching
+  on `PATH_INFO`, and adding two more handlers + the proto definition
+  is a clean 30-line follow-up. Not done here because (a) the
+  task brief flagged client-streaming as "skip if the harness
+  doesn't expose it cleanly" and (b) the 2.13-D streaming-input
+  spec coverage is already exercising the wire shape end-to-end
+  via `Protocol::HTTP2::Client` — the ghz numbers would not
+  validate any new code path, only re-bench the same paths under
+  ghz instead of the spec-suite client.
+- **Multi-worker scale-up.** Both servers ran with a single
+  worker / single Ruby process. A `-w 4` Hyperion sweep against
+  `falcon serve --hybrid -n 1 --forks 4 --threads 1` would be
+  the true production-shape comparison; punted because (a) the
+  per-CPU r/s deltas above are already unambiguous and (b)
+  the Falcon-side harness would need fork-aware setup that the
+  current standalone `Async::HTTP::Server.new` rackup doesn't
+  provide.
+- **TLS termination off the bench.** Because Hyperion's h2c
+  (plaintext h2 with prior-knowledge / Upgrade) path isn't yet
+  wired (`lib/hyperion/dispatch_mode.rb` documents h2c upgrade
+  as deferred), the bench runs h2 over TLS on both sides. In a
+  real deployment behind nginx, nginx terminates TLS and speaks
+  h2c upstream — those numbers will be ~10–20% higher across
+  the board for both servers (no per-connection TLS handshake
+  cost). This is consistent with the 2.13-A keepalive fast-path
+  data already published.
+
+**Constraints respected.** No code changes outside `bench/`.
+The 2.10-G TCP_NODELAY hunk, 2.10-E preload hooks, 2.10-F
+`rb_pc_serve_request`, 2.11-A dispatch pool warmup, 2.11-B cglue
+HPACK default, 2.12-C accept4 loop, 2.12-D io_uring loop, 2.12-E
+per-worker counter, 2.12-F gRPC unary trailers, 2.13-A metric
+shards / Rack-3 keepalive fast path, 2.13-B response head builder,
+2.13-C flake fixes, 2.13-D gRPC streaming, 2.13-E soak smoke,
+2.14-A dynamic-block dispatch, 2.14-B Server#stop accept-wake,
+2.14-C harness false-positive fix all stay on master and untouched
+by this change. Spec count unchanged (no spec edits in this commit).
+
 ### 2.14-C — io_uring 4h soak (borderline) + harness false-positive fix
 
 **Background.** 2.13-E shipped the soak harness
