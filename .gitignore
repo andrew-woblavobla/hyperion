@@ -27,3 +27,9 @@ keepalive_memory_results/
 
 # autobahn-testsuite reports (generated; recipe in autobahn-config/)
 autobahn-reports/
+
+# Claude Code: kept entirely local (per-developer setup, not shared with the
+# repo). Includes settings, skills cache, agents, hooks, and the project-level
+# memory file.
+.claude/
+CLAUDE.md
