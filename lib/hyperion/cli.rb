@@ -97,8 +97,6 @@ module Hyperion
         Hyperion.logger.info { { message: 'FiberLocal shim installed' } } if Hyperion::FiberLocal.installed?
       end
 
-      app = load_rack_app(rackup)
-      app = wrap_admin_middleware(app, config)
       workers = config.workers.zero? ? Etc.nprocessors : config.workers
 
       # 2.0 default flip (RFC A7): resolve the `h2.max_total_streams`
@@ -107,10 +105,30 @@ module Hyperion
       # (operator-requested unbounded).
       config.finalize!(workers: workers)
 
+      # 2.16 — preload toggle. In preload mode (default) the master
+      # parses config.ru once and workers inherit the loaded app via
+      # copy-on-write. In non-preload mode the master never touches
+      # the app; each worker parses post-fork. The non-preload path
+      # is the documented escape hatch for macOS getaddrinfo+fork
+      # deadlocks; it costs CoW (each worker pays the full boot RSS).
+      preload = config.preload != false
+      if preload
+        app = wrap_admin_middleware(load_rack_app(rackup), config)
+      else
+        app = nil
+        Hyperion.logger.info do
+          { message: 'preload disabled; each worker will parse rackup after fork',
+            rackup: File.expand_path(rackup) }
+        end
+      end
+
       if workers <= 1
+        # Single-mode always preloads — there's no fork to protect from
+        # global state poisoning, so deferring the parse buys nothing.
+        app ||= wrap_admin_middleware(load_rack_app(rackup), config)
         run_single(config, app)
       else
-        run_cluster(config, app, workers)
+        run_cluster(config, app, workers, rackup_path: preload ? nil : File.expand_path(rackup))
       end
     end
 
@@ -258,6 +276,15 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
              'Explicit `--preload-static` dirs still take effect.') do
           cli_opts[:auto_preload_static_disabled] = true
         end
+        # 2.16 — app preload toggle.
+        o.on('--[no-]preload',
+             'Preload the Rack app in the master before fork (default ON). ' \
+             '--no-preload makes each worker parse config.ru post-fork; ' \
+             'needed on macOS when native gems loaded in the master ' \
+             '(anything that touches Network.framework via XPC) ' \
+             'deadlock getaddrinfo in workers post-fork.') do |v|
+          cli_opts[:preload] = v
+        end
         o.on('-h', '--help', 'show help') do
           puts o
           exit 0
@@ -345,20 +372,22 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
       Hyperion.logger.flush_all
     end
 
-    def self.run_cluster(config, app, workers)
+    def self.run_cluster(config, app, workers, rackup_path: nil)
       tls = build_tls_from_config(config)
       Master.new(host: config.host, port: config.port, app: app,
                  workers: workers, tls: tls, thread_count: config.thread_count,
-                 read_timeout: config.read_timeout, config: config).run
+                 read_timeout: config.read_timeout, config: config,
+                 rackup_path: rackup_path).run
     end
 
     # Rack 3's parse_file returns a single app value; Rack 2 returned [app, options].
-    # Normalize so we get just the app either way.
+    # Normalize so we get just the app either way. Used by both the preload
+    # path (master parses once, before fork) and the non-preload path
+    # (each worker parses post-fork) — see Worker#run.
     def self.load_rack_app(path)
       result = ::Rack::Builder.parse_file(path)
       result.is_a?(Array) ? result.first : result
     end
-    private_class_method :load_rack_app
 
     def self.build_tls_from_config(config)
       return nil unless config.tls_cert || config.tls_key
@@ -610,7 +639,6 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
       end
       AdminMiddleware.new(app, token: config.admin.token)
     end
-    private_class_method :wrap_admin_middleware
 
     # Read the admin token from a file on disk. Refuses to load if the file
     # is missing, unreadable, or world-readable — the whole point of using a

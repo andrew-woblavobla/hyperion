@@ -68,10 +68,15 @@ module Hyperion
 
     def initialize(host:, port:, app:, workers: DEFAULT_WORKER_COUNT,
                    read_timeout: Server::DEFAULT_READ_TIMEOUT_SECONDS, tls: nil,
-                   thread_count: Server::DEFAULT_THREAD_COUNT, config: nil)
+                   thread_count: Server::DEFAULT_THREAD_COUNT, config: nil,
+                   rackup_path: nil)
       @host         = host
       @port         = port
       @app          = app
+      # 2.16 — non-preload mode: master holds a path; each worker parses
+      # post-fork. Mutually exclusive with @app (asserted by CLI flow:
+      # exactly one of the two is non-nil).
+      @rackup_path  = rackup_path
       @workers      = workers || Etc.nprocessors
       @read_timeout = read_timeout
       @tls          = tls
@@ -118,7 +123,13 @@ module Hyperion
       # BEFORE we fork. Children inherit the warm memory via copy-on-write
       # so the first batch of requests on each fresh worker doesn't pay
       # the allocation/autoload tax.
-      Hyperion.warmup!
+      #
+      # 2.16: skipped in non-preload mode. The whole point of `preload:
+      # false` is to keep the master's address space free of native-gem
+      # globals (OpenSSL session caches, Network.framework XPC state,
+      # etc.) so workers fork from a clean slate. Warming up here would
+      # re-introduce exactly the state we're trying to avoid.
+      Hyperion.warmup! if @app
 
       # `before_fork` runs ONCE in the master before any worker is forked.
       # Operators use it to close shared resources (DB pools, Redis sockets)
@@ -226,6 +237,10 @@ module Hyperion
         Signal.trap('TERM', 'DEFAULT')
         worker_args = {
           host: @host, port: @port, app: @app,
+          # 2.16 — propagate the deferred rackup path. Worker#run loads
+          # via Hyperion::CLI.load_rack_app + wraps admin middleware
+          # post-fork when @app is nil.
+          rackup_path: @rackup_path,
           read_timeout: @read_timeout, tls: @tls,
           thread_count: @thread_count, config: @config,
           worker_index: worker_index,

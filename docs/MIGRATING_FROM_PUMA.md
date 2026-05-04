@@ -18,22 +18,22 @@ Then translate `config/puma.rb` → `config/hyperion.rb` per the table below.
 
 ## Fiber-cooperative I/O for PG-bound apps
 
-If your app is bottlenecked on Postgres / external HTTP / Redis (not CPU), Hyperion 1.3.0 ships an opt-in mode that decouples concurrency from threads. Set `async_io: true` in your config (or pass `--async-io` on the CLI) and pair with the [hyperion-async-pg](https://github.com/andrew-woblavobla/hyperion-async-pg) companion gem.
+If your app is bottlenecked on Postgres / external HTTP / Redis (not CPU), Hyperion ships an opt-in mode that decouples concurrency from threads. Set `async_io: true` in your config (or pass `--async-io` on the CLI) and pair with the [hyperion-async-pg](https://github.com/andrew-woblavobla/hyperion-async-pg) companion gem.
 
-The bench picture (Ubuntu 24.04, 50 ms `pg_sleep`, 200 concurrent wrk conns):
+Indicative bench picture (Ubuntu 24.04, 50 ms `pg_sleep`, 200 concurrent wrk conns):
 
 - Puma `-t 5` + plain pg pool=5: 56 r/s, p99 3.88 s
 - Puma `-t 30` + plain pg pool=30: 402 r/s, p99 880 ms
 - Puma `-t 100` + plain pg pool=100: 1067 r/s, p99 557 ms
 - Hyperion `--async-io -t 5` + hyperion-async-pg pool=200: **2381 r/s, p99 471 ms**
 
-That's 5.9× Puma's tuned `-t 30` config. The trick: under `--async-io`, the OS-thread count is decoupled from in-flight-query count. Each fiber yields the OS thread on `recv()`; one accept-loop thread serves N concurrent in-flight queries (capped by your DB pool, not by `max_threads`).
+That's ~5.9× Puma's tuned `-t 30` config. The trick: under `--async-io`, the OS-thread count is decoupled from in-flight-query count. Each fiber yields the OS thread on `recv()`; one accept-loop thread serves N concurrent in-flight queries (capped by your DB pool, not by `max_threads`).
 
-Default is **off** so fiber-unaware apps keep 1.2.0's raw-loop fast path. Flip it on only when you've installed `hyperion-async-pg` (or another Async-aware driver) AND a fiber-aware connection pool — see the companion gem's README for the full matrix.
+Default is **off** so fiber-unaware apps keep the raw-loop fast path. Flip it on only when you've installed `hyperion-async-pg` (or another Async-aware driver) AND a fiber-aware connection pool — see the companion gem's README for the full matrix. As of 1.7.0, `--async-io` will hard-fail at boot if no fiber-cooperative I/O library is loaded, and emits an advisory warning if loaded but the rest of the stack isn't fiber-aware.
 
 ## Why migrate
 
-- **ActionCable now works on a single-binary Hyperion deploy** (2.1.0+) — `mount ActionCable.server => '/cable'` runs in the same `hyperion` process as your HTTP/1.1, HTTP/2, and TLS traffic; no separate cable container, no nginx WS upgrade. See [`WEBSOCKETS.md`](WEBSOCKETS.md).
+- **ActionCable runs on a single-binary Hyperion deploy** (since 2.1.0) — `mount ActionCable.server => '/cable'` runs in the same `hyperion` process as your HTTP/1.1, HTTP/2, and TLS traffic; no separate cable container, no nginx WS upgrade. See [`WEBSOCKETS.md`](WEBSOCKETS.md).
 - **Same throughput or better** at parity threads on every Rails workload tested. With access logs default-ON, Hyperion still beats Puma on hello-world (1.27×), production-cluster (1.17×), and Linux DB-backed (~1.02×). With `--no-log-requests` the lead widens.
 - **Structured access logs out of the box** — every request gets a JSON line with method/path/status/duration_ms/remote_addr. No `Rails::Rack::Logger` or `lograge` needed for basic operability.
 - **HTTP/2 + TLS native** — no nginx required just to talk h2 to browsers.
@@ -62,12 +62,15 @@ Default is **off** so fiber-unaware apps keep 1.2.0's raw-loop fast path. Flip i
 | `on_worker_shutdown { |idx| ... }`          | `on_worker_shutdown { |idx| ... }`           | identical API |
 | `worker_timeout 60`                         | `read_timeout 60`                            | per-connection read deadline |
 | `worker_shutdown_timeout 30`                | `graceful_timeout 30`                        | drain window before SIGKILL |
+| `persistent_timeout 5`                      | `idle_keepalive 5`                            | keep-alive idle close (seconds) |
 | `ssl_bind '0.0.0.0', 9443, cert_path: ..., key_path: ...` | `port 9443` + `tls_cert_path` + `tls_key_path` | Hyperion accepts both leaf-only and chain PEM in `tls_cert_path` |
 | `daemonize true`                            | (none — use systemd / Docker)                | |
 | `pidfile '/var/run/puma.pid'`               | (none — use systemd `PIDFile=` or process supervisor) | |
 | `state_path '/var/run/puma.state'`          | (none — `pumactl` not supported) | |
-| `log_requests true`                         | `log_requests true` (default)                 | identical; default ON |
+| `log_requests true`                         | `log_requests true` (default)                 | identical; default ON. CLI: `--no-log-requests` to disable |
 | `quiet true`                                | `log_requests false` + `log_level :warn`     | |
+| `plugin :tmp_restart`                       | (none — use process supervisor / `kill -TERM`) | |
+| `plugin :solid_queue`                       | (none — run Solid Queue / Sidekiq as a separate process) | |
 
 ## Lifecycle hooks (copy-paste safe from Puma)
 
@@ -146,7 +149,7 @@ port          9443
 
 #### Operating Hyperion's HTTP/2 path — `h2.max_total_streams`
 
-Hyperion 2.0.0 ships a per-process HTTP/2 admission cap that defaults to
+Since 2.0.0 Hyperion ships a per-process HTTP/2 admission cap that defaults to
 `max_concurrent_streams × workers × 4` (= 512 streams on a single-worker
 default config). The cap is sized for normal browser traffic — each browser
 connection rarely opens more than ~50–100 multiplexed streams, and the 4×
@@ -167,7 +170,7 @@ end
 ```
 
 ```sh
-# CLI flag — per-invocation override (introduced in 2.2.x fix-D)
+# CLI flag — per-invocation override
 hyperion --h2-max-total-streams 8192 config.ru
 hyperion --h2-max-total-streams unbounded config.ru   # restore 1.x behaviour
 
@@ -210,7 +213,7 @@ is a convenience knob, not a security boundary).
 
 **`bundle install` fails on Ruby 3.2** — Hyperion requires Ruby ≥ 3.3 (transitive `protocol-http2 ~> 0.26` constraint). Upgrade Ruby.
 
-**Logs not visible when piped to a file** — should work as of 1.0.1 (`@out.sync = true`). If not, file an issue.
+**Logs not visible when piped to a file** — should work since 1.0.1 (`@out.sync = true`). If not, file an issue.
 
 **TLS handshake failures with intermediate CA** — make sure your `tls_cert_path` PEM contains both leaf + intermediate(s) concatenated, not just the leaf. Hyperion auto-detects chain certs in the PEM.
 

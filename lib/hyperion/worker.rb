@@ -30,7 +30,8 @@ module Hyperion
                    io_uring: :off,
                    max_in_flight_per_conn: nil,
                    tls_handshake_rate_limit: :unlimited,
-                   preload_static_dirs: nil)
+                   preload_static_dirs: nil,
+                   rackup_path: nil)
       @host                     = host
       @port                     = port
       @app                      = app
@@ -57,6 +58,7 @@ module Hyperion
       @max_in_flight_per_conn            = max_in_flight_per_conn
       @tls_handshake_rate_limit          = tls_handshake_rate_limit
       @preload_static_dirs               = preload_static_dirs
+      @rackup_path                       = rackup_path
     end
 
     def run
@@ -68,6 +70,19 @@ module Hyperion
           worker_index: @worker_index,
           url: "#{scheme}://#{@host}:#{@port}"
         }
+      end
+
+      # 2.16 — non-preload mode: master never loaded the Rack app, so we
+      # parse it here, post-fork. Native gems load against THIS process's
+      # address space, not the master's, which avoids the macOS
+      # Network.framework + fork getaddrinfo deadlock (where post-fork
+      # XPC peers are wedged forever in `nw_path_evaluator_evaluate`).
+      if @app.nil? && @rackup_path
+        require_relative 'cli'
+        @app = ::Hyperion::CLI.wrap_admin_middleware(
+          ::Hyperion::CLI.load_rack_app(@rackup_path),
+          @config
+        )
       end
 
       server = Server.new(host: @host, port: @port, app: @app,

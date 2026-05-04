@@ -71,7 +71,25 @@ module Hyperion
       # the `--no-preload-static` CLI flag; lets operators turn off
       # auto-warming on a Rails app while still keeping the option to
       # configure explicit dirs via `preload_static`.
-      auto_preload_static_disabled: false
+      auto_preload_static_disabled: false,
+      # 2.16: app preload toggle. When true (default) the master loads
+      # `config.ru` once before forking — workers inherit the loaded app
+      # via copy-on-write, the canonical Hyperion model. When false, the
+      # master stays a thin supervisor and each worker parses `config.ru`
+      # itself post-fork. Mirrors Puma's `preload_app! false` mode.
+      #
+      # The non-preload mode is the documented escape hatch for macOS
+      # workloads where loading native gems in the master (anything that
+      # initializes Network.framework / CoreFoundation via XPC) leaves
+      # the post-fork resolver in a deadlocked state — `getaddrinfo`
+      # hangs forever in `nw_path_evaluator_evaluate`. Setting `preload
+      # false` keeps the master's address space free of those globals so
+      # workers fork from a clean slate.
+      #
+      # Trade-off: each worker pays the boot cost (CPU + RSS) on its own,
+      # so steady-state RSS is N× higher and worker boot is slower. Linux
+      # users should leave this true.
+      preload: true
     }.freeze
 
     HOOKS = %i[before_fork on_worker_boot on_worker_shutdown].freeze
