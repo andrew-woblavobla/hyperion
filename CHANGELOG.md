@@ -1,5 +1,68 @@
 # Changelog
 
+## 2.16.0 — 2026-05-04
+
+### 2.16-A — `preload false`: macOS fork+resolver escape hatch
+
+**Why.** On macOS, Hyperion's "always preload" model deadlocks
+post-fork DNS resolution for any deployment whose master process
+ends up touching `Network.framework` — typically through native
+gems loaded transitively via `Bundler.require` (OpenSSL session
+caches, observability agents, Foundation-backed clients). The
+master's `Network.framework` path evaluator initializes against XPC
+peers in `mDNSResponder`; after `fork()` those XPC connections are
+invalid in the workers, and the next `getaddrinfo` call hangs
+forever inside `nw_path_evaluator_evaluate` →
+`nw_nat64_v4_address_requires_synthesis`. The symptom: workers
+spin at 99% CPU, requests TCP-connect but never get a response,
+no per-request log line ever fires.
+`OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES` does not help — that
+flag only covers Foundation / Obj-C runtime init, not
+`Network.framework`.
+
+The reason Puma users don't hit this: Puma without explicit
+`preload_app! true` runs in non-preload mode, so the master is a
+thin supervisor and each worker loads the Rack app post-fork
+against a clean process. Hyperion shipped no such option — preload
+was the only mode.
+
+**What 2.16-A ships.**
+
+1. **`preload` config field** (default `true` to preserve current
+   behaviour). When `preload false` is set in `config/hyperion.rb`
+   or `--no-preload` is passed on the CLI, the master never loads
+   `config.ru` and never calls `Hyperion.warmup!`. Each worker
+   parses the rackup itself post-fork via the same
+   `Hyperion::CLI.load_rack_app` path the master used to use; the
+   admin middleware wrap is preserved per-worker. `--preload` is
+   the inverse for argv overrides.
+
+2. **Single-worker mode is exempt.** With `workers <= 1` there is
+   no fork to protect against, so `run_single` always loads the
+   app in-process — deferring the parse buys nothing and would
+   surface lifecycle hooks against an unloaded app.
+
+3. **Master/Worker plumbing.** `Master.new` gains a `rackup_path:`
+   kwarg; `Worker.new` mirrors it and lazy-parses if `@app` is
+   `nil` and a path was provided. Both keep their existing
+   contract for the preload path (master receives `app:`, workers
+   inherit via fork).
+
+**Trade-off.** Non-preload loses copy-on-write — each worker pays
+the full Rails-boot RSS independently. Steady-state memory is N×
+higher and worker boot is slower. The escape hatch is meant for
+operators who hit the macOS deadlock; Linux users should leave it
+at the default (`preload true`).
+
+**Verification.**
+
+- `bin/check` green (81 examples, 0 failures).
+- Hand-reproduced against a Rails 8.1 application with a typical
+  native-gem stack (OpenSSL, observability agent, multi-A-record
+  DNS host for the database). Without `preload false`: deadlock
+  reproduces deterministically; CPU pegs at 99% per worker; curl
+  times out. With `preload false`: requests return promptly.
+
 ## 2.15.0 — 2026-05-02
 
 ### 2.15-A — Fresh bench, README split, CI flake fix
