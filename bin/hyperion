@@ -1,14 +1,31 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# 2.16.1 — macOS fork-safety. The Obj-C runtime's post-fork sanity check
-# crashes any worker that touches a Foundation class which was mid-init
-# in the master at fork time (e.g. NSCharacterSet, common as a side-effect
-# of OpenSSL / system-resolver loads). The escape hatch is the env var
-# below; it must be set before Foundation classes load. Set on darwin
-# unconditionally — no-op elsewhere. `||=` so an operator who has set
-# it explicitly (e.g. to `NO`) is honoured.
-ENV['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] ||= 'YES' if RUBY_PLATFORM.include?('darwin')
+# 2.16.2 — macOS fork-safety. The Obj-C runtime caches the value of
+# `OBJC_DISABLE_INITIALIZE_FORK_SAFETY` at dyld init time, BEFORE any
+# Ruby code runs. Setting `ENV[...]` from Ruby is observable to
+# `Process.fork`'s child via inheritance, but the runtime's own
+# fork-safety check has already locked in its decision based on the
+# env it saw at process launch. So a Ruby-side `ENV[...] = 'YES'`
+# does not stop the post-fork crash:
+#   "+[NSCharacterSet initialize] may have been in progress in another
+#    thread when fork() was called. We cannot safely call it or ignore
+#    it in the fork() child process. Crashing instead."
+#
+# The reliable way to get the var into dyld's view is to re-exec the
+# Ruby process with it set. Once the new process starts, dyld picks
+# up the env var and the runtime's fork-safety check honours it.
+# `exec` replaces the current image so the wrapper shell call (e.g.
+# `bundle exec hyperion …`) sees a single child process and a single
+# exit status — no double accounting from the operator's side.
+#
+# Operators who've already set the var explicitly (in their shell, in
+# Foreman's .env load, in a Dockerfile ENV) skip this re-exec — we
+# only re-exec when the var is unset.
+if RUBY_PLATFORM.include?('darwin') && ENV['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'].nil?
+  ENV['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
+  exec(RbConfig.ruby, __FILE__, *ARGV)
+end
 
 $LOAD_PATH.unshift(File.expand_path('../lib', __dir__))
 require 'hyperion/cli'
