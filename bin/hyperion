@@ -1,6 +1,15 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+# 2.16.1 — macOS fork-safety. The Obj-C runtime's post-fork sanity check
+# crashes any worker that touches a Foundation class which was mid-init
+# in the master at fork time (e.g. NSCharacterSet, common as a side-effect
+# of OpenSSL / system-resolver loads). The escape hatch is the env var
+# below; it must be set before Foundation classes load. Set on darwin
+# unconditionally — no-op elsewhere. `||=` so an operator who has set
+# it explicitly (e.g. to `NO`) is honoured.
+ENV['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] ||= 'YES' if RUBY_PLATFORM.include?('darwin')
+
 $LOAD_PATH.unshift(File.expand_path('../lib', __dir__))
 require 'hyperion/cli'
 Hyperion::CLI.run(ARGV)
