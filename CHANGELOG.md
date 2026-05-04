@@ -1,5 +1,54 @@
 # Changelog
 
+## 2.16.2 — 2026-05-04
+
+### 2.16.2-A — macOS Obj-C fork-safety: re-exec, not just ENV write
+
+**Why.** 2.16.1's `ENV['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] ||= 'YES'`
+in `bin/hyperion` and `lib/hyperion.rb` did not actually stop the
+crash. The Obj-C runtime caches that env var's value at **dyld init**
+— before any Ruby code runs. By the time `bin/hyperion`'s first
+line executes, the runtime has already decided whether the post-fork
+check fires. Setting the var from Ruby is observable to `ENV.fetch`
+and inherited by `Process.fork` children via the kernel's env
+duplication, but the Obj-C runtime's own check ignores the late
+write. Workers continued to crash on `+[NSCharacterSet initialize]`
+in fork children after a 2.16.1 master spawned them.
+
+**What 2.16.2-A ships.** `bin/hyperion` now **re-execs itself** with
+the env var set when launched on `darwin` without it:
+
+```ruby
+if RUBY_PLATFORM.include?('darwin') && ENV['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'].nil?
+  ENV['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
+  exec(RbConfig.ruby, __FILE__, *ARGV)
+end
+```
+
+`exec` replaces the current process image; dyld of the new image
+reads `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES` from the inherited
+environment and the runtime's fork-safety check honours it for the
+master and every worker forked from it. Operators who have already
+set the var explicitly (shell export, Foreman's `.env` load,
+Dockerfile `ENV`) skip the re-exec — the `nil?` guard preserves
+deliberate `=NO` settings if anyone has a reason for those. The
+operator-facing shell call (`bundle exec hyperion …`) sees a single
+child and a single exit status; the re-exec is invisible.
+
+`lib/hyperion.rb`'s 2.16.1 `ENV ||=` line is removed: it was
+misleading (couldn't work for the current process anyway).
+Programmatic users embedding Hyperion via `require 'hyperion'`
+without `bin/hyperion` on macOS must set the env var themselves in
+the shell or wrapper before launching Ruby — same as before 2.16.1.
+
+**Verification.**
+
+- `bin/check` green.
+- Fresh `bundle exec hyperion -C config/hyperion.rb config.ru` against
+  the same Rails 8.1 app that reproduced the 2.16.1 crash loop:
+  master + workers boot cleanly; no `NSCharacterSet`-init crash; no
+  worker respawn churn; sequential curls return 200 OK.
+
 ## 2.16.1 — 2026-05-04
 
 ### 2.16.1-A — macOS Obj-C fork-safety guard
