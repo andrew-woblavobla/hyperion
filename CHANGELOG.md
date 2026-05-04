@@ -1,5 +1,50 @@
 # Changelog
 
+## 2.16.1 — 2026-05-04
+
+### 2.16.1-A — macOS Obj-C fork-safety guard
+
+**Why.** Operators landing on 2.16.0's `preload false` mode on macOS
+were still hitting a second fork+macOS crash, distinct from the
+Network.framework deadlock that 2.16.0 addressed. The Obj-C runtime's
+post-fork sanity check trips when a worker touches a Foundation
+class that was mid-initialization in the master at fork time:
+
+```
+objc[…]: +[NSCharacterSet initialize] may have been in progress in
+another thread when fork() was called. We cannot safely call it or
+ignore it in the fork() child process. Crashing instead.
+```
+
+`NSCharacterSet` (and friends) load transitively through OpenSSL,
+the system resolver, and several other native gems. The result with
+many workers (`WEB_CONCURRENCY=0` on a multi-core box): every fresh
+worker crashes on first Foundation touch, master respawns, ad
+infinitum until graceful_timeout fires.
+
+The escape hatch on macOS is the documented env var
+`OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`, but it MUST be in the
+process environment before any Foundation class loads — setting it
+from `config/hyperion.rb` (parsed after gems load) is too late.
+
+**What 2.16.1-A ships.** `bin/hyperion` and `lib/hyperion.rb` set
+`ENV['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] ||= 'YES'` on `darwin`
+unconditionally — before any `require` brings in Foundation-touching
+code. `||=` honours operators who've set the var explicitly. No-op
+on Linux/BSD; affects only macOS.
+
+This is a defense-in-depth change, complementary to `preload false`:
+`preload false` keeps Network.framework's resolver state out of the
+master; this guard keeps Obj-C runtime fork-checks from crashing
+the workers when something else (OpenSSL etc.) still touches
+Foundation. Together they make the macOS dev experience match Linux.
+
+**Verification.**
+
+- `bin/check` green.
+- Hand-reproduced the `NSCharacterSet` worker-crash loop on macOS;
+  no longer reproduces in 2.16.1.
+
 ## 2.16.0 — 2026-05-04
 
 ### 2.16-A — `preload false`: macOS fork+resolver escape hatch

@@ -1,5 +1,15 @@
 # frozen_string_literal: true
 
+# 2.16.1 — macOS fork-safety. Mirrors the guard at the top of
+# `bin/hyperion` so programmatic `require 'hyperion'` (specs,
+# embedded uses) gets the same workaround. The Obj-C runtime's
+# post-fork check crashes workers that touch a Foundation class
+# which was mid-init in the master at fork time (NSCharacterSet
+# is a frequent victim — it loads transitively via OpenSSL / system
+# resolver paths). `||=` so an operator who has set the var
+# explicitly is honoured. No-op on non-darwin platforms.
+ENV['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] ||= 'YES' if RUBY_PLATFORM.include?('darwin')
+
 require_relative 'hyperion/version'
 require_relative 'hyperion/logger'
 require_relative 'hyperion/metrics'
