@@ -1,28 +1,22 @@
 # frozen_string_literal: true
 
-# 2.10-A — Agoo boot wrapper.
-#
-# Agoo's CLI doesn't accept a Rack rackup directly, so the
-# 4-way harness shells into this script to get an apples-to-
-# apples Rack request flow against the same hello.ru / etc.
-# rackups the other three servers run.
+# 2.10-A — Agoo boot wrapper, with SO_REUSEPORT multi-worker mode.
 #
 # Usage:
-#   ruby bench/agoo_boot.rb [rackup_path] [port] [thread_count]
+#   ruby bench/agoo_boot.rb [rackup] [port] [thread_count] [workers]
 #
-# Defaults: hello.ru, 9810, 5 threads — matching the harness's
-# -t 5 -w 1 budget for the other three servers.
+# Defaults: bench/hello.ru, 9810, 5 threads, 1 worker.
 #
-# Notes:
-# * Agoo::Server.handle_not_found(app) makes the parsed Rack
-#   builder the catch-all handler. Agoo will service its own
-#   pre-built response cache for any explicitly registered
-#   routes (none here), then fall through to the Rack app for
-#   everything else — that's exactly the path the harness wants
-#   to measure (Agoo's pure-C HTTP core delivering a Rack
-#   response back to the client).
-# * Agoo logging is silenced (console=false, all states off);
-#   we don't want the bench wall-clock to include log churn.
+# When workers > 1, the main process forks `workers` children. Each
+# child runs in single-worker mode and binds the same port via
+# Linux SO_REUSEPORT (Agoo enables this by default on Linux). On
+# macOS the kernel only delivers connections to the most-recently-
+# bound socket, so the multi-worker mode is Linux-only practically;
+# on macOS the children will start but only one will receive load.
+#
+# The parent forwards SIGINT/SIGTERM to the children and waits for
+# them to exit so a single Ctrl-C / `kill PID` cleans the whole
+# process group.
 
 require 'agoo'
 require 'rack'
@@ -30,6 +24,28 @@ require 'rack'
 rackup_path  = ARGV[0] || 'bench/hello.ru'
 port         = (ARGV[1] || 9810).to_i
 thread_count = (ARGV[2] || 5).to_i
+workers      = (ARGV[3] || 1).to_i
+
+if workers > 1
+  child_pids = []
+  workers.times do
+    pid = fork do
+      # Re-exec ourselves in single-worker mode. Easier than re-binding
+      # the listener inside the same process.
+      exec RbConfig.ruby, __FILE__, rackup_path, port.to_s, thread_count.to_s, '1'
+    end
+    child_pids << pid
+  end
+  shutdown = false
+  %w[INT TERM].each do |sig|
+    trap(sig) do
+      shutdown = true
+      child_pids.each { |pid| Process.kill(sig, pid) rescue nil }
+    end
+  end
+  child_pids.each { |pid| Process.waitpid(pid) rescue nil }
+  exit 0
+end
 
 Agoo::Log.configure(
   dir: '',
@@ -39,17 +55,6 @@ Agoo::Log.configure(
   states: { INFO: false, DEBUG: false, request: false, response: false, error: true }
 )
 
-# Agoo's server-thread model:
-#   thread_count: 0  -> Server.start blocks on the current thread
-#                       (current thread runs the I/O loop directly).
-#   thread_count: N  -> Server.start spawns N worker threads and
-#                       RETURNS — the caller must keep the main
-#                       thread alive itself, otherwise the process
-#                       exits and nothing is listening.
-#
-# To match the harness's -t 5 budget AND keep the process alive,
-# we spawn 5 worker threads (thread_count: 5) and then sleep the
-# main thread on a Queue#pop. SIGINT / SIGTERM unblock it.
 Agoo::Server.init(port, '.', thread_count: thread_count)
 
 app, _options = Rack::Builder.parse_file(rackup_path)

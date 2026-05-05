@@ -199,9 +199,9 @@ boot_falcon() {
   PID=$!
 }
 boot_agoo() {
-  local rackup="$1"
-  echo "[agoo] boot: bundle exec ruby bench/agoo_boot.rb $rackup $PORT 5"
-  setsid nohup bundle exec ruby bench/agoo_boot.rb "$rackup" "$PORT" 5 \
+  local rackup="$1" workers="${2:-1}"
+  echo "[agoo] boot: bundle exec ruby bench/agoo_boot.rb $rackup $PORT 5 $workers"
+  setsid nohup bundle exec ruby bench/agoo_boot.rb "$rackup" "$PORT" 5 "$workers" \
     > "/tmp/2.15-bench-agoo.log" 2>&1 < /dev/null &
   PID=$!
 }
