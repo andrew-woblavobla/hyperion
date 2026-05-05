@@ -198,10 +198,11 @@ mod linux_impl {
         /// counter.  No syscall is required — the kernel polls the tail in
         /// shared memory.
         pub fn release(&self, buf_id: u16) {
-            // Compute the slot index: wrap into [0, n_bufs).
-            // We use the shadow tail so we don't have to read ring[0].resv
-            // (which the kernel may update concurrently in future SQPOLL designs).
-            let shadow_tail = self.tail.fetch_add(1, Ordering::AcqRel);
+            // Shadow tail is purely local state under the GVL; Relaxed is
+            // sufficient. The cross-domain ordering with the kernel is
+            // enforced by the explicit Release fence below before the
+            // tail-pointer store.
+            let shadow_tail = self.tail.fetch_add(1, Ordering::Relaxed);
             let slot = (shadow_tail as usize) & (self.n_bufs as usize - 1);
 
             // Re-publish the buffer at the slot.
@@ -214,13 +215,20 @@ mod linux_impl {
                 entry.set_bid(buf_id);
             }
 
-            // Write the new tail into ring[0].resv with a memory barrier so
-            // the entry writes above are visible before the kernel observes
-            // the tail increment.
+            // Store-Release barrier: the slot writes above MUST be visible
+            // to the kernel before the tail increment is. write_volatile
+            // alone is not a barrier on ARM (DMB ST is needed); on x86 TSO
+            // makes this redundant but the fence is free there. Without
+            // this fence, ARM kernels could observe the tail increment
+            // before the slot writes and pick up stale buffer pointers.
+            // Mirrors liburing's io_uring_buf_ring_advance which uses
+            // smp_store_release on the tail.
+            std::sync::atomic::fence(Ordering::Release);
             // SAFETY: ring_ptr is valid; tail() points to ring[0].resv.
             unsafe {
                 let tail_ptr = BufRingEntry::tail(self.ring_ptr) as *mut u16;
-                // Use wrapping_add to handle u16 overflow correctly.
+                // wrapping_add handles u16 overflow correctly (the kernel
+                // also uses wrapping arithmetic on this counter).
                 tail_ptr.write_volatile(shadow_tail.wrapping_add(1));
             }
         }
@@ -233,16 +241,27 @@ mod linux_impl {
 
     impl Drop for BufferRing {
         fn drop(&mut self) {
-            // Backing allocation first (no kernel interaction needed).
-            // SAFETY: backing_ptr and backing_layout are valid and were
-            // allocated with the global allocator.
+            // CRITICAL CONTRACT for HotpathRing (Task 2.1.3):
+            //
+            // Before this Drop runs, the owner MUST have called
+            // `ring.submitter().unregister_buf_ring(self.group_id)` on the
+            // associated IoUring, OR have dropped the IoUring (which closes
+            // the ring fd and tears down the registration kernel-side).
+            //
+            // Otherwise the kernel retains a registration pointing to the
+            // memory we are about to free, and the next multishot recv CQE
+            // can write into freed userspace memory — a kernel-side
+            // use-after-free, NOT a benign leak.
+            //
+            // HotpathRing's own Drop impl must enforce the order:
+            //   1. unregister_buf_ring(group_id)
+            //   2. drop(BufferRing)        ← this Drop runs here
+            //   3. drop(IoUring)
+            //
+            // SAFETY: backing_ptr / ring_ptr / *_layout are valid; the
+            // owner has guaranteed (per contract above) that the kernel
+            // is no longer accessing this memory.
             unsafe { dealloc(self.backing_ptr, self.backing_layout) };
-            // Ring allocation.  By the time Drop runs, the caller (HotpathRing)
-            // must have already called unregister_buf_ring on the IoUring
-            // submitter, or the IoUring itself has been dropped.  We free the
-            // memory regardless — a stale kernel registration pointing to freed
-            // memory is less dangerous than a leak.
-            // SAFETY: ring_ptr and ring_layout are valid.
             unsafe { dealloc(self.ring_ptr as *mut u8, self.ring_layout) };
         }
     }
