@@ -15,6 +15,7 @@ require 'mkmf'
 # is available (the C source raises NotImplementedError at call time).
 $srcs = %w[
   parser.c
+  response_writer.c
   sendfile.c
   page_cache.c
   io_uring_loop.c
@@ -36,6 +37,14 @@ $CFLAGS << ' -O2 -fno-strict-aliasing'
 have_header('sys/sendfile.h') # Linux: sendfile64
 have_header('sys/uio.h')      # BSD/Darwin sendfile + Linux iovec plumbing
 have_header('sys/socket.h')
+
+# Plan #1 (perf roadmap) — direct-syscall response writer probes.
+# All POSIX-shaped; on macOS MSG_NOSIGNAL doesn't exist so the C
+# source falls back to writev with #ifdef MSG_NOSIGNAL guards.
+have_func('writev', 'sys/uio.h')
+have_func('sendmsg', 'sys/socket.h')
+have_macro('MSG_NOSIGNAL', 'sys/socket.h')
+have_macro('TCP_CORK', 'netinet/tcp.h')
 
 # 2.4-A: h2_codec_glue.c calls dlopen/dlsym to wire the Rust HPACK
 # cdylib without going through Fiddle on the per-call hot path. macOS

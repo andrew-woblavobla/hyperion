@@ -1722,4 +1722,8 @@ void Init_hyperion_http(void) {
      * fail-fast crash here would break parser.c entirely. */
     extern void Init_hyperion_h2_codec_glue(void);
     Init_hyperion_h2_codec_glue();
+
+    /* Plan #1 (perf roadmap) — Hyperion::Http::ResponseWriter. */
+    extern void Init_hyperion_response_writer(void);
+    Init_hyperion_response_writer();
 }
