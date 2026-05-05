@@ -23,7 +23,7 @@ gem 'rack',   '~> 3.0'
 # matches what `rails new --database=sqlite3` produces. SQLite is used
 # in `mode=memory&cache=shared` mode so the AR-CRUD row doesn't touch
 # disk but all Rails connection-pool threads see the same DB.
-gem 'rails',   '~> 8.0'
+gem 'rails',   '~> 8.0.0'
 gem 'sqlite3', '~> 2.0'
 
 gem 'puma',   '~> 8.0'
