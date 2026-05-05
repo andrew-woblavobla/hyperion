@@ -568,9 +568,10 @@ typedef struct {
     /* Two-word key: input key VALUE bits + value VALUE bits. */
     VALUE key_v;
     VALUE val_v;
-    VALUE line;     /* "<lc-key>: <value>\r\n" buffer */
+    VALUE line;        /* "<lc-key>: <value>\r\n" buffer */
     long  line_len;
-    int   is_date;  /* 1 if lc-key == "date" — caller skips the date tail */
+    int   is_date;     /* 1 if lc-key == "date" — caller skips the date tail */
+    int   is_framing;  /* 1 if lc-key == "transfer-encoding" — skip in chunked mode */
 } header_line_cache_entry_t;
 
 static st_table *g_header_line_cache = NULL;
@@ -601,7 +602,7 @@ static const struct st_hash_type header_line_cache_type = {
  * and st_insert. */
 static const header_line_cache_entry_t *header_line_cache_lookup(VALUE key, VALUE val) {
     if (g_header_line_cache == NULL) return NULL;
-    header_line_cache_entry_t probe = { key, val, Qnil, 0, 0 };
+    header_line_cache_entry_t probe = { key, val, Qnil, 0, 0, 0 };
     st_data_t found_data;
     if (st_lookup(g_header_line_cache, (st_data_t)&probe, &found_data)) {
         return (const header_line_cache_entry_t *)found_data;
@@ -664,6 +665,8 @@ static const header_key_cache_entry_t *header_key_cache_lookup(VALUE key_v) {
 typedef struct {
     VALUE buf;
     int has_date;
+    int is_chunked;  /* 1 → skip content-length + transfer-encoding from user headers;
+                      *     emit transfer-encoding: chunked instead (set by sentinel -1). */
 } build_head_state_t;
 
 static int build_head_each(VALUE k, VALUE v, VALUE arg) {
@@ -671,11 +674,16 @@ static int build_head_each(VALUE k, VALUE v, VALUE arg) {
 
     /* Full-line cache fast path: BOTH key AND value are frozen-literal
      * Strings AND the (key, value) pair is already cached. ONE rb_str_cat
-     * consumes the entire prebuilt "<lc-key>: <value>\r\n" line. */
+     * consumes the entire prebuilt "<lc-key>: <value>\r\n" line.
+     * In chunked mode, skip any framing headers (transfer-encoding) that
+     * may have been cached from a previous non-chunked call on the same
+     * connection. content-length is never in the cache because the slow
+     * path drops it before the cache-populate step. */
     if (TYPE(k) == T_STRING && TYPE(v) == T_STRING &&
         OBJ_FROZEN_RAW(k) && OBJ_FROZEN_RAW(v)) {
         const header_line_cache_entry_t *line_e = header_line_cache_lookup(k, v);
         if (line_e != NULL) {
+            if (st->is_chunked && line_e->is_framing) return ST_CONTINUE;
             rb_str_cat(st->buf, RSTRING_PTR(line_e->line), line_e->line_len);
             if (line_e->is_date) st->has_date = 1;
             return ST_CONTINUE;
@@ -717,9 +725,14 @@ static int build_head_each(VALUE k, VALUE v, VALUE arg) {
     }
 
     /* Drop user-supplied content-length / connection — we always set
-     * these unconditionally below. */
+     * these unconditionally below.
+     * In chunked mode also drop transfer-encoding — we emit our own
+     * "transfer-encoding: chunked\r\n" (RFC 7230 §3.3.3: content-length
+     * and transfer-encoding are mutually exclusive). */
     if (lc_len == 14 && memcmp(lc_ptr, "content-length", 14) == 0) return ST_CONTINUE;
     if (lc_len == 10 && memcmp(lc_ptr, "connection", 10) == 0)     return ST_CONTINUE;
+    if (st->is_chunked &&
+        lc_len == 17 && memcmp(lc_ptr, "transfer-encoding", 17) == 0) return ST_CONTINUE;
 
     if (lc_len == 4 && memcmp(lc_ptr, "date", 4) == 0) st->has_date = 1;
 
@@ -733,7 +746,8 @@ static int build_head_each(VALUE k, VALUE v, VALUE arg) {
     rb_str_cat(st->buf, "\r\n", 2);
 
     /* Populate the line cache for next time when both sides are frozen
-     * literals and we have room. */
+     * literals and we have room. Mark transfer-encoding entries as
+     * is_framing so the full-line fast path can skip them in chunked mode. */
     if (g_header_line_cache != NULL &&
         TYPE(k) == T_STRING && TYPE(v) == T_STRING &&
         OBJ_FROZEN_RAW(k) && OBJ_FROZEN_RAW(v) &&
@@ -747,11 +761,12 @@ static int build_head_each(VALUE k, VALUE v, VALUE arg) {
         rb_obj_freeze(line);
 
         header_line_cache_entry_t *ne = ALLOC(header_line_cache_entry_t);
-        ne->key_v    = k;
-        ne->val_v    = v;
-        ne->line     = line;
-        ne->line_len = line_len;
-        ne->is_date  = (lc_len == 4 && memcmp(lc_ptr, "date", 4) == 0) ? 1 : 0;
+        ne->key_v      = k;
+        ne->val_v      = v;
+        ne->line       = line;
+        ne->line_len   = line_len;
+        ne->is_date    = (lc_len == 4  && memcmp(lc_ptr, "date", 4) == 0) ? 1 : 0;
+        ne->is_framing = (lc_len == 17 && memcmp(lc_ptr, "transfer-encoding", 17) == 0) ? 1 : 0;
 
         rb_ary_push(rb_aHeaderLineAnchor, k);
         rb_ary_push(rb_aHeaderLineAnchor, v);
@@ -811,6 +826,13 @@ static VALUE cbuild_response_head(VALUE self, VALUE rb_status, VALUE rb_reason,
     long body_size = NUM2LONG(rb_body_size);
     int keep_alive = RTEST(rb_keep_alive);
 
+    /* body_size == -1 is the chunked-encoding sentinel (from
+     * hyperion_build_response_head_chunked).  In this mode we emit
+     * "transfer-encoding: chunked\r\n" instead of "content-length: N\r\n"
+     * and suppress any user-supplied content-length / transfer-encoding
+     * headers (RFC 7230 §3.3.3 — they are mutually exclusive). */
+    int is_chunked = (body_size == -1);
+
     /* Most heads fit in 1 KiB; rb_str_cat grows on demand. */
     VALUE buf = rb_str_buf_new(1024);
 
@@ -831,18 +853,25 @@ static VALUE cbuild_response_head(VALUE self, VALUE rb_status, VALUE rb_reason,
 
     /* Iterate user headers — lowercase key, validate value, skip framing.
      * Threaded through rb_hash_foreach so we can reuse the per-key
-     * downcase cache and skip the per-call `keys` Array allocation. */
-    build_head_state_t state = { buf, 0 };
+     * downcase cache and skip the per-call `keys` Array allocation.
+     * is_chunked is threaded through state so build_head_each can drop
+     * user-supplied transfer-encoding and content-length in chunked mode. */
+    build_head_state_t state = { buf, 0, is_chunked };
     rb_hash_foreach(rb_headers, build_head_each, (VALUE)&state);
 
-    /* Framing headers — always emitted. content-length uses a hand-rolled
-     * itoa rather than snprintf (vfprintf was 1 % of CPU on the
-     * CPU-JSON profile). */
-    char itoa_scratch[24];
-    int cl_off = itoa_positive_decimal(body_size, itoa_scratch, (int)sizeof(itoa_scratch));
-    rb_str_cat(buf, "content-length: ", 16);
-    rb_str_cat(buf, itoa_scratch + cl_off, sizeof(itoa_scratch) - cl_off);
-    rb_str_cat(buf, "\r\n", 2);
+    /* Framing headers — always emitted.
+     * Non-chunked: content-length uses a hand-rolled itoa rather than
+     *   snprintf (vfprintf was 1 % of CPU on the CPU-JSON profile).
+     * Chunked: transfer-encoding: chunked (no content-length — RFC 7230 §3.3.3). */
+    if (is_chunked) {
+        rb_str_cat(buf, "transfer-encoding: chunked\r\n", 28);
+    } else {
+        char itoa_scratch[24];
+        int cl_off = itoa_positive_decimal(body_size, itoa_scratch, (int)sizeof(itoa_scratch));
+        rb_str_cat(buf, "content-length: ", 16);
+        rb_str_cat(buf, itoa_scratch + cl_off, sizeof(itoa_scratch) - cl_off);
+        rb_str_cat(buf, "\r\n", 2);
+    }
 
     if (keep_alive) {
         rb_str_cat(buf, "connection: keep-alive\r\n", 24);
@@ -860,6 +889,34 @@ static VALUE cbuild_response_head(VALUE self, VALUE rb_status, VALUE rb_reason,
     rb_str_cat(buf, "\r\n", 2);
 
     return buf;
+}
+
+/* response_writer.h surface — called from response_writer.c to reuse the
+ * head-build logic without going through Ruby method dispatch on the hot path.
+ * Both wrappers delegate directly to cbuild_response_head; they are NOT static
+ * so the linker can resolve them from response_writer.c in the same .bundle. */
+
+/* hyperion_build_response_head — non-chunked path.
+ * Calling convention matches the Ruby-side method:
+ *   status / reason / headers / body_size / keep_alive / date_str. */
+VALUE hyperion_build_response_head(VALUE status, VALUE reason, VALUE headers,
+                                   VALUE body_size, VALUE keep_alive,
+                                   VALUE date_str) {
+    return cbuild_response_head(Qnil, status, reason, headers,
+                                body_size, keep_alive, date_str);
+}
+
+/* hyperion_build_response_head_chunked — chunked-encoding path.
+ * Same byte shape as ResponseWriter#build_head_chunked in response_writer.rb
+ * but native, allocating one Ruby String.  Drops any caller-supplied
+ * content-length and transfer-encoding headers (mutually exclusive per
+ * RFC 7230 §3.3.3) and always emits "transfer-encoding: chunked\r\n".
+ * Implemented as cbuild_response_head with the body_size = -1 sentinel. */
+VALUE hyperion_build_response_head_chunked(VALUE status, VALUE reason,
+                                           VALUE headers, VALUE keep_alive,
+                                           VALUE date_str) {
+    return cbuild_response_head(Qnil, status, reason, headers,
+                                LL2NUM(-1), keep_alive, date_str);
 }
 
 /* Hyperion::CParser.build_access_line(format, ts, method, path, query,
