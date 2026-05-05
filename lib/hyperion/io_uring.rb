@@ -259,9 +259,16 @@ module Hyperion
       def candidate_paths
         gem_lib = File.expand_path('../hyperion_io_uring', __dir__)
         ext_target = File.expand_path('../../ext/hyperion_io_uring/target/release', __dir__)
-        %w[libhyperion_io_uring.dylib libhyperion_io_uring.so].flat_map do |name|
-          [File.join(gem_lib, name), File.join(ext_target, name)]
-        end
+        # Prefer the platform-native extension first so Fiddle.dlopen doesn't
+        # accidentally pick up a cross-platform binary (e.g. a macOS .dylib
+        # rsync'd into a Linux lib dir) which causes an ArgumentError on read.
+        native, other = linux? ? %w[.so .dylib] : %w[.dylib .so]
+        [
+          File.join(gem_lib,    "libhyperion_io_uring#{native}"),
+          File.join(ext_target, "libhyperion_io_uring#{native}"),
+          File.join(gem_lib,    "libhyperion_io_uring#{other}"),
+          File.join(ext_target, "libhyperion_io_uring#{other}"),
+        ]
       end
 
       # ---- FFI wrappers ----

@@ -254,13 +254,13 @@ mod linux_impl {
                 let flags    = cqe.flags();
 
                 // Extract buf_id for recv completions that carry a buffer.
-                // IORING_CQE_F_BUFFER (= 1) signals a valid buf_id in the
-                // upper 16 bits of flags (IORING_CQE_BUFFER_SHIFT = 16).
-                let buf_id = if op_byte == (OpKind::Recv as u8)
-                    && result >= 0
-                    && (flags & io_uring::sys::IORING_CQE_F_BUFFER) != 0
-                {
-                    ((flags >> io_uring::sys::IORING_CQE_BUFFER_SHIFT) & 0xffff) as i32
+                // Use the public `cqueue::buffer_select(flags)` helper which
+                // tests IORING_CQE_F_BUFFER and extracts the buffer-id from
+                // the upper 16 bits — avoids the private `io_uring::sys` module.
+                let buf_id = if op_byte == (OpKind::Recv as u8) && result >= 0 {
+                    io_uring::cqueue::buffer_select(flags)
+                        .map(|id| id as i32)
+                        .unwrap_or(-1)
                 } else {
                     -1
                 };
@@ -323,10 +323,8 @@ mod linux_impl {
             //
             // Best-effort: if the ring fd was already closed by a prior
             // failure the unregister will error — we ignore that.
-            let _ = unsafe {
-                self.ring.submitter()
-                    .unregister_buf_ring(self.buffer_ring.group_id())
-            };
+            let _ = self.ring.submitter()
+                .unregister_buf_ring(self.buffer_ring.group_id());
         }
     }
 
