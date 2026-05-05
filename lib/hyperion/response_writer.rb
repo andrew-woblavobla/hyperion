@@ -103,6 +103,26 @@ module Hyperion
     private
 
     def write_buffered(io, status, headers, body, keep_alive:)
+      if c_path_eligible?(io)
+        date_str = cached_date
+        bytes_out = ::Hyperion::Http::ResponseWriter.c_write_buffered(
+          io, status, headers, Array(body), keep_alive, date_str
+        )
+        if bytes_out == ::Hyperion::Http::ResponseWriter::WOULDBLOCK
+          # EAGAIN on the C path — fall back to the Ruby writer, which
+          # yields the fiber under Async / blocks the thread under
+          # threadpool correctly.
+          return write_buffered_ruby(io, status, headers, body, keep_alive: keep_alive)
+        end
+        Hyperion.metrics.increment(:bytes_written, bytes_out)
+        body.close if body.respond_to?(:close)
+        return
+      end
+
+      write_buffered_ruby(io, status, headers, body, keep_alive: keep_alive)
+    end
+
+    def write_buffered_ruby(io, status, headers, body, keep_alive:)
       # Phase 1 buffers the full body so Content-Length is exact.
       # Phase 2 introduces chunked transfer-encoding for streaming bodies;
       # Phase 5 batches via IO::Buffer to avoid this intermediate String.
@@ -386,6 +406,55 @@ module Hyperion
       false
     end
 
+    # Plan #1 (perf roadmap) — predicate for the C-side direct-syscall
+    # write path. True when:
+    #   (a) The Hyperion::Http::ResponseWriter C ext loaded.
+    #   (b) `io` exposes a real kernel fd (real_fd_io? handles the
+    #       SSLSocket / StringIO / IO-like-but-no-fileno cases).
+    #   (c) The class-level operator switch hasn't been flipped off.
+    #
+    # Operators flip the switch off via:
+    #   Hyperion::Http::ResponseWriter.c_writer_available = false
+    # (mirrors the Hyperion::ResponseWriter.page_cache_available pattern).
+    def c_path_eligible?(io)
+      return false unless defined?(::Hyperion::Http::ResponseWriter)
+      return false unless ::Hyperion::Http::ResponseWriter.c_writer_available?
+      return false unless real_fd_io?(io)
+
+      true
+    end
+
+    def write_chunked(io, status, headers, body, keep_alive:)
+      if c_path_eligible?(io)
+        date_str = cached_date
+        begin
+          bytes_out = ::Hyperion::Http::ResponseWriter.c_write_chunked(
+            io, status, headers, body, keep_alive, date_str
+          )
+        rescue Errno::EAGAIN
+          # Mid-body backpressure on the chunked path leaves the wire
+          # in a half-written state; we cannot recover by falling back
+          # to the Ruby writer because the chunked head has already
+          # been emitted. Re-raise so Connection#serve closes the
+          # connection cleanly. This is the documented contract from
+          # response_writer.c hyp_chunked_drain.
+          raise
+        end
+        if bytes_out == ::Hyperion::Http::ResponseWriter::WOULDBLOCK
+          # Pre-body WOULDBLOCK — only the head failed to ship; nothing
+          # is on the wire yet. Fall back to the Ruby chunked writer,
+          # which yields under Async / blocks under threadpool correctly.
+          return write_chunked_ruby(io, status, headers, body, keep_alive: keep_alive)
+        end
+        Hyperion.metrics.increment(:bytes_written, bytes_out)
+        Hyperion.metrics.increment(:chunked_responses)
+        body.close if body.respond_to?(:close)
+        return
+      end
+
+      write_chunked_ruby(io, status, headers, body, keep_alive: keep_alive)
+    end
+
     # Phase 5 — streaming chunked writer with per-response coalescing.
     #
     # Wire format per RFC 7230 §4.1:
@@ -405,7 +474,7 @@ module Hyperion
     #     past per-event coalescing latency.
     #   * body.close (or end-of-each) drains the buffer and appends the
     #     0\r\n\r\n terminator in a single syscall (atomic w.r.t. the wire).
-    def write_chunked(io, status, headers, body, keep_alive:)
+    def write_chunked_ruby(io, status, headers, body, keep_alive:)
       reason = REASONS[status] || 'Unknown'
       date_str = cached_date
       head = build_head_chunked(status, reason, headers, keep_alive, date_str)
