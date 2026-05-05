@@ -659,6 +659,66 @@ if want_row 28; then
   stop_port
 fi
 
+# ---------- Row 29: Hyperion Rails API low-conc latency (-c10) ----------
+if want_row 29; then
+  echo
+  echo "=== Row 29: Hyperion Rails API low-conc (-c10) ==="
+  stop_port
+  boot_hyperion "row29" "bench/rails_api.ru" -t 5 -w 1 -p "$PORT"
+  if wait_for_bind "row29" "/healthz"; then
+    warmup_hit "row29" "/api/users"
+    WRK_THREADS=2 WRK_CONNS=10 bench_wrk_row 29 "hyperion_rails_api_lowconc" "bench/rails_api.ru" "/api/users"
+  else
+    echo "29,hyperion_rails_api_lowconc,wrk,bench/rails_api.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 30: Agoo Rails API low-conc latency (-c10) ----------
+if want_row 30; then
+  echo
+  echo "=== Row 30: Agoo Rails API low-conc (-c10) ==="
+  stop_port
+  boot_agoo "bench/rails_api.ru" 1
+  if wait_for_bind "agoo-row30" "/healthz"; then
+    warmup_hit "row30" "/api/users"
+    WRK_THREADS=2 WRK_CONNS=10 bench_wrk_row 30 "agoo_rails_api_lowconc" "bench/rails_api.ru" "/api/users"
+  else
+    echo "30,agoo_rails_api_lowconc,wrk,bench/rails_api.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 31: Hyperion Rails API high-conc backpressure (-c500) ----------
+if want_row 31; then
+  echo
+  echo "=== Row 31: Hyperion Rails API high-conc (-c500) ==="
+  stop_port
+  boot_hyperion "row31" "bench/rails_api.ru" -t 5 -w 1 -p "$PORT"
+  if wait_for_bind "row31" "/healthz"; then
+    warmup_hit "row31" "/api/users"
+    WRK_THREADS=8 WRK_CONNS=500 bench_wrk_row 31 "hyperion_rails_api_highconc" "bench/rails_api.ru" "/api/users"
+  else
+    echo "31,hyperion_rails_api_highconc,wrk,bench/rails_api.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 32: Agoo Rails API high-conc backpressure (-c500) ----------
+if want_row 32; then
+  echo
+  echo "=== Row 32: Agoo Rails API high-conc (-c500) ==="
+  stop_port
+  boot_agoo "bench/rails_api.ru" 1
+  if wait_for_bind "agoo-row32" "/healthz"; then
+    warmup_hit "row32" "/api/users"
+    WRK_THREADS=8 WRK_CONNS=500 bench_wrk_row 32 "agoo_rails_api_highconc" "bench/rails_api.ru" "/api/users"
+  else
+    echo "32,agoo_rails_api_highconc,wrk,bench/rails_api.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
 echo
 echo "============================================================"
 echo "Final CSV: $OUT_CSV"
