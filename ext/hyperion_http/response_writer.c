@@ -12,6 +12,7 @@
 #include <sys/uio.h>
 #include <sys/socket.h>
 #include <errno.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <string.h>
 
@@ -234,6 +235,186 @@ static VALUE c_write_buffered(VALUE self, VALUE io, VALUE rb_status,
     return SSIZET2NUM(n);
 }
 
+/* -----------------------------------------------------------------------
+ * c_write_chunked — chunked Transfer-Encoding response writer
+ * ----------------------------------------------------------------------- */
+
+/* Per-call chunked state passed through rb_block_call. */
+struct hyp_chunked_state {
+    int fd;
+    unsigned char buf[4096];     /* coalesce buffer; 4 KiB matches
+                                  * ResponseWriter::COALESCE_FLUSH_BYTES
+                                  * (response_writer.rb:19). */
+    size_t buf_used;
+    size_t bytes_written;
+};
+
+static const char HYP_HEX[16] = {
+    '0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'
+};
+
+/* Format `n` as lowercase hex (no 0x prefix). Returns bytes written.
+ * Handwritten so we don't pay snprintf cost per chunk; mirrors the
+ * u64_to_dec helper in c_access_line.c. */
+static size_t hyp_u64_to_hex(unsigned char *dst, uint64_t n) {
+    if (n == 0) { dst[0] = '0'; return 1; }
+    unsigned char tmp[16];
+    int i = 0;
+    while (n > 0) { tmp[i++] = (unsigned char)HYP_HEX[n & 0xf]; n >>= 4; }
+    for (int j = 0; j < i; j++) dst[j] = tmp[i - 1 - j];
+    return (size_t)i;
+}
+
+/* Drain the coalesce buffer to the wire as a single syscall.
+ * Updates bytes_written and resets buf_used. */
+static void hyp_chunked_drain(struct hyp_chunked_state *st) {
+    if (st->buf_used == 0) return;
+    struct iovec iov[1];
+    iov[0].iov_base = st->buf;
+    iov[0].iov_len  = st->buf_used;
+    ssize_t n = hyp_writev_all(st->fd, iov, 1);
+    if (n >= 0) st->bytes_written += st->buf_used;
+    /* WOULDBLOCK on the chunked path is degenerate — the body iterator
+     * has already returned more chunks; we can't easily resume. The
+     * caller's spec for that case would fall back to the Ruby chunked
+     * writer at the dispatcher level (Task 6). */
+    st->buf_used = 0;
+}
+
+/* Append `framed_len` bytes to the coalesce buffer. If they overflow
+ * the buffer, drain first; if the bytes themselves exceed 4 KiB,
+ * drain and write directly bypassing the coalesce. */
+static void hyp_chunked_append(struct hyp_chunked_state *st,
+                               const unsigned char *framed,
+                               size_t framed_len) {
+    if (framed_len >= sizeof(st->buf)) {
+        /* Big frame: drain anything we've buffered so order is preserved,
+         * then write the framed bytes directly with one syscall. */
+        hyp_chunked_drain(st);
+        struct iovec iov[1] = {{ (void *)framed, framed_len }};
+        ssize_t n = hyp_writev_all(st->fd, iov, 1);
+        if (n >= 0) st->bytes_written += framed_len;
+        return;
+    }
+    if (st->buf_used + framed_len > sizeof(st->buf)) hyp_chunked_drain(st);
+    memcpy(st->buf + st->buf_used, framed, framed_len);
+    st->buf_used += framed_len;
+}
+
+/* rb_block_call callback invoked once per `body.each` yield. */
+static VALUE hyp_chunked_callback(RB_BLOCK_CALL_FUNC_ARGLIST(yielded, callback_arg)) {
+    struct hyp_chunked_state *st = (struct hyp_chunked_state *)callback_arg;
+    VALUE chunk = yielded;
+    if (NIL_P(chunk)) return Qnil;
+
+    /* Flush sentinel: literal symbol :__hyperion_flush__ from
+     * response_writer.rb (used by SSE servers to push events past the
+     * coalescing latency). */
+    if (SYMBOL_P(chunk) &&
+        rb_sym2id(chunk) == rb_intern("__hyperion_flush__")) {
+        hyp_chunked_drain(st);
+        return Qnil;
+    }
+
+    Check_Type(chunk, T_STRING);
+    size_t payload_len = (size_t)RSTRING_LEN(chunk);
+    if (payload_len == 0) return Qnil;
+
+    /* Frame: <hex-size>\r\n<payload>\r\n. We allocate the framed
+     * bytes on the C stack for small chunks. For large chunks the
+     * framing wrapping bytes are stack-built; the payload itself
+     * lives in the Ruby String and we writev with three iovs. */
+    if (payload_len < (sizeof(st->buf) - 32)) {
+        /* Stack-frame the chunk so it lands in the coalesce buffer
+         * (or drains directly via hyp_chunked_append if oversized). */
+        unsigned char framed[4096 + 32];
+        size_t hex_n = hyp_u64_to_hex(framed, (uint64_t)payload_len);
+        framed[hex_n++] = '\r'; framed[hex_n++] = '\n';
+        memcpy(framed + hex_n, RSTRING_PTR(chunk), payload_len);
+        hex_n += payload_len;
+        framed[hex_n++] = '\r'; framed[hex_n++] = '\n';
+        hyp_chunked_append(st, framed, hex_n);
+    } else {
+        /* Large chunk: drain coalesce, write the size-line + payload +
+         * CRLF in one writev (3 iovs). */
+        hyp_chunked_drain(st);
+        unsigned char hex_buf[18];
+        size_t hex_n = hyp_u64_to_hex(hex_buf, (uint64_t)payload_len);
+        hex_buf[hex_n++] = '\r'; hex_buf[hex_n++] = '\n';
+        unsigned char crlf[2] = { '\r', '\n' };
+        struct iovec iov[3];
+        iov[0].iov_base = hex_buf;
+        iov[0].iov_len  = hex_n;
+        iov[1].iov_base = (void *)RSTRING_PTR(chunk);
+        iov[1].iov_len  = payload_len;
+        iov[2].iov_base = crlf;
+        iov[2].iov_len  = 2;
+        ssize_t n = hyp_writev_all(st->fd, iov, 3);
+        if (n >= 0) st->bytes_written += hex_n + payload_len + 2;
+        RB_GC_GUARD(chunk);
+    }
+    return Qnil;
+}
+
+/* Hyperion::Http::ResponseWriter.c_write_chunked(io, status, headers,
+ *                                                 body, keep_alive,
+ *                                                 date_str) -> Integer */
+static VALUE c_write_chunked(VALUE self, VALUE io, VALUE rb_status,
+                             VALUE rb_headers, VALUE rb_body,
+                             VALUE rb_keep_alive, VALUE rb_date) {
+    (void)self;
+    Check_Type(rb_headers, T_HASH);
+
+    int fd = NUM2INT(rb_funcall(io, id_fileno, 0));
+    int status = NUM2INT(rb_status);
+    VALUE rb_reason = hyp_lookup_reason(status);
+
+    /* Build chunked head: emits transfer-encoding: chunked instead of
+     * content-length; drops caller-supplied content-length and TE. */
+    VALUE head = hyperion_build_response_head_chunked(
+        rb_status, rb_reason, rb_headers, rb_keep_alive, rb_date
+    );
+
+    struct hyp_chunked_state st;
+    memset(&st, 0, sizeof(st));
+    st.fd = fd;
+
+    /* Emit the head as a single syscall. */
+    struct iovec head_iov[1];
+    head_iov[0].iov_base = (void *)RSTRING_PTR(head);
+    head_iov[0].iov_len  = (size_t)RSTRING_LEN(head);
+    ssize_t n = hyp_writev_all(fd, head_iov, 1);
+    if (n == HYP_C_WRITE_WOULDBLOCK) {
+        RB_GC_GUARD(head);
+        return INT2NUM(HYP_C_WRITE_WOULDBLOCK);
+    }
+    st.bytes_written += (size_t)RSTRING_LEN(head);
+
+    /* Iterate body via rb_block_call. Ruby exceptions propagate
+     * (the dispatcher's Connection#serve rescue handles teardown). */
+    rb_block_call(rb_body, rb_intern("each"), 0, NULL,
+                  hyp_chunked_callback, (VALUE)&st);
+
+    /* Drain coalesce + emit terminator atomically when possible:
+     * coalesce buffer has room → memcpy the terminator and drain
+     * (single syscall ends the response). Otherwise drain first
+     * then write the terminator separately. */
+    static const unsigned char term[] = { '0','\r','\n','\r','\n' };
+    if (st.buf_used + sizeof(term) <= sizeof(st.buf)) {
+        memcpy(st.buf + st.buf_used, term, sizeof(term));
+        st.buf_used += sizeof(term);
+        hyp_chunked_drain(&st);
+    } else {
+        hyp_chunked_drain(&st);
+        struct iovec t_iov[1] = {{ (void *)term, sizeof(term) }};
+        ssize_t tn = hyp_writev_all(fd, t_iov, 1);
+        if (tn >= 0) st.bytes_written += sizeof(term);
+    }
+
+    RB_GC_GUARD(head);
+    return SIZET2NUM(st.bytes_written);
+}
+
 void Init_hyperion_response_writer(void) {
     rb_mHyperion = rb_const_get(rb_cObject, rb_intern("Hyperion"));
     /* Hyperion::Http may already exist (created by Init_hyperion_sendfile
@@ -273,6 +454,8 @@ void Init_hyperion_response_writer(void) {
                                c_response_writer_available_p, 0);
     rb_define_singleton_method(rb_mResponseWriter, "c_write_buffered",
                                c_write_buffered, 6);
+    rb_define_singleton_method(rb_mResponseWriter, "c_write_chunked",
+                               c_write_chunked, 6);
 
     /* WOULDBLOCK sentinel: Ruby caller checks for this value and falls
      * back to io.write when the kernel send buffer is full (EAGAIN). */
