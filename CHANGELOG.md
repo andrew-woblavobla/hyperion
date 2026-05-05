@@ -1,5 +1,66 @@
 # Changelog
 
+## 2.16.3 — 2026-05-05
+
+### 2.16.3-A — Hot-path Ruby cost reduction (metrics + split_host cache)
+
+Combined optimizations across the Hyperion request hot path, driven by
+profile data on `bench/hello.ru` (`stackprof` + `perf` on the Linux
+bench host). All purely Ruby-side; no public API change.
+
+- **`Hyperion::Metrics::STATUS_SYMBOLS`**: pre-built frozen
+  `Integer → Symbol` table for HTTP status codes 100–599.
+  `increment_status(code)` is now a single Hash lookup, replacing
+  per-request `:"responses_#{code}"` String interpolation.
+
+- **`Hyperion::Metrics::PathTemplater` per-thread shadow cache**:
+  hot-path reads now hit a thread-local Hash before falling through
+  to the shared LRU. Eliminates the `@mutex` acquire on the steady
+  state where the same routes recur.
+
+- **`Hyperion::Metrics#observe_histogram` String-keyed family**:
+  internal `family` Hash is now keyed by frozen String
+  (`label_values.join("\x00")`) instead of by `Array`. `String#hash`
+  is interned/cached and `String#eql?` is a single C `memcmp` —
+  vs `Array#eql?`'s per-element dispatch which was 41% of
+  `observe_histogram`'s callees on the post-PR1 profile.
+
+- **`Hyperion::Connection` per-connection Host: header cache**:
+  `Adapter::Rack#build_env` reuses the prior `split_host` result on
+  keep-alive connections where the `Host` header doesn't change
+  (steady state). Skips two String byteslice allocations per
+  request and the surrounding branch dispatch.
+
+- **`bench/run_all.sh` `boot_hyperion`**: now passes
+  `--no-log-requests` for apples-to-apples vs Agoo's already-silent
+  bench wrapper. Hyperion's per-request JSON access log was 32.9%
+  of CPU on `bench/hello.ru`. Real prod typically forwards logs
+  through a sidecar / async drain, so this aligns the harness with
+  what operators actually measure.
+
+#### Bench impact (Linux x86_64, Ruby 3.3.3 + YJIT, single-worker)
+
+- `bench/hello.ru` (Hyperion Rack hello): **4,231 → ~5,521 r/s, ~+30%**.
+- Real Rails 8 API row (`/api/users`, single-worker): **583 → 683 r/s, +17.1%**;
+  flips to a +3.5% lead over Agoo (was −25% pre-tuning).
+- ERB (`/page`, 1w): **421 → 476 r/s, +13.1%** (now within 0.8% of Agoo).
+- See `docs/BENCH_HYPERION_RAILS.md` for the full Rails matrix.
+
+p99 latency stays at the Hyperion sweet spot (8–13 ms across all
+Rails rows; Agoo's p99 ranges 36–769 ms on the same workloads).
+
+#### Bench harness
+
+- New `bench/run_all.sh --rails` flag: runs a 22-row Rails matrix
+  (API-only / ERB / AR-CRUD × 1w/4w × Hyperion/Agoo/Falcon/Puma)
+  plus latency-profile rows.
+- `bench/rails_app/`: minimal Rails 8.0.5 skeleton (~100 KB) with
+  three workloads sharing one app boot.
+- `bench/profile_hello.rb`: stackprof signal-driven harness for
+  hot-path profiling (USR1 start / USR2 dump).
+- Cross-OS portability: `setsid` and `ss` fallbacks so the harness
+  runs on macOS dev hosts as well as the Linux bench VM.
+
 ## 2.16.2 — 2026-05-04
 
 ### 2.16.2-A — macOS Obj-C fork-safety: re-exec, not just ENV write
