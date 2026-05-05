@@ -242,11 +242,13 @@ setup_pg_bench_db() {
   fi
 
   echo "[setup_pg_bench_db] migrating $dbname"
+  # Use rake (not rails) — bench/rails_app/ has Rakefile but no bin/rails
+  # binstub, and `rails` outside an app prints "rails new" help.
   (
     cd bench/rails_app && \
     RAILS_ENV=production RAILS_DB=pg \
     DATABASE_URL="postgres://${PGHOST:-localhost}:${PGPORT:-5432}/$dbname" \
-    bundle exec rails db:migrate
+    bundle exec rake db:migrate
   ) || {
     echo "[setup_pg_bench_db] migrate failed; AR rows will boot-fail"
     return 1
@@ -600,6 +602,12 @@ if want_row 19 || want_row 20 || want_row 21 || want_row 22 || \
     PG_BENCH_OK=1
     export RAILS_DB=pg
     export DATABASE_URL="postgres://${PGHOST:-localhost}:${PGPORT:-5432}/${PGDATABASE_BENCH:-hyperion_bench}"
+    # Pre-load hyperion-async-pg into the Hyperion server process via
+    # RUBYOPT — Hyperion's --async-io strict-validation
+    # (validate_async_io_loaded_libs!) runs BEFORE the rackup loads,
+    # so the rackup itself can't satisfy the check. boot_hyperion
+    # forwards $HYPERION_EXTRA_ENV verbatim into the child env.
+    export HYPERION_EXTRA_ENV="RUBYOPT=-rhyperion-async-pg"
   fi
 fi
 
@@ -778,8 +786,9 @@ if want_row 28; then
 fi
 
 # AR-CRUD rows are done; clear the PG-only env so non-AR rows that
-# follow (29-32 latency-profile) don't inherit RAILS_DB / DATABASE_URL.
-unset RAILS_DB DATABASE_URL
+# follow (29-32 latency-profile) don't inherit RAILS_DB / DATABASE_URL
+# / the hyperion-async-pg pre-require.
+unset RAILS_DB DATABASE_URL HYPERION_EXTRA_ENV
 
 # ---------- Row 29: Hyperion Rails API low-conc latency (-c10) ----------
 if want_row 29; then
