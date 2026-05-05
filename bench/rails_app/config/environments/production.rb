@@ -67,6 +67,5 @@ Rails.application.configure do
   # config.host_authorization = { exclude: ->(request) { request.path == "/up" } }
 
   # Bench overrides: disable SSL redirect, show exceptions for testability.
-  config.cache_classes = true
   config.action_dispatch.show_exceptions = :rescuable
 end

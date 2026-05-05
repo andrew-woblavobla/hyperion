@@ -2,10 +2,13 @@ default: &default
   adapter: sqlite3
   pool: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
   timeout: 5000
-  # mode=memory&cache=shared: in-memory database shared across all
-  # connections in the pool. Without cache=shared, each Rails
-  # connection-pool thread would see a fresh empty DB.
-  database: "file:rails_bench?mode=memory&cache=shared&uri=true"
+  # OPEN_URI(64) | OPEN_CREATE(4) | OPEN_READWRITE(2). Required so
+  # sqlite3 actually parses the file: URI; otherwise the URI string is
+  # treated as a literal filename and each pool connection opens a
+  # fresh empty in-memory DB. mode=memory makes it in-RAM,
+  # cache=shared lets all pool connections see one DB.
+  flags: <%= 64 | 4 | 2 %>
+  database: "file:rails_bench?mode=memory&cache=shared"
 
 production:
   <<: *default
