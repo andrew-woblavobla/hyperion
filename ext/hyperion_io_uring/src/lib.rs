@@ -47,6 +47,8 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+mod buffer_ring;
+
 use std::os::raw::{c_int, c_uchar, c_uint};
 
 const ABI_VERSION: u32 = 2;
