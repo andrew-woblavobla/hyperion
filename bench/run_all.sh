@@ -153,7 +153,7 @@ bench_wrk_row() {
   p99_med=$(median "${p99_list[@]}")
   trials="${rps_list[*]}"
   echo "[$label] WRK MEDIAN rps=$rps_med p99=$p99_med (runs: $trials)"
-  echo "$row,$label,wrk,$rackup,$rps_med,$p99_med,${trials// /|}" >> "$OUT_CSV"
+  echo "$row,$label,wrk,$rackup,$rps_med,$p99_med,${trials// /|}," >> "$OUT_CSV"
 }
 
 # Boot a Hyperion server in background. Uses setsid so SIGINT to the
@@ -194,7 +194,7 @@ boot_agoo() {
 }
 
 : > "$OUT_CSV"
-echo "row,label,tool,rackup,rps_med,p99_med,trials" >> "$OUT_CSV"
+echo "row,label,tool,rackup,rps_med,p99_med,trials,bar" >> "$OUT_CSV"
 
 echo "============================================================"
 echo "Hyperion 2.15-A canonical bench"
@@ -218,7 +218,7 @@ if want_row 1; then
     bench_wrk_row 1 "hyperion_handle_static_iouring" "bench/hello_static.ru"
   else
     echo "row1: BOOT-FAIL"
-    echo "1,hyperion_handle_static_iouring,wrk,bench/hello_static.ru,BOOT-FAIL,BOOT-FAIL," >> "$OUT_CSV"
+    echo "1,hyperion_handle_static_iouring,wrk,bench/hello_static.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
   fi
   stop_port
 fi
@@ -233,7 +233,7 @@ if want_row 2; then
   if wait_for_bind "row2"; then
     bench_wrk_row 2 "hyperion_handle_static_accept4" "bench/hello_static.ru"
   else
-    echo "2,hyperion_handle_static_accept4,wrk,bench/hello_static.ru,BOOT-FAIL,BOOT-FAIL," >> "$OUT_CSV"
+    echo "2,hyperion_handle_static_accept4,wrk,bench/hello_static.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
   fi
   stop_port
 fi
@@ -248,7 +248,7 @@ if want_row 3; then
   if wait_for_bind "row3"; then
     bench_wrk_row 3 "hyperion_handle_block" "bench/hello_handle_block.ru"
   else
-    echo "3,hyperion_handle_block,wrk,bench/hello_handle_block.ru,BOOT-FAIL,BOOT-FAIL," >> "$OUT_CSV"
+    echo "3,hyperion_handle_block,wrk,bench/hello_handle_block.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
   fi
   stop_port
 fi
@@ -263,7 +263,7 @@ if want_row 4; then
   if wait_for_bind "row4"; then
     bench_wrk_row 4 "hyperion_rack_hello" "bench/hello.ru"
   else
-    echo "4,hyperion_rack_hello,wrk,bench/hello.ru,BOOT-FAIL,BOOT-FAIL," >> "$OUT_CSV"
+    echo "4,hyperion_rack_hello,wrk,bench/hello.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
   fi
   stop_port
 fi
@@ -278,7 +278,7 @@ if want_row 5; then
   if wait_for_bind "row5"; then
     bench_wrk_row 5 "hyperion_cpu_json" "bench/work.ru"
   else
-    echo "5,hyperion_cpu_json,wrk,bench/work.ru,BOOT-FAIL,BOOT-FAIL," >> "$OUT_CSV"
+    echo "5,hyperion_cpu_json,wrk,bench/work.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
   fi
   stop_port
 fi
@@ -313,7 +313,7 @@ if want_row 7; then
   if wait_for_bind "agoo"; then
     bench_wrk_row 7 "ref_agoo" "bench/hello.ru"
   else
-    echo "7,ref_agoo,wrk,bench/hello.ru,BOOT-FAIL,BOOT-FAIL," >> "$OUT_CSV"
+    echo "7,ref_agoo,wrk,bench/hello.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
   fi
   stop_port
 fi
@@ -327,7 +327,7 @@ if want_row 8; then
   if wait_for_bind "falcon"; then
     bench_wrk_row 8 "ref_falcon" "bench/hello.ru"
   else
-    echo "8,ref_falcon,wrk,bench/hello.ru,BOOT-FAIL,BOOT-FAIL," >> "$OUT_CSV"
+    echo "8,ref_falcon,wrk,bench/hello.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
   fi
   stop_port
 fi
@@ -341,7 +341,7 @@ if want_row 9; then
   if wait_for_bind "puma"; then
     bench_wrk_row 9 "ref_puma" "bench/hello.ru"
   else
-    echo "9,ref_puma,wrk,bench/hello.ru,BOOT-FAIL,BOOT-FAIL," >> "$OUT_CSV"
+    echo "9,ref_puma,wrk,bench/hello.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
   fi
   stop_port
 fi
@@ -368,6 +368,77 @@ echo "Final CSV: $OUT_CSV"
 column -t -s , "$OUT_CSV"
 echo "============================================================"
 
+# Post-process: fill in the `bar` column for gated Rails rows.
+# Pairs (Hyperion, Agoo) are colocated in the table:
+#   API-only 1w:  rows 11 vs 12     |  4w: 23 vs 24
+#   ERB      1w:  rows 15 vs 16     |  4w: 25 vs 26
+#   AR-CRUD  1w:  rows 19 vs 20     |  4w: 27 vs 28
+# For each pair, "pass" if Hyperion rps_med >= Agoo rps_med; "fail" otherwise.
+# The Agoo row gets "ref" so it's distinguishable from a non-gated row.
+fill_bar_column() {
+  local tmp; tmp=$(mktemp)
+  awk -F, 'BEGIN { OFS="," }
+    NR == 1 { print; next }
+    {
+      row = $1
+      rps[row] = $5
+      lines[row] = $0
+    }
+    END {
+      pairs = "11:12 15:16 19:20 23:24 25:26 27:28"
+      n = split(pairs, ps, " ")
+      for (i = 1; i <= n; i++) {
+        split(ps[i], p, ":"); h = p[1]; a = p[2]
+        if (lines[h] != "" && lines[a] != "") {
+          # numeric-safe compare: treat NA / BOOT-FAIL as 0
+          hr = (rps[h] + 0); ar = (rps[a] + 0)
+          bar = (hr >= ar && hr > 0) ? "pass" : "fail"
+          # Hyperion row gets the bar value; Agoo row gets "ref" for symmetry
+          sub(/,$/, "," bar, lines[h])
+          sub(/,$/, ",ref", lines[a])
+        }
+      }
+      # Print all rows in their original order (we may not see them in 1..32 order
+      # because --rows can run a subset). Iterate using the keys we collected.
+      # AWK does not preserve insertion order; we sort numerically by row.
+      n_rows = 0
+      for (r in lines) row_keys[++n_rows] = r
+      # simple insertion sort
+      for (i = 2; i <= n_rows; i++) {
+        v = row_keys[i]
+        j = i - 1
+        while (j >= 1 && (row_keys[j] + 0) > (v + 0)) {
+          row_keys[j+1] = row_keys[j]
+          j--
+        }
+        row_keys[j+1] = v
+      }
+      for (i = 1; i <= n_rows; i++) print lines[row_keys[i]]
+    }
+  ' "$OUT_CSV" > "$tmp"
+  mv "$tmp" "$OUT_CSV"
+}
+
+# Print the bar-d summary block to stdout. Returns 0 if all 6 gated rows
+# passed (bar d met), non-zero otherwise.
+print_bar_summary() {
+  echo
+  echo "=================== Bar d summary ==================="
+  awk -F, 'NR > 1 && ($8 == "pass" || $8 == "fail") {
+    printf "row %2s  %-40s  rps=%s  %s\n", $1, $2, $5, $8
+  }' "$OUT_CSV"
+  echo "------------------------------------------------------"
+  local pass_count fail_count
+  pass_count=$(awk -F, 'NR > 1 && $8 == "pass"' "$OUT_CSV" | wc -l | tr -d ' ')
+  fail_count=$(awk -F, 'NR > 1 && $8 == "fail"' "$OUT_CSV" | wc -l | tr -d ' ')
+  echo "passed: $pass_count / 6 gated rows  (failed: $fail_count)"
+  echo "======================================================"
+  [ "$pass_count" = "6" ] && return 0 || return 1
+}
+
+fill_bar_column
+print_bar_summary || true   # don't abort on bar fail; the CSV is the truth
+
 # Render markdown table
 {
   echo "# Hyperion 2.15-A bench results"
@@ -376,11 +447,11 @@ echo "============================================================"
   echo "Host:      $(uname -a)"
   echo "Ruby:      $(ruby --version)"
   echo
-  echo "| Row | Label | Tool | Rackup | rps (median) | p99 (median) |"
-  echo "|----:|-------|------|--------|-------------:|-------------:|"
-  tail -n +2 "$OUT_CSV" | while IFS=, read -r row label tool rackup rps p99 trials; do
-    printf "| %s | %s | %s | %s | %s | %s |\n" \
-      "$row" "$label" "$tool" "\`$rackup\`" "$rps" "$p99"
+  echo "| Row | Label | Tool | Rackup | rps (median) | p99 (median) | Bar |"
+  echo "|----:|-------|------|--------|-------------:|-------------:|:---:|"
+  tail -n +2 "$OUT_CSV" | while IFS=, read -r row label tool rackup rps p99 trials bar; do
+    printf "| %s | %s | %s | %s | %s | %s | %s |\n" \
+      "$row" "$label" "$tool" "\`$rackup\`" "$rps" "$p99" "${bar:--}"
   done
 } > "$OUT_MD"
 
