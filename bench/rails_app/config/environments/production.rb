@@ -21,21 +21,22 @@ Rails.application.configure do
   # Enable serving of images, stylesheets, and JavaScripts from an asset server.
   # config.asset_host = "http://assets.example.com"
 
-  # Assume all access to the app is happening through a SSL-terminating reverse proxy.
-  config.assume_ssl = true
-
-  # Force all access to the app over SSL, use Strict-Transport-Security, and use secure cookies.
-  config.force_ssl = true
+  # Bench-friendly production config. We keep eager_load + cache_classes
+  # at their Rails defaults (true), but route the logger to /dev/null
+  # so log churn isn't on the request hot path. Real prod typically
+  # ships logs to a sidecar; routing to /dev/null is the closest
+  # approximation that doesn't disable the logger entirely (which
+  # would change Rails' middleware shape).
+  config.assume_ssl = false
+  config.force_ssl = false
 
   # Skip http-to-https redirect for the default health check endpoint.
   # config.ssl_options = { redirect: { exclude: ->(request) { request.path == "/up" } } }
 
-  # Log to STDOUT with the current request id as a default log tag.
-  config.log_tags = [ :request_id ]
-  config.logger   = ActiveSupport::TaggedLogging.logger(STDOUT)
+  config.logger = ActiveSupport::Logger.new('/dev/null')
 
   # Change to "debug" to log everything (including potentially personally-identifiable information!)
-  config.log_level = ENV.fetch("RAILS_LOG_LEVEL", "info")
+  config.log_level = :warn
 
   # Prevent health checks from clogging up the logs.
   config.silence_healthcheck_path = "/up"
@@ -64,4 +65,8 @@ Rails.application.configure do
   #
   # Skip DNS rebinding protection for the default health check endpoint.
   # config.host_authorization = { exclude: ->(request) { request.path == "/up" } }
+
+  # Bench overrides: disable SSL redirect, show exceptions for testability.
+  config.cache_classes = true
+  config.action_dispatch.show_exceptions = :rescuable
 end
