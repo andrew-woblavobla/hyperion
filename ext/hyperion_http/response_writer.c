@@ -33,6 +33,8 @@ static VALUE rb_mResponseWriter;
 
 /* IDs cached at init time — avoids rb_intern on the hot path. */
 static ID id_fileno;
+static ID id_each;
+static ID id_hyp_flush; /* :__hyperion_flush__ chunked-drain sentinel */
 
 /* Pre-baked frozen Ruby Strings for the 23 common reason phrases.
  * Built once at init; looked up by status code in c_write_buffered.
@@ -266,24 +268,33 @@ static size_t hyp_u64_to_hex(unsigned char *dst, uint64_t n) {
 }
 
 /* Drain the coalesce buffer to the wire as a single syscall.
- * Updates bytes_written and resets buf_used. */
+ * Updates bytes_written and resets buf_used. Raises Errno::EAGAIN on
+ * mid-body backpressure: once any chunked bytes are on the wire, a
+ * partial flush would corrupt the chunked encoding for the peer
+ * (the next coalesce-and-drain would inject framing in the wrong
+ * place). The dispatcher (Task 6) catches the exception and tears
+ * the connection down — this matches "WOULDBLOCK is degenerate
+ * mid-body" from the spec. The pre-body WOULDBLOCK case is handled
+ * separately by the head-emit path in c_write_chunked. */
 static void hyp_chunked_drain(struct hyp_chunked_state *st) {
     if (st->buf_used == 0) return;
     struct iovec iov[1];
     iov[0].iov_base = st->buf;
     iov[0].iov_len  = st->buf_used;
     ssize_t n = hyp_writev_all(st->fd, iov, 1);
-    if (n >= 0) st->bytes_written += st->buf_used;
-    /* WOULDBLOCK on the chunked path is degenerate — the body iterator
-     * has already returned more chunks; we can't easily resume. The
-     * caller's spec for that case would fall back to the Ruby chunked
-     * writer at the dispatcher level (Task 6). */
+    if (n == HYP_C_WRITE_WOULDBLOCK) {
+        errno = EAGAIN;
+        rb_sys_fail("chunked-encoding mid-body backpressure (WOULDBLOCK)");
+    }
+    st->bytes_written += st->buf_used;
     st->buf_used = 0;
 }
 
 /* Append `framed_len` bytes to the coalesce buffer. If they overflow
  * the buffer, drain first; if the bytes themselves exceed 4 KiB,
- * drain and write directly bypassing the coalesce. */
+ * drain and write directly bypassing the coalesce. Mid-body
+ * WOULDBLOCK propagates as Errno::EAGAIN via hyp_chunked_drain
+ * and rb_sys_fail (see hyp_chunked_drain comment). */
 static void hyp_chunked_append(struct hyp_chunked_state *st,
                                const unsigned char *framed,
                                size_t framed_len) {
@@ -293,7 +304,11 @@ static void hyp_chunked_append(struct hyp_chunked_state *st,
         hyp_chunked_drain(st);
         struct iovec iov[1] = {{ (void *)framed, framed_len }};
         ssize_t n = hyp_writev_all(st->fd, iov, 1);
-        if (n >= 0) st->bytes_written += framed_len;
+        if (n == HYP_C_WRITE_WOULDBLOCK) {
+            errno = EAGAIN;
+            rb_sys_fail("chunked-encoding mid-body backpressure (WOULDBLOCK)");
+        }
+        st->bytes_written += framed_len;
         return;
     }
     if (st->buf_used + framed_len > sizeof(st->buf)) hyp_chunked_drain(st);
@@ -309,9 +324,8 @@ static VALUE hyp_chunked_callback(RB_BLOCK_CALL_FUNC_ARGLIST(yielded, callback_a
 
     /* Flush sentinel: literal symbol :__hyperion_flush__ from
      * response_writer.rb (used by SSE servers to push events past the
-     * coalescing latency). */
-    if (SYMBOL_P(chunk) &&
-        rb_sym2id(chunk) == rb_intern("__hyperion_flush__")) {
+     * coalescing latency). id_hyp_flush cached at init. */
+    if (SYMBOL_P(chunk) && rb_sym2id(chunk) == id_hyp_flush) {
         hyp_chunked_drain(st);
         return Qnil;
     }
@@ -350,7 +364,11 @@ static VALUE hyp_chunked_callback(RB_BLOCK_CALL_FUNC_ARGLIST(yielded, callback_a
         iov[2].iov_base = crlf;
         iov[2].iov_len  = 2;
         ssize_t n = hyp_writev_all(st->fd, iov, 3);
-        if (n >= 0) st->bytes_written += hex_n + payload_len + 2;
+        if (n == HYP_C_WRITE_WOULDBLOCK) {
+            errno = EAGAIN;
+            rb_sys_fail("chunked-encoding mid-body backpressure (WOULDBLOCK)");
+        }
+        st->bytes_written += hex_n + payload_len + 2;
         RB_GC_GUARD(chunk);
     }
     return Qnil;
@@ -391,8 +409,9 @@ static VALUE c_write_chunked(VALUE self, VALUE io, VALUE rb_status,
     st.bytes_written += (size_t)RSTRING_LEN(head);
 
     /* Iterate body via rb_block_call. Ruby exceptions propagate
-     * (the dispatcher's Connection#serve rescue handles teardown). */
-    rb_block_call(rb_body, rb_intern("each"), 0, NULL,
+     * (the dispatcher's Connection#serve rescue handles teardown).
+     * id_each cached at init. */
+    rb_block_call(rb_body, id_each, 0, NULL,
                   hyp_chunked_callback, (VALUE)&st);
 
     /* Drain coalesce + emit terminator atomically when possible:
@@ -430,7 +449,9 @@ void Init_hyperion_response_writer(void) {
     rb_mResponseWriter = rb_define_module_under(rb_mHttp, "ResponseWriter");
 
     /* Cache rb_intern lookups at init time — never on the hot path. */
-    id_fileno = rb_intern("fileno");
+    id_fileno    = rb_intern("fileno");
+    id_each      = rb_intern("each");
+    id_hyp_flush = rb_intern("__hyperion_flush__");
 
     /* Pre-bake the 23 common reason phrases as frozen, never-GC'd Ruby
      * Strings so c_write_buffered can hand them to cbuild_response_head
