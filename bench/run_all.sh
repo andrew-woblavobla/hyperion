@@ -202,7 +202,7 @@ fi
 #
 # Required env (set by run_all.sh before AR rows):
 #   RAILS_DB=pg
-#   DATABASE_URL=postgres://localhost/hyperion_bench (default)
+#   DATABASE_URL=postgres://${PGHOST:-localhost}:${PGPORT:-5432}/hyperion_bench (default)
 #
 # On openclaw-vm: install with `apt-get install postgresql-15` and
 # `sudo -u postgres createuser -s ubuntu` (see docs/BENCH_HOST_SETUP.md).
