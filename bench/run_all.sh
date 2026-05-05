@@ -762,6 +762,10 @@ if want_row 28; then
   fi
 fi
 
+# AR-CRUD rows are done; clear the PG-only env so non-AR rows that
+# follow (29-32 latency-profile) don't inherit RAILS_DB / DATABASE_URL.
+unset RAILS_DB DATABASE_URL
+
 # ---------- Row 29: Hyperion Rails API low-conc latency (-c10) ----------
 if want_row 29; then
   echo
