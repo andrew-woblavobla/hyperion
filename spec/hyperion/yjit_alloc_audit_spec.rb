@@ -125,4 +125,60 @@ RSpec.describe 'YJIT allocation audit (Phase 11)' do
     expect(per_req).to be <= 3.0,
                        "expected ≤ 3.0 objects/req, got #{per_req.round(2)}"
   end
+
+  describe 'C-path engagement (plan #1 — direct-syscall response writer)' do
+    # Socket.pair gives us a real kernel fd so real_fd_io? returns true
+    # and c_path_eligible? is true — the C dispatcher is engaged.
+    # A drain thread reads from the reader side so the kernel send buffer
+    # never fills (which would flip the C path into WOULDBLOCK and fall
+    # back to Ruby, skewing the measurement).
+    def per_request_allocations_with_fd(iterations)
+      reader, writer_io = Socket.pair(:UNIX, :STREAM)
+      drain = Thread.new { reader.read rescue nil }
+
+      # Warm up: same shape as the NullSinkIO warm, but routes through
+      # the C dispatcher because the writer fd has a real fileno.
+      20.times do
+        status, headers, body = Hyperion::Adapter::Rack.call(app, request)
+        writer.write(writer_io, status, headers, body, keep_alive: true)
+      end
+
+      GC.disable
+      GC.start
+      before = GC.stat[:total_allocated_objects]
+      iterations.times do
+        status, headers, body = Hyperion::Adapter::Rack.call(app, request)
+        writer.write(writer_io, status, headers, body, keep_alive: true)
+      end
+      after = GC.stat[:total_allocated_objects]
+      GC.enable
+
+      writer_io.close
+      drain.join
+      reader.close
+
+      (after - before).fdiv(iterations)
+    end
+
+    it 'allocates fewer objects per request than the Ruby path (C dispatcher engaged)' do
+      skip 'C ext not loaded' unless defined?(::Hyperion::Http::ResponseWriter) &&
+                                     ::Hyperion::Http::ResponseWriter.c_writer_available?
+      iterations = 2_000
+      per_req = per_request_allocations_with_fd(iterations)
+      # Plan #1 — the C path eliminates the Ruby `+''` head buffer and
+      # the per-chunk body `<<`, plus the IO#write encoding check on
+      # the buffered hot path.
+      #
+      # Measured baseline (macOS arm64, Ruby 3.3, C ext built, Socket.pair
+      # UNIX target): ~6.05 objects/req. The remaining allocations come
+      # from Adapter::Rack#build_env (the 2 host_header byteslices + env
+      # hash pool round-trip) which is on the same call path as the
+      # NullSinkIO benchmark but unchanged by the C writer.
+      #
+      # Budget = ceil(1.2 × 6.08) = 8.0. If the measured count drifts
+      # up intentionally (new env key, etc.), regenerate and lift here.
+      expect(per_req).to be <= 8.0,
+                         "expected ≤ 8.0 objects/req on the C path, got #{per_req.round(2)}"
+    end
+  end
 end
