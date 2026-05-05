@@ -48,6 +48,8 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod buffer_ring;
+pub mod hotpath;
+pub use hotpath::Completion as HotpathCompletion;
 
 use std::os::raw::{c_int, c_uchar, c_uint};
 
