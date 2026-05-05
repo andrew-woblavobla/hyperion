@@ -135,12 +135,29 @@ module Hyperion
       # keep the existing pattern of caching boot-time refs as ivars so
       # the per-request observe stays a single Hash lookup.
       @path_templater = path_templater || Hyperion::Metrics.default_path_templater
+      # PR3-4 — split_host per-connection cache. On keep-alive
+      # connections the Host: header rarely changes between requests
+      # (client sends the same host on every request in the pipeline).
+      # Caching the split_host result avoids 2 String allocations
+      # (byteslice for name + port) and the branch dispatch per request.
+      # Cache invalidates when the header value changes.
+      @host_cache_header = nil
+      @host_cache_parsed = nil
       # 2.12-E — per-worker request counter label. Cached once per
       # Connection (Process.pid is process-constant — re-reading it per
       # request would allocate the to_s String every time the operator
       # asked Ruby for the symbol/label). Each Connection lives in
       # exactly one process, so the cache is tight and never stale.
       @worker_id = Process.pid.to_s
+      # PR3-4b — per-connection cache for the observe_request_duration
+      # label tuple [method, path_template, status_class].  On keep-alive
+      # benchmark connections the same GET / 2xx tuple repeats on every
+      # request; caching the frozen Array avoids 1 Array allocation +
+      # 3 String refs per request on the steady-state hot path.
+      # Cache key is [method, templated_path, status_class] so any change
+      # in method, route, or status class correctly invalidates and rebuilds.
+      @duration_label_cache_key = nil   # [method_str, templated_path, status_class]
+      @duration_label_cached    = nil   # frozen [method_str, templated_path, status_class]
       # 2.13-A — pre-build the frozen single-element label tuple that
       # `tick_worker_request` would otherwise allocate every request
       # (`[@worker_id]` per call). Per-Connection caching is safe
@@ -195,6 +212,12 @@ module Hyperion
     # NOT hijack on request N must still get the normal response path,
     # and a hijack on request N+1 should not be observed during request N.
     attr_reader :socket
+
+    # PR3-4 — split_host per-connection cache accessors.
+    # These are written by Adapter::Rack#build_env and read on the
+    # next request on the same keep-alive connection. The cache is
+    # connection-owned so there are no cross-connection races.
+    attr_accessor :host_cache_header, :host_cache_parsed
 
     # 2.6-C — per-response dispatch-mode override.  Reset to `nil` at
     # the top of each request iteration; the Rack adapter sets this to
@@ -1119,22 +1142,36 @@ module Hyperion
 
     # 2.4-C — observe one sample on the per-route request-duration
     # histogram. Best-effort: a misbehaving templater or sink degrades
-    # silently to no observation. The label tuple Array is fresh per
-    # call (3 small Strings) — that's the only allocation cost the
-    # observation imposes on the response path. Histogram observation
-    # itself reuses the per-(name, labels_tuple) accumulator after the
-    # first samples for a given templated path, so steady-state per-
-    # route observations are zero-allocation past the tuple Array.
+    # silently to no observation.
+    #
+    # PR3-4b — per-connection label tuple cache. On keep-alive benchmark
+    # connections the same [method, template, status_class] tuple repeats
+    # on every request. We cache the last frozen tuple and the raw key
+    # triple that produced it. On a hit we skip the Array allocation and
+    # pass the cached frozen object; the Metrics shard sees the SAME
+    # frozen Array on every request and reuses the pre-looked-up
+    # HistogramAccumulator directly (one Hash#[] with cached hash code).
     def observe_request_duration(request, status, started_at)
       duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
       method   = request.method
       template = @path_templater.template(request.path)
-      class_ = STATUS_CLASS[status / 100] || STATUS_CLASS[0]
-      @metrics.observe_histogram(
-        REQUEST_DURATION_HISTOGRAM,
-        duration,
-        [method, template, class_]
-      )
+      class_   = STATUS_CLASS[status / 100] || STATUS_CLASS[0]
+
+      # Cache miss: method, template, or status class changed.
+      cached_key = @duration_label_cache_key
+      label_tuple = if cached_key &&
+                       cached_key[0].equal?(method) &&
+                       cached_key[1] == template &&
+                       cached_key[2].equal?(class_)
+                      @duration_label_cached
+                    else
+                      t = [method, template, class_].freeze
+                      @duration_label_cache_key = t
+                      @duration_label_cached    = t
+                      t
+                    end
+
+      @metrics.observe_histogram(REQUEST_DURATION_HISTOGRAM, duration, label_tuple)
     rescue StandardError
       nil
     end

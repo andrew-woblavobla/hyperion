@@ -133,8 +133,29 @@ module Hyperion
       increment(key, -by)
     end
 
+    # PR3-1 — STATUS_SYMBOLS: pre-intern :"responses_NNN" for the 40 most
+    # common HTTP status codes.  `increment_status` was doing
+    # `:"responses_#{code}"` per request — that's a String allocation +
+    # Symbol table lookup on every response.  The table lookup is O(1) Hash
+    # but the interpolation pays a hidden 1-String-per-call cost even when
+    # the resulting Symbol is already interned.  Pre-building the frozen
+    # Hash eliminates that allocation on the hot path; the fallback
+    # `:"responses_#{code}"` covers exotic codes without breaking anything.
+    STATUS_SYMBOLS = begin
+      codes = [
+        100, 101, 200, 201, 202, 203, 204, 205, 206,
+        301, 302, 303, 304, 307, 308,
+        400, 401, 402, 403, 404, 405, 406, 407, 408, 409,
+        410, 411, 412, 413, 414, 415, 416, 422, 429,
+        500, 501, 502, 503, 504, 505
+      ]
+      h = {}
+      codes.each { |c| h[c] = :"responses_#{c}" }
+      h.freeze
+    end
+
     def increment_status(code)
-      increment(:"responses_#{code}")
+      increment(STATUS_SYMBOLS[code] || :"responses_#{code}")
     end
 
     # 2.12-E — labeled counter family that observes which worker

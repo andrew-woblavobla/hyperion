@@ -644,7 +644,32 @@ module Hyperion
 
         def build_env(request, connection: nil)
           host_header = request.header('host') || ''
-          server_name, server_port = split_host(host_header)
+
+          # PR3-4 — split_host per-connection cache. On keep-alive
+          # benchmark connections the Host: header value is identical for
+          # every request in the pipeline. We stash the last parsed result
+          # on the Connection object; if the header matches we skip the
+          # split_host branch dispatch + 2 String allocations entirely.
+          # The cache is per-Connection (not process-global) so there are
+          # no cross-connection data races. Falls back to the full split
+          # when connection is nil (h2 streams, specs without a Connection).
+          if connection &&
+             connection.respond_to?(:host_cache_header) &&
+             connection.host_cache_header == host_header
+            parsed = connection.host_cache_parsed
+            server_name = parsed[0]
+            server_port = parsed[1]
+          else
+            server_name, server_port = split_host(host_header)
+            if connection && connection.respond_to?(:host_cache_header=)
+              # Store a frozen copy of the header string (the request
+              # object owns the original; using it directly is safe but
+              # we freeze to avoid any mutation surprise).
+              frozen_header = host_header.empty? ? host_header : host_header.frozen? ? host_header : host_header.dup.freeze
+              connection.host_cache_header = frozen_header
+              connection.host_cache_parsed = [server_name.dup.freeze, server_port.frozen? ? server_port : server_port.dup.freeze].freeze
+            end
+          end
 
           env = ENV_POOL.acquire
           # 2.13-D — gRPC streaming requests pass a non-String IO-shaped
