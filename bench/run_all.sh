@@ -217,13 +217,28 @@ setup_pg_bench_db() {
   fi
 
   local dbname="${PGDATABASE_BENCH:-hyperion_bench}"
-  # createdb is idempotent if we tolerate the duplicate-database error.
-  if ! psql -lqt | cut -d \| -f 1 | grep -qw "$dbname"; then
+  # Existence check via a server-side query against pg_database.
+  # `psql -lqt` (the older approach) selects columns that vary across
+  # major versions (e.g. d.daticulocale exists on PG 17 but not PG 16
+  # clients), so an older local psql against a newer server errors out
+  # and the grep below sees empty stdin. The pg_database query works
+  # against any reachable server, regardless of client/server version
+  # skew. Output is `1` when the DB exists, empty otherwise.
+  local exists
+  exists="$(psql -tAc "SELECT 1 FROM pg_database WHERE datname='$dbname'" postgres 2>/dev/null || true)"
+  if [ "$exists" != "1" ]; then
     echo "[setup_pg_bench_db] creating database $dbname"
-    createdb "$dbname" || {
-      echo "[setup_pg_bench_db] createdb failed; check PG auth on this host"
-      return 1
-    }
+    if ! createdb "$dbname" 2>/tmp/createdb.err; then
+      # Tolerate "already exists" (TOCTOU race or concurrent run);
+      # any other error is fatal.
+      if grep -q 'already exists' /tmp/createdb.err; then
+        echo "[setup_pg_bench_db] $dbname already exists (treating as success)"
+      else
+        echo "[setup_pg_bench_db] createdb failed; check PG auth on this host"
+        cat /tmp/createdb.err >&2
+        return 1
+      fi
+    fi
   fi
 
   echo "[setup_pg_bench_db] migrating $dbname"
