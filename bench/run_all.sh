@@ -194,17 +194,17 @@ boot_hyperion() {
 
 # Boot a Puma / Falcon / Agoo server.
 boot_puma() {
-  local rackup="$1"
-  echo "[puma] boot: bundle exec puma -t 5:5 -w 1 -b tcp://$HOST:$PORT $rackup"
-  $SETSID nohup bundle exec puma -t 5:5 -w 1 -b "tcp://$HOST:$PORT" "$rackup" \
+  local rackup="$1" workers="${2:-1}"
+  echo "[puma] boot: bundle exec puma -t 5:5 -w $workers -b tcp://$HOST:$PORT $rackup"
+  $SETSID nohup bundle exec puma -t 5:5 -w "$workers" -b "tcp://$HOST:$PORT" "$rackup" \
     > "/tmp/2.15-bench-puma.log" 2>&1 < /dev/null &
   PID=$!
 }
 boot_falcon() {
-  local rackup="$1"
-  echo "[falcon] boot: bundle exec falcon serve --bind http://localhost:$PORT --hybrid -n 1 --forks 1 --threads 5 --config $rackup"
+  local rackup="$1" forks="${2:-1}"
+  echo "[falcon] boot: bundle exec falcon serve --bind http://localhost:$PORT --hybrid -n 1 --forks $forks --threads 5 --config $rackup"
   $SETSID nohup bundle exec falcon serve \
-    --bind "http://localhost:$PORT" --hybrid -n 1 --forks 1 --threads 5 \
+    --bind "http://localhost:$PORT" --hybrid -n 1 --forks "$forks" --threads 5 \
     --config "$rackup" > "/tmp/2.15-bench-falcon.log" 2>&1 < /dev/null &
   PID=$!
 }
