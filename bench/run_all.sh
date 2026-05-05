@@ -169,14 +169,24 @@ bench_wrk_row() {
   echo "$row,$label,wrk,$rackup,$rps_med,$p99_med,${trials// /|}," >> "$OUT_CSV"
 }
 
-# Boot a Hyperion server in background. Uses setsid so SIGINT to the
-# harness doesn't double-fire into the server. Returns the PID.
+# macOS doesn't ship `setsid`. Use it on Linux for clean process-group
+# isolation (so a SIGINT to the harness doesn't double-fire into the
+# server); fall back to plain `nohup` on macOS where the smoke runs
+# (Task 20) are short-lived and isolation matters less.
+if command -v setsid >/dev/null 2>&1; then
+  SETSID="setsid"
+else
+  SETSID=""
+fi
+
+# Boot a Hyperion server in background. Uses setsid (Linux) for clean
+# process-group isolation. Returns the PID.
 boot_hyperion() {
   local label="$1" rackup="$2"; shift 2
   local extra_env="${HYPERION_EXTRA_ENV:-}"
   echo "[$label] boot: $extra_env bundle exec hyperion $* $rackup"
   # shellcheck disable=SC2086
-  env $extra_env setsid nohup bundle exec hyperion "$@" "$rackup" \
+  env $extra_env $SETSID nohup bundle exec hyperion "$@" "$rackup" \
     > "/tmp/2.15-bench-$label.log" 2>&1 < /dev/null &
   PID=$!
   disown 2>/dev/null || true
@@ -186,14 +196,14 @@ boot_hyperion() {
 boot_puma() {
   local rackup="$1"
   echo "[puma] boot: bundle exec puma -t 5:5 -w 1 -b tcp://$HOST:$PORT $rackup"
-  setsid nohup bundle exec puma -t 5:5 -w 1 -b "tcp://$HOST:$PORT" "$rackup" \
+  $SETSID nohup bundle exec puma -t 5:5 -w 1 -b "tcp://$HOST:$PORT" "$rackup" \
     > "/tmp/2.15-bench-puma.log" 2>&1 < /dev/null &
   PID=$!
 }
 boot_falcon() {
   local rackup="$1"
   echo "[falcon] boot: bundle exec falcon serve --bind http://localhost:$PORT --hybrid -n 1 --forks 1 --threads 5 --config $rackup"
-  setsid nohup bundle exec falcon serve \
+  $SETSID nohup bundle exec falcon serve \
     --bind "http://localhost:$PORT" --hybrid -n 1 --forks 1 --threads 5 \
     --config "$rackup" > "/tmp/2.15-bench-falcon.log" 2>&1 < /dev/null &
   PID=$!
@@ -201,7 +211,7 @@ boot_falcon() {
 boot_agoo() {
   local rackup="$1" workers="${2:-1}"
   echo "[agoo] boot: bundle exec ruby bench/agoo_boot.rb $rackup $PORT 5 $workers"
-  setsid nohup bundle exec ruby bench/agoo_boot.rb "$rackup" "$PORT" 5 "$workers" \
+  $SETSID nohup bundle exec ruby bench/agoo_boot.rb "$rackup" "$PORT" 5 "$workers" \
     > "/tmp/2.15-bench-agoo.log" 2>&1 < /dev/null &
   PID=$!
 }
