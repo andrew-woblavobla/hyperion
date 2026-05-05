@@ -36,3 +36,5 @@ gem 'hyperion-rb', path: ENV.fetch('HYPERION_PATH', '/home/ubuntu/hyperion')
 # is the rackup; the other rows (hello, static, work, sse_generic) ignore them.
 gem 'pg',                '~> 1.5'
 gem 'hyperion-async-pg', '~> 0.5'
+
+gem 'stackprof', '~> 0.2'  # used by bench/profile_hello.rb for hot-path profiling
