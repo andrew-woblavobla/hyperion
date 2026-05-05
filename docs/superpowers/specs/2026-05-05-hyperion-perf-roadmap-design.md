@@ -137,6 +137,16 @@ narrows but does not close, #1 + #2 still do work on those rows.
 Revert the bench commits. SQLite path was preserved; no app-side change
 to undo.
 
+### Outcome (filled in after bench re-run)
+
+- Date: 2026-05-05
+- Host: openclaw-vm (Linux 6.8); PG: pg.wobla.space (PG 17.2)
+- AR-CRUD 1w (Hyperion vs Agoo): 569.63 r/s vs 488.90 r/s → **pass (+16.5%)**
+- AR-CRUD 4w (Hyperion vs Agoo): 2098.73 r/s vs 509.25 r/s → **pass (4.1x)**
+- Decision: **(a) PG closes the AR-CRUD gap.** Class #3 retired. Plans #1 and #2 proceed with one fewer success criterion.
+
+CSV: `docs/BENCH_HYPERION_2_17_AR_results.csv`.
+
 ---
 
 ## #1 — C-side ResponseWriter (full path, plain TCP only)

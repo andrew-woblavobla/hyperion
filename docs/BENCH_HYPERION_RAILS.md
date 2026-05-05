@@ -20,6 +20,22 @@ Each server boots fresh per row, port released between rows.
 
 ---
 
+## DB choice for AR-CRUD rows
+
+The AR-CRUD rows (19-22, 27-28) require `RAILS_DB=pg` to exercise the
+canonical Hyperion path: `--async-io` + `hyperion-async-pg`, where the
+AR-side `Fiber.scheduler.io_wait` parks on the PG socket while other
+fibers run. SQLite in `mode=memory&cache=shared` (the previous default)
+has no socket to yield on — the per-stmt cost is GVL-held C work + pool-
+mutex contention, which characterizes neither Hyperion nor the
+comparison servers fairly.
+
+Hosts without PG can still run the AR rows by unsetting `RAILS_DB`
+(or `RAILS_DB=sqlite`); the rows then exercise SQLite-mem-shared as
+before. The headline numbers in this doc are PG.
+
+---
+
 ## Pre-tuning baseline
 
 ### Single-worker (1w × 5t)
@@ -212,3 +228,66 @@ spec.
 # Default rows + Rails matrix in one go:
 ./bench/run_all.sh --with-rails
 ```
+
+## Post-PG-switch (2026-05-05)
+
+After switching the AR-CRUD rows to Postgres + `--async-io` +
+`hyperion-async-pg` (per `docs/superpowers/specs/2026-05-05-hyperion-perf-roadmap-design.md` §#3),
+the AR rows of the Rails matrix re-ran on `openclaw-vm` against
+a remote PG 17 (`pg.wobla.space`).
+
+### Single-worker (1w × 5t) — PG
+
+| Workload | Hyperion (r/s) | Agoo (r/s) | Falcon (r/s) | Puma (r/s) | Bar |
+|---|---:|---:|---:|---:|:---:|
+| AR-CRUD `/users.json` | **569.63** | 488.90 | 395.80 | BOOT-FAIL | **pass (116.5%)** |
+
+### Multi-worker (4w × 5t, Hyperion vs Agoo) — PG
+
+| Workload | Hyperion (r/s) | Agoo (r/s) | Bar |
+|---|---:|---:|:---:|
+| AR-CRUD | **2098.73** | 509.25 | **pass (412%)** |
+
+### Latency (p99 median)
+
+| Row | Server | p99 |
+|---|---|---:|
+| 19 | Hyperion 1w | 497 ms |
+| 20 | Agoo 1w | 418 ms |
+| 27 | Hyperion 4w | 485 ms |
+| 28 | Agoo 4w | 320 ms |
+
+Hyperion's p99 is comparable to Agoo's at 1w; at 4w Agoo edges
+Hyperion on p99 (320 vs 485 ms), but Hyperion's median throughput is
+4.1× higher — the latency tradeoff is a deeper queue at higher
+throughput, the same shape as the pre-tuning matrix.
+
+CSV: `docs/BENCH_HYPERION_2_17_AR_results.csv`.
+
+### Decision
+
+**(a) PG closes the AR-CRUD gap.** Both gated rows (19/20 and 27/28)
+pass Bar d. Class #3 of the perf roadmap is retired. #1 (C
+ResponseWriter) and #2 (io_uring hot path) proceed as planned but
+with one fewer success criterion to chase.
+
+The result confirms the design analysis: SQLite-mem-shared was
+characterizing the wrong axis. Hyperion's `--async-io` +
+`hyperion-async-pg` story is the path the AR rows are meant to test,
+and against that workload Hyperion is comfortably ahead of Agoo at
+both 1w and 4w.
+
+#### Caveats worth flagging
+
+- Agoo segfaulted in trial 3 of row 20 (1w PG); two clean trials
+  (495.50 / 488.90 r/s) and one zero-result trial. Median (488.90)
+  is the middle value, so the segfault doesn't bias the headline.
+- Agoo row 28 trial spread was wide (509.25 / 1923.82 / 163.68);
+  Agoo on PG appears flaky under load. Median was taken.
+- Puma row 22 BOOT-FAIL (Puma didn't bind cleanly on this host with
+  PG configuration); Puma is a comparison row, not a Bar d gate, so
+  this doesn't affect the decision.
+- The Hyperion 4w row (2098.73 r/s) shows PG itself is comfortably
+  keeping up with the bench load; the bench DB has 100 seeded users
+  and the queries are a `SELECT ... LIMIT 10` shape, well within PG's
+  capacity for this concurrency.
