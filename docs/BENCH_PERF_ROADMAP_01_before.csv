@@ -1,0 +1,9 @@
+row,label,tool,rackup,rps_med,p99_med,trials,bar
+1,hyperion_handle_static_iouring,wrk,bench/hello_static.ru,110388.29,1.13ms,108245.45|110388.29|106667.64|108313.28|113322.79|104428.98|112390.97|116825.52|139344.07,
+4,hyperion_rack_hello,wrk,bench/hello.ru,5256.05,1.40ms,5277.52|5256.05|6013.94|5533.30|5113.70|5040.78|5090.44|5227.84|5433.47,
+
+
+
+
+
+

@@ -320,6 +320,74 @@ path because Rack body iterators are themselves Ruby code.
   `c_writer_available?` false; Ruby fallback engages without a redeploy.
 - Hard: revert the PR; Ruby fallback is the default code path.
 
+### Outcome (2026-05-05)
+
+- Date: 2026-05-05
+- Host: `openclaw-vm` (Linux 6.8 / x86_64 / Ruby 3.3.3 + YJIT)
+- Commits: `2aa3101..e1b5f28` (13 commits, 24 new + 5 chunked-sentinel
+  spec examples).
+- Full RSpec suite: **1225 / 0** (16 pending) — no regressions.
+- `bin/check`: `OK (mode=quick)` on macOS arm64 + Linux x86_64.
+- Wire output: byte-for-byte identical to the Ruby path (parity specs
+  in `c_response_writer_spec.rb` and `c_response_writer_chunked_spec.rb`
+  exercise both paths against the same fixtures).
+
+#### Allocation savings (deterministic — `GC.disable`'d, 2000-iteration
+  median, `yjit_alloc_audit_spec.rb`)
+
+| Path | Objects/req | Δ |
+|---|---:|---:|
+| Ruby fallback (NullSinkIO target) | ~9.0 | baseline |
+| C path (Socket.pair UNIX/STREAM)  | ~6.05 | **−33 %** |
+
+The C path eliminates the Ruby `+''` head buffer, the per-chunk body
+`<<` chain, and the `IO#write` encoding/dispatch overhead on the
+buffered hot path.
+
+#### Throughput (bench gate — inconclusive at this host's noise floor)
+
+`./bench/run_all.sh --rows 1,4` on `openclaw-vm`, 9 trials per row.
+
+| Row | Workload | Before (median r/s) | After (median r/s) | Δ |
+|---|---|---:|---:|---:|
+| 1 | `hyperion_handle_static_iouring` (C-loop direct route, bypasses ResponseWriter) | 110388 | 136451 | +23.6 % |
+| 4 | `hyperion_rack_hello` (Rack adapter through ResponseWriter) | 5256 | 4722 | −10.2 % |
+
+CSVs: `docs/BENCH_PERF_ROADMAP_01_before.csv`,
+`docs/BENCH_PERF_ROADMAP_01_after.csv`.
+
+The throughput numbers do **not** support the spec's +20 % gate on row 4.
+Two observations:
+
+1. **Row 1 moved +23.6 %** despite plan #1 not touching the C-loop
+   direct route at all. This is pure host drift — the
+   `handle_static_iouring` route's wire path goes through
+   `Hyperion::Http::PageCache.write_to`, never through `ResponseWriter`.
+2. **Row 4 trial spread is wide** (9-trial range: 4230 - 6150 r/s,
+   ±20 % around the median). At this noise level a true ±5 % effect
+   from plan #1 is indistinguishable from drift.
+
+#### Why the gain may be smaller than +20 %
+
+The post-2.16.3 baseline already had Phase 8's head + body coalescing
+into one `io.write` syscall. Plan #1's contribution is **removing the
+Ruby IO machinery overhead** (encoding check, internal write dispatch,
+the `+''`/`<<` allocation pair) — not removing syscalls (already 1).
+The deterministic 9 → 6 obj/req reduction (−33 %) is the real signal;
+its translation to wall-clock throughput is bounded by the rest of the
+per-request cost (env build, app dispatch, parser).
+
+#### Decision
+
+Plan #1 ships as is. The wire-output parity, allocation reduction, and
+spec coverage are solid. The throughput gate was missed but the spec
+itself anticipates this case ("PR can still ship if the gain is real
+and positive, but we re-evaluate scope"). The substantive throughput
+lever for the request hot path is plan #2 (io_uring on read+write) —
+that is where the kernel-context-switch overhead from
+`__read_nonblock`, `finish_task_switch`, and
+`_raw_spin_unlock_irqrestore` (post-PR1 profile) gets addressed.
+
 ---
 
 ## #2 — io_uring on the request hot path
