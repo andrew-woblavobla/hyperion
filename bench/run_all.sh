@@ -26,6 +26,8 @@
 #   ./bench/run_all.sh --row 1               # single row
 #   ./bench/run_all.sh --rows 1,2,3,4,5      # subset
 #   ./bench/run_all.sh --skip-grpc           # rows 1-5 + 7-9
+#   ./bench/run_all.sh --rails              # Rails matrix only (rows 11-32)
+#   ./bench/run_all.sh --with-rails         # default rows + Rails matrix
 #
 # Knobs (env):
 #   PORT=9810 DURATION=20s WRK_THREADS=4 WRK_CONNS=100 RUNS=3
@@ -61,21 +63,40 @@ OUT_MD="${OUT_MD:-/tmp/hyperion-2.15-bench.md}"
 
 ROWS_FILTER=""
 SKIP_GRPC=0
+RAILS_ONLY=0
+INCLUDE_RAILS=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --row) ROWS_FILTER="$2"; shift 2 ;;
     --rows) ROWS_FILTER="$2"; shift 2 ;;
     --skip-grpc) SKIP_GRPC=1; shift ;;
-    -h|--help) sed -n '1,50p' "$0"; exit 0 ;;
+    --rails) RAILS_ONLY=1; INCLUDE_RAILS=1; shift ;;
+    --with-rails) INCLUDE_RAILS=1; shift ;;
+    -h|--help) sed -n '1,57p' "$0"; exit 0 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
 
 want_row() {
   local n="$1"
-  [ -z "$ROWS_FILTER" ] && return 0
-  echo ",$ROWS_FILTER," | grep -q ",$n,"
+  # If --rails was given without --rows, run only Rails rows (11-32).
+  # If --rows was also given, the explicit list wins.
+  if [ -z "$ROWS_FILTER" ] && [ "$RAILS_ONLY" = "1" ]; then
+    [ "$n" -ge 11 ] && [ "$n" -le 32 ]
+    return $?
+  fi
+  # If --rows was given, only those rows run.
+  if [ -n "$ROWS_FILTER" ]; then
+    echo ",$ROWS_FILTER," | grep -q ",$n,"
+    return $?
+  fi
+  # Default: rows 1-10 (existing behavior); skip Rails rows unless --with-rails.
+  if [ "$n" -ge 11 ] && [ "$n" -le 32 ]; then
+    [ "$INCLUDE_RAILS" = "1" ]
+    return $?
+  fi
+  return 0
 }
 
 PID=""
