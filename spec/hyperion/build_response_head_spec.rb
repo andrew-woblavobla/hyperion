@@ -165,6 +165,47 @@ RSpec.describe 'Hyperion::CParser.build_response_head' do
     expect(head).to include("content-length: 0\r\n")
   end
 
+  describe 'chunked-encoding sentinel (body_size = -1)' do
+    it 'emits transfer-encoding: chunked instead of content-length' do
+      head = call({ 'content-type' => 'text/plain' }, body_size: -1)
+      expect(head).to start_with("HTTP/1.1 200 OK\r\n")
+      expect(head).to include("transfer-encoding: chunked\r\n")
+      expect(head).not_to include('content-length:')
+      expect(head).to include("content-type: text/plain\r\n")
+      expect(head).to end_with("\r\n\r\n")
+    end
+
+    it 'drops a caller-supplied transfer-encoding header (we always emit chunked)' do
+      head = call({ 'transfer-encoding' => 'gzip' }, body_size: -1)
+      expect(head).to include("transfer-encoding: chunked\r\n")
+      expect(head).not_to include('transfer-encoding: gzip')
+    end
+
+    it 'drops a caller-supplied content-length header' do
+      head = call({ 'content-length' => '99' }, body_size: -1)
+      expect(head).to include("transfer-encoding: chunked\r\n")
+      expect(head).not_to include('content-length:')
+    end
+
+    it 'survives the full-line cache: a non-chunked TE-cached entry is skipped in chunked mode' do
+      # First populate the full-line cache with a frozen TE entry via a
+      # non-chunked call. Then re-issue a chunked call carrying the same
+      # TE; the chunked branch must skip the cached non-chunked TE line
+      # and emit the canonical chunked line instead.
+      frozen_te = -'identity'
+      call({ 'transfer-encoding' => frozen_te }, body_size: 5)
+      head = call({ 'transfer-encoding' => frozen_te }, body_size: -1)
+      expect(head).to include("transfer-encoding: chunked\r\n")
+      expect(head).not_to include('transfer-encoding: identity')
+    end
+
+    it 'raises ArgumentError for body_size < -1 (programming-error guard)' do
+      expect {
+        call({ 'content-type' => 'text/plain' }, body_size: -2)
+      }.to raise_error(ArgumentError, /body_size must be >= 0/)
+    end
+  end
+
   it 'survives a stress loop over many distinct (key, value) pairs without corrupting earlier entries' do
     # Drive the full-line cache toward saturation. After saturation the
     # cache stops growing — which means new (k, v) pairs MUST still be

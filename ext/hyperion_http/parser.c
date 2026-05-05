@@ -3,6 +3,7 @@
 #include <ruby/st.h>
 #include <string.h>
 #include "llhttp.h"
+#include "response_writer.h"
 
 /* ----------------------------------------------------------------------
  * Hyperion::CParser — C extension wrapping llhttp.
@@ -825,6 +826,16 @@ static VALUE cbuild_response_head(VALUE self, VALUE rb_status, VALUE rb_reason,
     int status     = NUM2INT(rb_status);
     long body_size = NUM2LONG(rb_body_size);
     int keep_alive = RTEST(rb_keep_alive);
+
+    /* body_size == -1 is the chunked-encoding sentinel; any other
+     * negative value is a programming error (likely an integer
+     * underflow in a caller). Reject early with a clear message
+     * rather than silently treating -2 / -42 as chunked. */
+    if (body_size < -1) {
+        rb_raise(rb_eArgError,
+                 "body_size must be >= 0 (or -1 for chunked sentinel), got %ld",
+                 body_size);
+    }
 
     /* body_size == -1 is the chunked-encoding sentinel (from
      * hyperion_build_response_head_chunked).  In this mode we emit
