@@ -118,7 +118,7 @@ trap 'stop_port' EXIT INT TERM
 
 wait_for_bind() {
   local label="$1" url_path="${2:-/}"
-  for i in $(seq 1 7); do
+  for i in $(seq 1 12); do
     sleep 1
     if curl -sS -o /dev/null --max-time 1 "http://$HOST:$PORT$url_path" 2>/dev/null; then
       echo "[$label] bound after ${i}s"
@@ -383,6 +383,70 @@ if want_row 10 && [ "$SKIP_GRPC" = "0" ]; then
     echo "[row10] ghz binary not at $GHZ — skipping"
     echo "10,ref_falcon_grpc_unary,ghz,bench/grpc_stream_falcon.rb,SKIP,SKIP,ghz-not-installed," >> "$OUT_CSV"
   fi
+fi
+
+# ============================================================
+# Rails matrix (rows 11-32) — opt-in via --rails or --with-rails
+# ============================================================
+
+# ---------- Row 11: Hyperion Rails API-only (1w x 5t) ----------
+if want_row 11; then
+  echo
+  echo "=== Row 11: Hyperion Rails API-only (1w x 5t) ==="
+  stop_port
+  boot_hyperion "row11" "bench/rails_api.ru" -t 5 -w 1 -p "$PORT"
+  if wait_for_bind "row11" "/healthz"; then
+    warmup_hit "row11" "/api/users"
+    bench_wrk_row 11 "hyperion_rails_api_1w" "bench/rails_api.ru" "/api/users"
+  else
+    echo "11,hyperion_rails_api_1w,wrk,bench/rails_api.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 12: Agoo Rails API-only (1w x 5t) ----------
+if want_row 12; then
+  echo
+  echo "=== Row 12: Agoo Rails API-only (1w x 5t) ==="
+  stop_port
+  boot_agoo "bench/rails_api.ru" 1
+  if wait_for_bind "agoo-row12" "/healthz"; then
+    warmup_hit "row12" "/api/users"
+    bench_wrk_row 12 "agoo_rails_api_1w" "bench/rails_api.ru" "/api/users"
+  else
+    echo "12,agoo_rails_api_1w,wrk,bench/rails_api.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 13: Falcon Rails API-only (1w x 5t) ----------
+if want_row 13; then
+  echo
+  echo "=== Row 13: Falcon Rails API-only (1w x 5t) ==="
+  stop_port
+  boot_falcon "bench/rails_api.ru" 1
+  if wait_for_bind "falcon-row13" "/healthz"; then
+    warmup_hit "row13" "/api/users"
+    bench_wrk_row 13 "falcon_rails_api_1w" "bench/rails_api.ru" "/api/users"
+  else
+    echo "13,falcon_rails_api_1w,wrk,bench/rails_api.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 14: Puma Rails API-only (1w x 5t) ----------
+if want_row 14; then
+  echo
+  echo "=== Row 14: Puma Rails API-only (1w x 5t) ==="
+  stop_port
+  boot_puma "bench/rails_api.ru" 1
+  if wait_for_bind "puma-row14" "/healthz"; then
+    warmup_hit "row14" "/api/users"
+    bench_wrk_row 14 "puma_rails_api_1w" "bench/rails_api.ru" "/api/users"
+  else
+    echo "14,puma_rails_api_1w,wrk,bench/rails_api.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
 fi
 
 echo
