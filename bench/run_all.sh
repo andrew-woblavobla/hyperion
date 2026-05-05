@@ -297,10 +297,10 @@ if want_row 6 && [ "$SKIP_GRPC" = "0" ]; then
     rps_med=$(grep -E "unary MEDIAN" /tmp/2.15-bench-row6.log | head -1 | awk '{ print $4 }')
     p99_med=$(grep -E "unary MEDIAN" /tmp/2.15-bench-row6.log | head -1 | awk '{ print $6 }')
     echo "[row6] unary rps_med=$rps_med p99_med=$p99_med"
-    echo "6,hyperion_grpc_unary,ghz,bench/grpc_stream.ru,${rps_med:-NA},${p99_med:-NA},see-grpc-bench-log" >> "$OUT_CSV"
+    echo "6,hyperion_grpc_unary,ghz,bench/grpc_stream.ru,${rps_med:-NA},${p99_med:-NA},see-grpc-bench-log," >> "$OUT_CSV"
   else
     echo "[row6] ghz binary not at $GHZ — skipping; install via 'go install github.com/bojand/ghz/cmd/ghz@latest'"
-    echo "6,hyperion_grpc_unary,ghz,bench/grpc_stream.ru,SKIP,SKIP,ghz-not-installed" >> "$OUT_CSV"
+    echo "6,hyperion_grpc_unary,ghz,bench/grpc_stream.ru,SKIP,SKIP,ghz-not-installed," >> "$OUT_CSV"
   fi
 fi
 
@@ -355,10 +355,10 @@ if want_row 10 && [ "$SKIP_GRPC" = "0" ]; then
     rps_med=$(grep -E "unary MEDIAN" /tmp/2.15-bench-row10.log | head -1 | awk '{ print $4 }')
     p99_med=$(grep -E "unary MEDIAN" /tmp/2.15-bench-row10.log | head -1 | awk '{ print $6 }')
     echo "[row10] unary rps_med=$rps_med p99_med=$p99_med"
-    echo "10,ref_falcon_grpc_unary,ghz,bench/grpc_stream_falcon.rb,${rps_med:-NA},${p99_med:-NA},see-grpc-bench-log" >> "$OUT_CSV"
+    echo "10,ref_falcon_grpc_unary,ghz,bench/grpc_stream_falcon.rb,${rps_med:-NA},${p99_med:-NA},see-grpc-bench-log," >> "$OUT_CSV"
   else
     echo "[row10] ghz binary not at $GHZ — skipping"
-    echo "10,ref_falcon_grpc_unary,ghz,bench/grpc_stream_falcon.rb,SKIP,SKIP,ghz-not-installed" >> "$OUT_CSV"
+    echo "10,ref_falcon_grpc_unary,ghz,bench/grpc_stream_falcon.rb,SKIP,SKIP,ghz-not-installed," >> "$OUT_CSV"
   fi
 fi
 
