@@ -32,7 +32,19 @@ static VALUE rb_mResponseWriter;
 
 /* IDs cached at init time — avoids rb_intern on the hot path. */
 static ID id_fileno;
-static ID id_keys_resp;
+
+/* Pre-baked frozen Ruby Strings for the 23 common reason phrases.
+ * Built once at init; looked up by status code in c_write_buffered.
+ * Eliminates the per-request rb_str_new_cstr allocation that would
+ * otherwise fire on every response. Statuses outside the table fall
+ * back to a per-call rb_str_new_cstr("Unknown"). */
+#define HYP_REASON_TABLE_SIZE 23
+static int   k_reason_statuses[HYP_REASON_TABLE_SIZE] = {
+    200, 201, 204, 301, 302, 304, 400, 401, 403, 404, 405, 408,
+    409, 410, 413, 414, 422, 429, 500, 501, 502, 503, 504
+};
+static VALUE k_reason_strings[HYP_REASON_TABLE_SIZE];
+static VALUE k_reason_unknown;
 
 static VALUE c_response_writer_available_p(VALUE self) {
     (void)self;
@@ -52,55 +64,14 @@ static VALUE c_response_writer_available_p(VALUE self) {
  * multi-part case; Array[8+] coalesces. */
 #define HYP_C_IOV_MAX 8
 
-/* Reason phrase lookup — mirrors Hyperion::ResponseWriter::REASONS in
- * lib/hyperion/response_writer.rb and the k_status_lines table in
- * parser.c (the three must stay in sync). Returns a literal C string
- * for common statuses; "Unknown" as the catch-all (matching the Ruby
- * REASONS.fetch fallback). Called once per c_write_buffered call to
- * build the rb_reason VALUE passed to hyperion_build_response_head. */
-static const char *hyp_status_reason(int status) {
-    switch (status) {
-        case 200: return "OK";
-        case 201: return "Created";
-        case 204: return "No Content";
-        case 301: return "Moved Permanently";
-        case 302: return "Found";
-        case 304: return "Not Modified";
-        case 400: return "Bad Request";
-        case 401: return "Unauthorized";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 408: return "Request Timeout";
-        case 409: return "Conflict";
-        case 410: return "Gone";
-        case 413: return "Payload Too Large";
-        case 414: return "URI Too Long";
-        case 422: return "Unprocessable Entity";
-        case 429: return "Too Many Requests";
-        case 500: return "Internal Server Error";
-        case 501: return "Not Implemented";
-        case 502: return "Bad Gateway";
-        case 503: return "Service Unavailable";
-        case 504: return "Gateway Timeout";
-        default:  return "Unknown";
+/* Look up the cached reason String for `status`. Returns a frozen
+ * Ruby String for the 23 common statuses (zero allocation), or
+ * k_reason_unknown ("Unknown") for anything else. */
+static inline VALUE hyp_lookup_reason(int status) {
+    for (int i = 0; i < HYP_REASON_TABLE_SIZE; i++) {
+        if (k_reason_statuses[i] == status) return k_reason_strings[i];
     }
-}
-
-/* Validate a single header value: no CR/LF allowed (header injection
- * defense — matches response_writer.rb's `raise ArgumentError` guard
- * for CRLF_HEADER_VALUE). Declared static inline: small body, called
- * per-header, compiler can inline at each call site. */
-static inline void hyp_check_header_value(VALUE value) {
-    Check_Type(value, T_STRING);
-    const char *p = RSTRING_PTR(value);
-    long n = RSTRING_LEN(value);
-    for (long i = 0; i < n; i++) {
-        if (p[i] == '\r' || p[i] == '\n') {
-            rb_raise(rb_eArgError,
-                     "header value contains CR/LF (response-splitting guard)");
-        }
-    }
+    return k_reason_unknown;
 }
 
 /* Issue one sendmsg/writev with `iov_count` iovecs. Returns total
@@ -180,13 +151,19 @@ static VALUE c_write_buffered(VALUE self, VALUE io, VALUE rb_status,
                               VALUE rb_keep_alive, VALUE rb_date) {
     (void)self;
 
-    /* 1. Resolve fd from the Ruby IO object. rb_funcall can GC; do it
-     *    before we hold any raw C pointers into Ruby objects. */
+    /* 1. Type checks up front — fail fast on bad shapes before any
+     *    syscall. Header CR/LF validation and value coercion happen
+     *    inside cbuild_response_head (build_head_each), so we don't
+     *    duplicate them here. */
+    Check_Type(rb_headers, T_HASH);
+    Check_Type(rb_body, T_ARRAY);
+
+    /* 2. Resolve fd from the Ruby IO object. rb_funcall can GC; do it
+     *    before we take any raw C pointers into Ruby objects. */
     int fd = NUM2INT(rb_funcall(io, id_fileno, 0));
 
-    /* 2. Body type check and byte-size sum.
+    /* 3. Body type check and byte-size sum.
      *    RARRAY_AREF is safe while rb_body is live on the C stack. */
-    Check_Type(rb_body, T_ARRAY);
     long body_size = 0;
     long body_len  = RARRAY_LEN(rb_body);
     for (long i = 0; i < body_len; i++) {
@@ -195,30 +172,16 @@ static VALUE c_write_buffered(VALUE self, VALUE io, VALUE rb_status,
         body_size += RSTRING_LEN(chunk);
     }
 
-    /* 3. Header CR/LF validation. rb_hash_foreach would be slightly
-     *    faster but rb_funcall(keys) + iteration is cleaner given that
-     *    the hot path (n_headers ≤ 6) makes the difference negligible.
-     *    We iterate the keys Array returned by Hash#keys so we get both
-     *    key and value without a second lookup per pair. */
-    if (TYPE(rb_headers) == T_HASH) {
-        VALUE keys = rb_funcall(rb_headers, id_keys_resp, 0);
-        long klen  = RARRAY_LEN(keys);
-        for (long i = 0; i < klen; i++) {
-            VALUE k = RARRAY_AREF(keys, i);
-            VALUE v = rb_hash_aref(rb_headers, k);
-            hyp_check_header_value(v);
-        }
-    }
-
     /* 4. Build the response head.
      *    hyperion_build_response_head lives in parser.c and is exported
-     *    via response_writer.h. It requires a non-empty reason string —
-     *    an empty "" passes Check_Type but prints "HTTP/1.1 200 \r\n"
-     *    (blank reason) on the snprintf fallback path. We supply the
-     *    canonical reason from hyp_status_reason() so the pre-baked
-     *    status-line table in parser.c produces a single memcpy hit. */
+     *    via response_writer.h. The reason String comes from a pre-baked
+     *    frozen-String table — zero allocation for the 23 common statuses;
+     *    only unknown statuses fall back to k_reason_unknown.
+     *    cbuild_response_head's build_head_each performs the CR/LF guard
+     *    and rb_obj_as_string coercion on header values, matching the
+     *    Ruby fallback's semantics exactly. */
     int status = NUM2INT(rb_status);
-    VALUE rb_reason = rb_str_new_cstr(hyp_status_reason(status));
+    VALUE rb_reason = hyp_lookup_reason(status);
     VALUE head = hyperion_build_response_head(
         rb_status, rb_reason, rb_headers,
         LL2NUM(body_size), rb_keep_alive, rb_date
@@ -259,10 +222,13 @@ static VALUE c_write_buffered(VALUE self, VALUE io, VALUE rb_status,
 
     ssize_t n = hyp_writev_all(fd, iov, iov_count);
 
-    /* Touch coalesced after the syscall so the optimizer can't reap it
-     * before sendmsg/writev finishes scanning its iov_base pointer.
-     * Project-standard GC-safety idiom (matches other ext files). */
-    if (!NIL_P(coalesced)) (void)RSTRING_PTR(coalesced);
+    /* GC-safety: keep `head` and `coalesced` (when used) alive across
+     * the syscall. -O2 can elide local Ruby Strings whose only use is
+     * the RSTRING_PTR at iov assembly; MRI's conservative GC stack
+     * scan would then miss them. RB_GC_GUARD is the project-standard
+     * idiom (parser.c uses it 9 times for the same pattern). */
+    RB_GC_GUARD(head);
+    RB_GC_GUARD(coalesced);
 
     if (n == HYP_C_WRITE_WOULDBLOCK) return INT2NUM(HYP_C_WRITE_WOULDBLOCK);
     return SSIZET2NUM(n);
@@ -283,8 +249,25 @@ void Init_hyperion_response_writer(void) {
     rb_mResponseWriter = rb_define_module_under(rb_mHttp, "ResponseWriter");
 
     /* Cache rb_intern lookups at init time — never on the hot path. */
-    id_fileno    = rb_intern("fileno");
-    id_keys_resp = rb_intern("keys");
+    id_fileno = rb_intern("fileno");
+
+    /* Pre-bake the 23 common reason phrases as frozen, never-GC'd Ruby
+     * Strings so c_write_buffered can hand them to cbuild_response_head
+     * without an allocation. rb_global_variable pins them as GC roots. */
+    static const char *k_reason_phrases[HYP_REASON_TABLE_SIZE] = {
+        "OK", "Created", "No Content", "Moved Permanently", "Found",
+        "Not Modified", "Bad Request", "Unauthorized", "Forbidden",
+        "Not Found", "Method Not Allowed", "Request Timeout", "Conflict",
+        "Gone", "Payload Too Large", "URI Too Long", "Unprocessable Entity",
+        "Too Many Requests", "Internal Server Error", "Not Implemented",
+        "Bad Gateway", "Service Unavailable", "Gateway Timeout"
+    };
+    for (int i = 0; i < HYP_REASON_TABLE_SIZE; i++) {
+        k_reason_strings[i] = rb_obj_freeze(rb_str_new_cstr(k_reason_phrases[i]));
+        rb_global_variable(&k_reason_strings[i]);
+    }
+    k_reason_unknown = rb_obj_freeze(rb_str_new_cstr("Unknown"));
+    rb_global_variable(&k_reason_unknown);
 
     rb_define_singleton_method(rb_mResponseWriter, "available?",
                                c_response_writer_available_p, 0);
