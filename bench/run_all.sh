@@ -193,6 +193,54 @@ else
   SETSID=""
 fi
 
+# Postgres setup for the AR-CRUD bench rows (19-22 / 27-28).
+#
+# Idempotent: probes for pg_isready, creates the bench database if
+# missing, and runs the Rails migrations against it. Returns 0 on
+# success, non-zero if PG is not reachable (caller marks the AR rows
+# as BOOT-FAIL,no-pg).
+#
+# Required env (set by run_all.sh before AR rows):
+#   RAILS_DB=pg
+#   DATABASE_URL=postgres://localhost/hyperion_bench (default)
+#
+# On openclaw-vm: install with `apt-get install postgresql-15` and
+# `sudo -u postgres createuser -s ubuntu` (see docs/BENCH_HOST_SETUP.md).
+setup_pg_bench_db() {
+  if ! command -v pg_isready >/dev/null 2>&1; then
+    echo "[setup_pg_bench_db] pg_isready not on PATH; skipping AR rows"
+    return 1
+  fi
+  if ! pg_isready -q -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}"; then
+    echo "[setup_pg_bench_db] postgres not reachable at ${PGHOST:-localhost}:${PGPORT:-5432}; skipping AR rows"
+    return 1
+  fi
+
+  local dbname="${PGDATABASE_BENCH:-hyperion_bench}"
+  # createdb is idempotent if we tolerate the duplicate-database error.
+  if ! psql -lqt | cut -d \| -f 1 | grep -qw "$dbname"; then
+    echo "[setup_pg_bench_db] creating database $dbname"
+    createdb "$dbname" || {
+      echo "[setup_pg_bench_db] createdb failed; check PG auth on this host"
+      return 1
+    }
+  fi
+
+  echo "[setup_pg_bench_db] migrating $dbname"
+  (
+    cd bench/rails_app && \
+    RAILS_ENV=production RAILS_DB=pg \
+    DATABASE_URL="postgres://localhost/$dbname" \
+    BUNDLE_GEMFILE=../Gemfile.4way \
+    bundle exec bin/rails db:migrate
+  ) || {
+    echo "[setup_pg_bench_db] migrate failed; AR rows will boot-fail"
+    return 1
+  }
+
+  return 0
+}
+
 # Boot a Hyperion server in background. Uses setsid (Linux) for clean
 # process-group isolation. Returns the PID.
 boot_hyperion() {
