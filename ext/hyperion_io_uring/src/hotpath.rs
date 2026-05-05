@@ -65,6 +65,16 @@ pub struct Completion {
     pub flags:   u32,
 }
 
+// Compile-time ABI guard: Ruby (via Fiddle) reads Completion by byte
+// offset using the size assumed in lib/hyperion/io_uring.rb's
+// HotpathRing::COMPLETION_BYTES constant. If a future field/padding
+// change drifts this size, build fails here with a clear message
+// rather than producing silent garbage at runtime.
+const _: () = assert!(
+    std::mem::size_of::<Completion>() == 24,
+    "Completion ABI size changed — update Ruby Fiddle offsets in lib/hyperion/io_uring.rb"
+);
+
 // ===== Linux implementation =====
 
 #[cfg(target_os = "linux")]
@@ -126,6 +136,15 @@ mod linux_impl {
         /// accepted connection until the listener is closed or the SQE
         /// is cancelled.  Each accepted fd arrives as a separate CQE
         /// drained by `wait_completions`.
+        ///
+        /// CONTRACT: when `wait_completions` returns -1 (sets
+        /// `healthy = false`), the Ruby caller MUST stop issuing any
+        /// further `submit_*` calls and engage the per-worker accept4
+        /// fallback. This method does NOT guard on `is_healthy()`
+        /// itself — it would unconditionally push the SQE onto a
+        /// broken ring and fail at submit() with a confusing OS error.
+        /// The Ruby side checks `is_healthy()` after each
+        /// wait_completions return.
         ///
         /// Available since kernel 5.19.
         pub fn submit_accept_multishot(&mut self, listener_fd: RawFd)
@@ -394,6 +413,15 @@ pub use stub_impl::{HotpathRing, probe};
 /// Probe whether the hotpath (PBUF_RING + multishot accept/recv) is
 /// supported on this kernel.  Returns 0 on success, negative errno
 /// otherwise (e.g. -ENOSYS on kernels < 5.19 or in sandboxes).
+///
+/// CAVEAT — partial probe coverage:
+/// `probe()` exercises `IORING_REGISTER_PBUF_RING` only (kernel ≥ 5.19).
+/// `IORING_OP_RECV` with `IORING_RECV_MULTISHOT` requires kernel ≥ 6.0
+/// and is NOT exercised here. A 5.19-5.x kernel returns 0 from this
+/// probe but will reject the first `submit_recv_multishot` SQE with
+/// `result < 0` and no `IORING_CQE_F_MORE` bit. The Ruby caller MUST
+/// treat the first recv CQE failure as a feature-unavailable signal
+/// and fall back to the accept4 + read_nonblock path.
 #[no_mangle]
 pub extern "C" fn hyperion_io_uring_hotpath_supported() -> c_int {
     catch_unwind(probe).unwrap_or(-EINVAL)
