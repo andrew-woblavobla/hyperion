@@ -449,6 +449,66 @@ if want_row 14; then
   stop_port
 fi
 
+# ---------- Row 15: Hyperion Rails ERB (1w x 5t) ----------
+if want_row 15; then
+  echo
+  echo "=== Row 15: Hyperion Rails ERB (1w x 5t) ==="
+  stop_port
+  boot_hyperion "row15" "bench/rails_erb.ru" -t 5 -w 1 -p "$PORT"
+  if wait_for_bind "row15" "/healthz"; then
+    warmup_hit "row15" "/page"
+    bench_wrk_row 15 "hyperion_rails_erb_1w" "bench/rails_erb.ru" "/page"
+  else
+    echo "15,hyperion_rails_erb_1w,wrk,bench/rails_erb.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 16: Agoo Rails ERB (1w x 5t) ----------
+if want_row 16; then
+  echo
+  echo "=== Row 16: Agoo Rails ERB (1w x 5t) ==="
+  stop_port
+  boot_agoo "bench/rails_erb.ru" 1
+  if wait_for_bind "agoo-row16" "/healthz"; then
+    warmup_hit "row16" "/page"
+    bench_wrk_row 16 "agoo_rails_erb_1w" "bench/rails_erb.ru" "/page"
+  else
+    echo "16,agoo_rails_erb_1w,wrk,bench/rails_erb.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 17: Falcon Rails ERB (1w x 5t) ----------
+if want_row 17; then
+  echo
+  echo "=== Row 17: Falcon Rails ERB (1w x 5t) ==="
+  stop_port
+  boot_falcon "bench/rails_erb.ru" 1
+  if wait_for_bind "falcon-row17" "/healthz"; then
+    warmup_hit "row17" "/page"
+    bench_wrk_row 17 "falcon_rails_erb_1w" "bench/rails_erb.ru" "/page"
+  else
+    echo "17,falcon_rails_erb_1w,wrk,bench/rails_erb.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 18: Puma Rails ERB (1w x 5t) ----------
+if want_row 18; then
+  echo
+  echo "=== Row 18: Puma Rails ERB (1w x 5t) ==="
+  stop_port
+  boot_puma "bench/rails_erb.ru" 1
+  if wait_for_bind "puma-row18" "/healthz"; then
+    warmup_hit "row18" "/page"
+    bench_wrk_row 18 "puma_rails_erb_1w" "bench/rails_erb.ru" "/page"
+  else
+    echo "18,puma_rails_erb_1w,wrk,bench/rails_erb.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
 echo
 echo "============================================================"
 echo "Final CSV: $OUT_CSV"
