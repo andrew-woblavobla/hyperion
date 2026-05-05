@@ -230,9 +230,8 @@ setup_pg_bench_db() {
   (
     cd bench/rails_app && \
     RAILS_ENV=production RAILS_DB=pg \
-    DATABASE_URL="postgres://localhost/$dbname" \
-    BUNDLE_GEMFILE=../Gemfile.4way \
-    bundle exec bin/rails db:migrate
+    DATABASE_URL="postgres://${PGHOST:-localhost}:${PGPORT:-5432}/$dbname" \
+    bundle exec rails db:migrate
   ) || {
     echo "[setup_pg_bench_db] migrate failed; AR rows will boot-fail"
     return 1
