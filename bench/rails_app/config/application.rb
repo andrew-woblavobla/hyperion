@@ -40,8 +40,13 @@ module RailsApp
     config.generators.system_tests = nil
 
     # Bench-only: auto-migrate and seed 100 users on every boot.
-    # The DB is `:memory:` shared-cache, so it's empty on every fresh
-    # process — eager seeding is the only way the AR-CRUD row sees data.
+    #
+    # SQLite path: the DB is `:memory:` shared-cache, so it's empty on
+    # every fresh process — eager seeding is the only way the AR-CRUD
+    # row sees data.
+    # PG path: an operator may have run `db:migrate` ahead of time, so
+    # the table exists; we still need to seed if the table is empty.
+    # Both branches are idempotent: re-boots on PG don't re-seed.
     config.after_initialize do
       ActiveRecord::Base.connection_pool.with_connection do |conn|
         unless conn.table_exists?(:users)
@@ -50,8 +55,12 @@ module RailsApp
               Rails.root.join('db/migrate')
             ).migrate
           end
-          100.times do |i|
-            User.create!(name: "User #{i}", email: "user#{i}@bench.local")
+        end
+        if User.count.zero?
+          User.transaction do
+            100.times do |i|
+              User.create!(name: "User #{i}", email: "user#{i}@bench.local")
+            end
           end
         end
       end
