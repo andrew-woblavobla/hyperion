@@ -1,6 +1,6 @@
 [package]
 name = "hyperion_io_uring"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2021"
 publish = false
 description = "io_uring accept/read primitives for Hyperion (2.3-A, Linux 5.6+ only)"

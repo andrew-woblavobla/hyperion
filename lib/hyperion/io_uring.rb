@@ -52,7 +52,7 @@ module Hyperion
   # 2.4 only after 6 months of soak. io_uring code in production has
   # too many sharp edges to default-on without field validation.
   module IOUring
-    EXPECTED_ABI = 1
+    EXPECTED_ABI = 2
     # Linux 5.6 stabilized IORING_OP_ACCEPT (commit 17f2fe35d080,
     # mainlined Mar 2020). 5.5 had a buggy precursor that the io-uring
     # crate refuses to use. We gate on 5.6 to match the crate's stance.

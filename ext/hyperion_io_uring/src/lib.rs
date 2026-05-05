@@ -49,7 +49,7 @@
 
 use std::os::raw::{c_int, c_uchar, c_uint};
 
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = 2;
 
 // ---------- ABI version + probe ----------
 
