@@ -94,6 +94,72 @@ longer relies on `ssh-agent`.
 - **Config block:** see "The fix" above; goes in `~/.ssh/config` on
   the controller workstation, not in the Hyperion repo.
 
+## Postgres (for the Rails AR-CRUD bench rows)
+
+The AR-CRUD bench rows (19-22, 27-28) run on Postgres so they exercise
+Hyperion's `--async-io` + `hyperion-async-pg` story (a path SQLite-mem
+can't characterize because there's no I/O wait to yield on). Rows that
+need PG fail open: if `pg_isready` fails the rows write
+`BOOT-FAIL,no-pg` to the CSV and the rest of the matrix continues.
+
+```sh
+# Ubuntu 22.04+ on the bench VM
+sudo apt-get update
+sudo apt-get install -y postgresql-15 postgresql-client-15
+
+# Trust on localhost so the bench harness needs no password.
+# /etc/postgresql/15/main/pg_hba.conf — replace the `local`/`host` peer
+# rules with:
+#
+#   local   all   all                trust
+#   host    all   all   127.0.0.1/32 trust
+#   host    all   all   ::1/128      trust
+#
+sudo systemctl restart postgresql
+
+# Bench user (matches the OS user that runs run_all.sh on openclaw-vm).
+sudo -u postgres createuser -s ubuntu
+
+# Verify
+pg_isready -h localhost -p 5432
+# /var/run/postgresql:5432 - accepting connections
+```
+
+The bench harness creates the `hyperion_bench` database itself
+(`bench/run_all.sh::setup_pg_bench_db`); no manual `createdb` needed.
+
+To override the database name, set `PGDATABASE_BENCH=other_name` before
+invoking `./bench/run_all.sh`.
+
+To run the AR rows against SQLite anyway (for hosts without PG, or to
+A/B against the legacy results), unset `RAILS_DB` or pass
+`RAILS_DB=sqlite` — the rest of the matrix continues to work the same.
+
+### Remote Postgres (override)
+
+To run the AR-CRUD rows against a Postgres on a different host (e.g. a
+shared bench DB or `pg.wobla.space`), set the standard libpq env vars
+before invoking `./bench/run_all.sh`:
+
+```sh
+export PGHOST=pg.wobla.space
+export PGPORT=5432
+export PGUSER=hyperion_bench
+export PGPASSWORD=...           # if password auth is required
+export PGDATABASE_BENCH=hyperion_bench
+
+./bench/run_all.sh --rails
+```
+
+`bench/run_all.sh::setup_pg_bench_db` honors `PGHOST` / `PGPORT` /
+`PGDATABASE_BENCH` for both the `pg_isready` probe and the
+`DATABASE_URL` constructed for `bundle exec rails db:migrate`. The
+helper assumes the user identified by `PGUSER` (or the OS-user default)
+already has `CREATE DATABASE` and CONNECT privileges; it does NOT run
+`CREATE ROLE`. For a fully-managed remote DB where you can't `createdb`
+yourself, pre-create the database and either set
+`PGDATABASE_BENCH=existing_name` or skip the create step manually.
+
 ## What this doc is *not*
 
 This doc does not change Hyperion code. It documents an operator
