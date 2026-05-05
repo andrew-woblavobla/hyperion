@@ -509,6 +509,66 @@ if want_row 18; then
   stop_port
 fi
 
+# ---------- Row 19: Hyperion Rails AR-CRUD (1w x 5t) ----------
+if want_row 19; then
+  echo
+  echo "=== Row 19: Hyperion Rails AR-CRUD (1w x 5t) ==="
+  stop_port
+  boot_hyperion "row19" "bench/rails_ar.ru" -t 5 -w 1 -p "$PORT"
+  if wait_for_bind "row19" "/healthz"; then
+    warmup_hit "row19" "/users.json"
+    bench_wrk_row 19 "hyperion_rails_ar_1w" "bench/rails_ar.ru" "/users.json"
+  else
+    echo "19,hyperion_rails_ar_1w,wrk,bench/rails_ar.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 20: Agoo Rails AR-CRUD (1w x 5t) ----------
+if want_row 20; then
+  echo
+  echo "=== Row 20: Agoo Rails AR-CRUD (1w x 5t) ==="
+  stop_port
+  boot_agoo "bench/rails_ar.ru" 1
+  if wait_for_bind "agoo-row20" "/healthz"; then
+    warmup_hit "row20" "/users.json"
+    bench_wrk_row 20 "agoo_rails_ar_1w" "bench/rails_ar.ru" "/users.json"
+  else
+    echo "20,agoo_rails_ar_1w,wrk,bench/rails_ar.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 21: Falcon Rails AR-CRUD (1w x 5t) ----------
+if want_row 21; then
+  echo
+  echo "=== Row 21: Falcon Rails AR-CRUD (1w x 5t) ==="
+  stop_port
+  boot_falcon "bench/rails_ar.ru" 1
+  if wait_for_bind "falcon-row21" "/healthz"; then
+    warmup_hit "row21" "/users.json"
+    bench_wrk_row 21 "falcon_rails_ar_1w" "bench/rails_ar.ru" "/users.json"
+  else
+    echo "21,falcon_rails_ar_1w,wrk,bench/rails_ar.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 22: Puma Rails AR-CRUD (1w x 5t) ----------
+if want_row 22; then
+  echo
+  echo "=== Row 22: Puma Rails AR-CRUD (1w x 5t) ==="
+  stop_port
+  boot_puma "bench/rails_ar.ru" 1
+  if wait_for_bind "puma-row22" "/healthz"; then
+    warmup_hit "row22" "/users.json"
+    bench_wrk_row 22 "puma_rails_ar_1w" "bench/rails_ar.ru" "/users.json"
+  else
+    echo "22,puma_rails_ar_1w,wrk,bench/rails_ar.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
 echo
 echo "============================================================"
 echo "Final CSV: $OUT_CSV"
