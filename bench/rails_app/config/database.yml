@@ -1,3 +1,30 @@
+# Bench DB config. Selected at boot via `RAILS_DB`:
+#   unset / RAILS_DB=sqlite → in-memory SQLite (cache=shared) — works on
+#                              any host, no external deps, used by CI
+#                              smoke runs.
+#   RAILS_DB=pg              → Postgres at DATABASE_URL (default
+#                              postgres://localhost/hyperion_bench).
+#                              Required for the canonical AR-CRUD bench
+#                              rows; pairs with --async-io +
+#                              hyperion-async-pg.
+<% if ENV['RAILS_DB'].to_s.downcase == 'pg' %>
+default: &default
+  adapter: postgresql
+  encoding: unicode
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+  url: <%= ENV.fetch('DATABASE_URL', 'postgres://localhost/hyperion_bench') %>
+  prepared_statements: true
+  advisory_locks: false
+
+production:
+  <<: *default
+
+development:
+  <<: *default
+
+test:
+  <<: *default
+<% else %>
 default: &default
   adapter: sqlite3
   pool: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
@@ -18,3 +45,4 @@ development:
 
 test:
   <<: *default
+<% end %>
