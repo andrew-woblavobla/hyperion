@@ -100,6 +100,16 @@ want_row() {
 }
 
 PID=""
+# Detect a port-listing tool: `ss` on Linux, `lsof` on macOS. The wait-for-
+# release loop polls until our $PORT is no longer bound, so we don't race
+# the next row's boot with a kernel-pending listener.
+if command -v ss >/dev/null 2>&1; then
+  port_listening() { ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$PORT$"; }
+elif command -v lsof >/dev/null 2>&1; then
+  port_listening() { lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | grep -q .; }
+else
+  port_listening() { return 1; }   # no tool available; assume free
+fi
 stop_port() {
   if [ -n "$PID" ]; then
     kill -KILL "$PID" 2>/dev/null || true
@@ -107,8 +117,12 @@ stop_port() {
     PID=""
   fi
   pkill -KILL -f "[ :=]$PORT( |$)" 2>/dev/null || true
+  # macOS-specific belt-and-suspenders: kill anything still on the port.
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -ti :"$PORT" 2>/dev/null | xargs kill -KILL 2>/dev/null || true
+  fi
   local waited=0
-  while ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$PORT$"; do
+  while port_listening; do
     sleep 0.5
     waited=$((waited + 1))
     [ $waited -ge 20 ] && break
