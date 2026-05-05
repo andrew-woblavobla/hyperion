@@ -198,9 +198,14 @@ fi
 boot_hyperion() {
   local label="$1" rackup="$2"; shift 2
   local extra_env="${HYPERION_EXTRA_ENV:-}"
-  echo "[$label] boot: $extra_env bundle exec hyperion $* $rackup"
+  # --no-log-requests: silence per-request access log writes for apples-to-
+  # apples comparison with Agoo (whose bench/agoo_boot.rb suppresses logs via
+  # Agoo::Log.configure states: { INFO: false, request: false, ... }).
+  # Real prod runs with sidecar log forwarders or async log drains; the
+  # bench measures server hot-path CPU, not synchronous-stdout-write CPU.
+  echo "[$label] boot: $extra_env bundle exec hyperion --no-log-requests $* $rackup"
   # shellcheck disable=SC2086
-  env $extra_env $SETSID nohup bundle exec hyperion "$@" "$rackup" \
+  env $extra_env $SETSID nohup bundle exec hyperion --no-log-requests "$@" "$rackup" \
     > "/tmp/2.15-bench-$label.log" 2>&1 < /dev/null &
   PID=$!
   disown 2>/dev/null || true
