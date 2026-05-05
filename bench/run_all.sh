@@ -128,6 +128,19 @@ wait_for_bind() {
   return 1
 }
 
+# After bind, hit a cheap path 3x so YJIT compiles the hot path
+# before wrk starts the real run. Without this, the first ~500ms
+# of the wrk window is YJIT compilation noise that drags the median
+# down. Used by the Rails rows (Tasks 15-19) which point /healthz
+# at an inline Rack lambda — ultra-cheap, no controller dispatch.
+warmup_hit() {
+  local label="$1" url_path="${2:-/healthz}"
+  for _ in 1 2 3; do
+    curl -sS -o /dev/null --max-time 2 "http://$HOST:$PORT$url_path" 2>/dev/null
+  done
+  echo "[$label] warmup: 3x GET $url_path"
+}
+
 median() {
   printf '%s\n' "$@" | sort -g | awk -v n=$# 'NR == int((n+1)/2) { print; exit }'
 }
