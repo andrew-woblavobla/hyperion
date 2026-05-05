@@ -569,6 +569,96 @@ if want_row 22; then
   stop_port
 fi
 
+# ---------- Row 23: Hyperion Rails API-only (4w x 5t) ----------
+if want_row 23; then
+  echo
+  echo "=== Row 23: Hyperion Rails API-only (4w x 5t) ==="
+  stop_port
+  boot_hyperion "row23" "bench/rails_api.ru" -t 5 -w 4 -p "$PORT"
+  if wait_for_bind "row23" "/healthz"; then
+    warmup_hit "row23" "/api/users"
+    bench_wrk_row 23 "hyperion_rails_api_4w" "bench/rails_api.ru" "/api/users"
+  else
+    echo "23,hyperion_rails_api_4w,wrk,bench/rails_api.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 24: Agoo Rails API-only (4w x 5t) ----------
+if want_row 24; then
+  echo
+  echo "=== Row 24: Agoo Rails API-only (4w x 5t) ==="
+  stop_port
+  boot_agoo "bench/rails_api.ru" 4
+  if wait_for_bind "agoo-row24" "/healthz"; then
+    warmup_hit "row24" "/api/users"
+    bench_wrk_row 24 "agoo_rails_api_4w" "bench/rails_api.ru" "/api/users"
+  else
+    echo "24,agoo_rails_api_4w,wrk,bench/rails_api.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 25: Hyperion Rails ERB (4w x 5t) ----------
+if want_row 25; then
+  echo
+  echo "=== Row 25: Hyperion Rails ERB (4w x 5t) ==="
+  stop_port
+  boot_hyperion "row25" "bench/rails_erb.ru" -t 5 -w 4 -p "$PORT"
+  if wait_for_bind "row25" "/healthz"; then
+    warmup_hit "row25" "/page"
+    bench_wrk_row 25 "hyperion_rails_erb_4w" "bench/rails_erb.ru" "/page"
+  else
+    echo "25,hyperion_rails_erb_4w,wrk,bench/rails_erb.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 26: Agoo Rails ERB (4w x 5t) ----------
+if want_row 26; then
+  echo
+  echo "=== Row 26: Agoo Rails ERB (4w x 5t) ==="
+  stop_port
+  boot_agoo "bench/rails_erb.ru" 4
+  if wait_for_bind "agoo-row26" "/healthz"; then
+    warmup_hit "row26" "/page"
+    bench_wrk_row 26 "agoo_rails_erb_4w" "bench/rails_erb.ru" "/page"
+  else
+    echo "26,agoo_rails_erb_4w,wrk,bench/rails_erb.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 27: Hyperion Rails AR-CRUD (4w x 5t) ----------
+if want_row 27; then
+  echo
+  echo "=== Row 27: Hyperion Rails AR-CRUD (4w x 5t) ==="
+  stop_port
+  boot_hyperion "row27" "bench/rails_ar.ru" -t 5 -w 4 -p "$PORT"
+  if wait_for_bind "row27" "/healthz"; then
+    warmup_hit "row27" "/users.json"
+    bench_wrk_row 27 "hyperion_rails_ar_4w" "bench/rails_ar.ru" "/users.json"
+  else
+    echo "27,hyperion_rails_ar_4w,wrk,bench/rails_ar.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
+# ---------- Row 28: Agoo Rails AR-CRUD (4w x 5t) ----------
+if want_row 28; then
+  echo
+  echo "=== Row 28: Agoo Rails AR-CRUD (4w x 5t) ==="
+  stop_port
+  boot_agoo "bench/rails_ar.ru" 4
+  if wait_for_bind "agoo-row28" "/healthz"; then
+    warmup_hit "row28" "/users.json"
+    bench_wrk_row 28 "agoo_rails_ar_4w" "bench/rails_ar.ru" "/users.json"
+  else
+    echo "28,agoo_rails_ar_4w,wrk,bench/rails_ar.ru,BOOT-FAIL,BOOT-FAIL,," >> "$OUT_CSV"
+  fi
+  stop_port
+fi
+
 echo
 echo "============================================================"
 echo "Final CSV: $OUT_CSV"
