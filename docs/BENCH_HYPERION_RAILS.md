@@ -232,9 +232,8 @@ spec.
 ## Post-PG-switch (2026-05-05)
 
 After switching the AR-CRUD rows to Postgres + `--async-io` +
-`hyperion-async-pg` (per `docs/superpowers/specs/2026-05-05-hyperion-perf-roadmap-design.md` §#3),
-the AR rows of the Rails matrix re-ran on `openclaw-vm` against
-a remote PG 17 (`pg.wobla.space`).
+`hyperion-async-pg`, the AR rows of the Rails matrix re-ran on
+`openclaw-vm` against a remote PG 17 (`pg.wobla.space`).
 
 ### Single-worker (1w × 5t) — PG
 
