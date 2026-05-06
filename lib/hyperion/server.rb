@@ -1023,7 +1023,38 @@ module Hyperion
             end
           end
         end
+
+        # Plan #2 Task 2.5.2 — per-worker fallback-engaged detection.
+        # After each completion drain, check whether the ring went
+        # unhealthy (sustained SQE submit failures / repeated EBADR
+        # from the Rust side set a dirty flag). When detected:
+        #   1. Increment the observable metric so operators can alert.
+        #   2. Emit a single warn-level log line (actionable, not spammy).
+        #   3. Flip @io_uring_hotpath_active to false so subsequent
+        #      accept-fiber dispatch (run_accept_fiber's top-level branch)
+        #      uses the epoll path for newly-spawned accept fibers on
+        #      restart — the current fiber exits the loop and falls
+        #      through to run_accept_fiber_epoll below.
+        unless ring.healthy?
+          runtime_metrics.increment(:io_uring_hotpath_fallback_engaged)
+          runtime_logger.warn do
+            { message: 'io_uring hotpath ring unhealthy; engaging accept4 fallback per-worker',
+              worker_pid: Process.pid }
+          end
+          @io_uring_hotpath_active = false
+          begin
+            ring.close
+          rescue StandardError
+            nil
+          end
+          Fiber.current[:hyperion_hotpath_ring] = nil
+          break
+        end
       end
+      # If we broke out due to an unhealthy ring (not a clean stop), fall
+      # through to the epoll path so existing + new connections keep being
+      # served. @stopped is still false in that case — the server is alive.
+      run_accept_fiber_epoll(task) unless @stopped
     rescue IOError, Errno::EBADF
       @stopped = true
     rescue Hyperion::IOUring::Unsupported => e
