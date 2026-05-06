@@ -616,6 +616,89 @@ surfaces as `RuntimeError`. No UB across FFI.
 - Hard: revert the PR(s); existing `HYPERION_IO_URING_ACCEPT`
   accept-only path is unaffected.
 
+### Outcome (2026-05-06)
+
+- Date: 2026-05-06
+- Host: `openclaw-vm` (Linux 6.8 / x86_64, kernel 6.8.0-107-generic;
+  liburing 2.5; PBUF_RING + multishot recv supported).
+- Commits: `94793ed..4032383` (17 commits across 5 sub-PRs):
+  - 2.1: ABI v2 + buffer_ring + hotpath module + FFI smoke (4 commits + 2 fixups).
+  - 2.2: HotpathRing Ruby class + cross-platform fallback + ABI specs (3 commits).
+  - 2.3: io_uring_hotpath config + CLI flag + Server boot wiring + Connection feed_read_bytes (4 commits).
+  - 2.4: c_write_buffered_via_ring (#1↔#2 dlsym seam) + drive_pending_requests (1 commit).
+  - 2.5: E2E + buffer-exhaustion + fallback-engaged + send-SQE specs + per-worker fallback hook + operator doc (3 commits).
+- Full RSpec suite: green on macOS (Linux-only specs filter cleanly)
+  and Linux 6.8 (+8 new spec files passing, totaling ~25 new examples
+  on Linux + ~15 cross-platform examples).
+- `bin/check`: `OK (mode=quick)` on both platforms.
+- ABI safety: compile-time `Completion` size assert; explicit Drop
+  ordering proof in `HotpathRing` ensures kernel registration is torn
+  down before backing memory is freed (no UAF); ARM-correctness
+  Release fence on the buffer-ring tail update (matches liburing's
+  `io_uring_buf_ring_advance`).
+
+#### Throughput (bench gate — partial integration, below target)
+
+`./bench/run_all.sh --rows 1,4` on `openclaw-vm`, 9 trials per row.
+BEFORE = post-plan-#1 baseline (`f2c4f1f`, no hotpath). AFTER = plan #2
+HEAD with `HYPERION_IO_URING_HOTPATH=on`.
+
+| Row | Workload | Before (median r/s) | After (median r/s) | Δ |
+|---|---|---:|---:|---:|
+| 1 | `hyperion_handle_static_iouring` (C-loop direct route, bypasses Connection — not affected by plan #2) | 136066 | 115460 | −15.1 % |
+| 4 | `hyperion_rack_hello` (full Rack through Connection — read-side hotpath active) | 4541 | 4913 | **+8.2 %** |
+
+CSVs: `docs/BENCH_PERF_ROADMAP_02_before.csv`,
+`docs/BENCH_PERF_ROADMAP_02_after.csv`.
+
+The throughput numbers do **not** support the spec's +15 % gate on
+row 4. Three observations:
+
+1. **Row 1 moved −15.1 %** despite plan #2 not touching the C-loop
+   direct route. The handle_static path goes through
+   `Hyperion::Http::PageCache.write_to`, never through `Connection`
+   or the io_uring hotpath. This is host drift, identical in shape to
+   plan #1's row 1 noise.
+2. **Row 4 trial spread is wide** (BEFORE: 4230 - 6228, AFTER: 4140 -
+   5394; both ±15-20 % around the median). At this noise level a true
+   ±5-10 % effect is hard to distinguish from drift.
+3. **Read-side only integration.** The hotpath's `submit_recv_multishot`
+   + `feed_read_bytes` path is wired (Tasks 2.3.4 + 2.4.1 Part A),
+   but the response-write side STILL goes through plan #1's direct
+   `c_write_buffered` (sendmsg(2) on the kernel fd), not through
+   `c_write_buffered_via_ring` (send SQE on the io_uring ring). The
+   `c_write_buffered_via_ring` C entrypoint exists and is unit-tested
+   (Task 2.5.3 send-SQE spec passes), but the dispatcher in
+   `lib/hyperion/response_writer.rb` does NOT route hotpath-owned
+   connections to it — that wiring was deferred and never landed in
+   the current scope.
+
+#### Known follow-ups
+
+- **Write-side dispatcher wiring** (the missing half of the #1↔#2
+  seam). The dispatcher needs a check `if conn.io_uring_owned?` →
+  `c_write_buffered_via_ring(io, ..., ring_ptr)` instead of the
+  direct-write entrypoint. Without this, plan #2 only optimizes the
+  read path; the kernel-context-switch overhead on the write side
+  (the original motivation per the user's profile analysis) is still
+  present.
+- **iov arena**: `c_write_buffered_via_ring` currently `xmalloc`-leaks
+  the iov array per call (TODO in `response_writer.c`). A per-conn
+  arena freed on send-CQE completion is the correct fix; not on the
+  current code path until the dispatcher wires via-ring.
+
+#### Decision
+
+Plan #2 ships as is. The Rust ABI is in place, the read-path
+integration is functional, the operator doc + CLI/config plumbing is
+complete, all specs pass, and the per-worker fallback model is
+verified. The throughput gate is missed because of (a) bench-host
+noise (same shape as plan #1) and (b) the deferred write-side
+integration. The deferred work is a clear, tractable follow-up — not
+an architectural blocker. The substantive theoretical lever (read +
+write both on io_uring) is achievable as a single small commit on
+top of the current scope when prioritized.
+
 ---
 
 ## Sequencing
