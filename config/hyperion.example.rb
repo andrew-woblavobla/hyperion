@@ -33,6 +33,15 @@ log_requests true      # per-request access log (default ON)
 # Compatibility
 fiber_local_shim false # set true for Rails apps using Thread.current.thread_variable_*
 
+# io_uring accept loop (Linux 5.6+ only). Default :off. Set :auto to
+# enable when the runtime probe succeeds, or :on to require it.
+# io_uring :off
+
+# Hot-path io_uring (Linux 5.19+ only). Independent of `io_uring`
+# above. Enables multishot accept + multishot recv + send SQEs on a
+# single unified ring per worker. Default :off. See docs/IO_URING_HOTPATH.md.
+# io_uring_hotpath :off
+
 # Lifecycle hooks — mirror Puma's API.
 before_fork do
   # Runs ONCE in the master before any worker forks.

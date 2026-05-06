@@ -43,6 +43,14 @@ Run `bin/hyperion --help` for the full set including:
 `HYPERION_IO_URING_ACCEPT` (`0|1`), `HYPERION_H2_DISPATCH_POOL`,
 `HYPERION_H2_NATIVE_HPACK` (`v2|ruby|off`), `HYPERION_H2_TIMING`.
 
+### io_uring hotpath env vars (Linux 5.19+, Hyperion 2.18+)
+
+| Env var | Values | Default | Notes |
+|---|---|---|---|
+| `HYPERION_IO_URING_HOTPATH` | `off\|auto\|on` | `off` | Enable multishot accept + recv + send SQE hotpath. See [IO_URING_HOTPATH.md](IO_URING_HOTPATH.md). |
+| `HYPERION_IO_URING_HOTPATH_BUFS` | Integer (power of two) | `512` | Kernel-managed receive buffers per worker. |
+| `HYPERION_IO_URING_HOTPATH_BUF_SIZE` | Integer | `8192` | Bytes per receive buffer. |
+
 ## Config file (`config/hyperion.rb`)
 
 Same shape as Puma's `puma.rb`. Auto-loaded if present. Strict DSL:
