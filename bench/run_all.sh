@@ -204,8 +204,8 @@ fi
 #   RAILS_DB=pg
 #   DATABASE_URL=postgres://${PGHOST:-localhost}:${PGPORT:-5432}/hyperion_bench (default)
 #
-# On openclaw-vm: install with `apt-get install postgresql-15` and
-# `sudo -u postgres createuser -s ubuntu` (see docs/BENCH_HOST_SETUP.md).
+# Bench-host setup: install postgresql-15 and create a superuser
+# matching the OS user that runs run_all.sh; see docs/BENCH_HOST_SETUP.md.
 setup_pg_bench_db() {
   if ! command -v pg_isready >/dev/null 2>&1; then
     echo "[setup_pg_bench_db] pg_isready not on PATH; skipping AR rows"

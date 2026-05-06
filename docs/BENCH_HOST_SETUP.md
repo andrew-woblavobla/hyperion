@@ -137,12 +137,12 @@ A/B against the legacy results), unset `RAILS_DB` or pass
 
 ### Remote Postgres (override)
 
-To run the AR-CRUD rows against a Postgres on a different host (e.g. a
-shared bench DB or `pg.wobla.space`), set the standard libpq env vars
-before invoking `./bench/run_all.sh`:
+To run the AR-CRUD rows against a Postgres on a different host (a
+shared bench DB, a managed cloud Postgres, etc.), set the standard
+libpq env vars before invoking `./bench/run_all.sh`:
 
 ```sh
-export PGHOST=pg.wobla.space
+export PGHOST=your-postgres-host.example
 export PGPORT=5432
 export PGUSER=hyperion_bench
 export PGPASSWORD=...           # if password auth is required
