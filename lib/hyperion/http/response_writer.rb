@@ -13,6 +13,15 @@ module Hyperion
     #                                   keep_alive, date_str) -> Integer
     #   ResponseWriter.c_write_chunked(io, status, headers, body,
     #                                  keep_alive, date_str)  -> Integer
+    #   ResponseWriter.c_write_buffered_via_ring(io, status, headers,
+    #                                            body, keep_alive,
+    #                                            date_str, ring_ptr)
+    #                                           -> Integer
+    #     Plan #2 seam: submits a send SQE via the io_uring crate instead
+    #     of issuing writev directly. Falls back to c_write_buffered when
+    #     the io_uring crate is not loaded (hyp_submit_send_fn == NULL
+    #     after lazy dlsym attempt). ring_ptr is the HotpathRing raw
+    #     pointer as an Integer.
     #
     # Operators can flip the dispatcher off at runtime with
     # `Hyperion::Http::ResponseWriter.c_writer_available = false`

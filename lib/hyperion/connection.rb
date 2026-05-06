@@ -77,11 +77,19 @@ module Hyperion
     def initialize(parser: self.class.default_parser, writer: ResponseWriter.new, thread_pool: nil,
                    log_requests: nil, max_body_bytes: MAX_BODY_BYTES, runtime: nil,
                    max_in_flight_per_conn: nil, path_templater: nil, route_table: nil,
-                   io_uring_owned: false)
+                   io_uring_owned: false, app: nil)
       @parser         = parser
       @writer         = writer
       @thread_pool    = thread_pool
       @max_body_bytes = max_body_bytes
+      # Plan #2 Task 2.4.1 — Rack app reference for io_uring-owned connections.
+      # On the regular (non-hotpath) path the app is passed to Connection#serve
+      # as a parameter and never stored. On the io_uring hotpath, Connection#serve
+      # is never called; instead the accept fiber drives dispatch via
+      # feed_read_bytes → drive_pending_requests, which needs the app stored.
+      # Nil on non-io_uring connections; those still use the serve(socket, app)
+      # call signature.
+      @app            = app
       # Plan #2 Task 2.3.4 — when true, this connection's reads are
       # delivered via feed_read_bytes by the accept fiber's OP_RECV
       # handler. read_chunk must NOT be called on io_uring-owned
@@ -1110,8 +1118,145 @@ module Hyperion
       return :eof if @inbuf.empty?
       return :need_more unless @inbuf.include?(HEADER_TERM)
 
-      # At least one complete header block present — parse it.
-      :dispatched
+      # At least one complete header block is present — drive parse + dispatch.
+      drive_pending_requests
+    end
+
+    # Plan #2 Task 2.4.1 — parse-and-dispatch loop for io_uring-owned
+    # connections.  Called by feed_read_bytes after appending CQE bytes
+    # to @inbuf.  Mirrors the core of Connection#serve's request loop but
+    # uses @socket / @app ivars (set at accept time) instead of locals.
+    #
+    # Returns :dispatched when at least one request was fully processed,
+    # :need_more when @inbuf holds data but not a complete request yet, or
+    # :eof when @inbuf is empty after carry-over trimming.
+    #
+    # Runs in the accept fiber (single-threaded, GVL held). No mutex needed
+    # on @inbuf or any of the per-connection ivars it touches.
+    def drive_pending_requests
+      @hijacked = false unless defined?(@hijacked)
+      @last_response_was_static_inline_blocking = false \
+        unless defined?(@last_response_was_static_inline_blocking)
+
+      dispatched_any = false
+
+      loop do
+        # Fast-fail: no complete headers yet.
+        break unless @inbuf.include?(HEADER_TERM)
+
+        # Attempt to parse one request from @inbuf.  @inbuf IS the buffer
+        # (not a copy) — carry_into_inbuf! trims it in-place after parse.
+        begin
+          request, body_end = @parser.parse(@inbuf)
+        rescue ParseError => e
+          @metrics.increment(:parse_errors)
+          @logger.warn { { message: 'parse error (hotpath)', error: e.message,
+                           error_class: e.class.name } }
+          begin
+            @socket.write("HTTP/1.1 400 Bad Request\r\ncontent-length: 11\r\n" \
+                          "connection: close\r\n\r\nBad Request")
+          rescue StandardError
+            nil
+          end
+          @inbuf.clear
+          break
+        rescue UnsupportedError => e
+          @logger.warn { { message: 'unsupported request (hotpath)', error: e.message,
+                           error_class: e.class.name } }
+          begin
+            @socket.write("HTTP/1.1 501 Not Implemented\r\ncontent-length: 15\r\n" \
+                          "connection: close\r\n\r\nNot Implemented")
+          rescue StandardError
+            nil
+          end
+          @inbuf.clear
+          break
+        end
+
+        # Snapshot hijack-buffered carry BEFORE trimming @inbuf.
+        @hijack_buffered = if @inbuf.bytesize > body_end
+                             @inbuf.byteslice(body_end, @inbuf.bytesize - body_end).b
+                           else
+                             EMPTY_BIN
+                           end
+        carry_into_inbuf!(@inbuf, body_end)
+
+        peer_addr = peer_address(@socket)
+        request   = enrich_with_peer(request, peer_addr) if peer_addr && request.peer_address.nil?
+
+        @metrics.increment(:bytes_read, body_end)
+        @metrics.increment(:requests_total)
+        @metrics.increment(:requests_in_flight)
+        @metrics.increment_labeled_counter(Hyperion::Metrics::REQUESTS_DISPATCH_TOTAL,
+                                           @worker_id_label_tuple)
+
+        @response_dispatch_mode = nil
+        request_started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+        # 2.10-D direct-dispatch fast path.
+        if @route_table && (direct_handler = @route_table.lookup(request.method, request.path))
+          dispatch_direct!(@socket, request, direct_handler, request_started_at, peer_addr)
+          dispatched_any = true
+          # keep-alive: loop to process any pipelined requests already in @inbuf.
+          next if should_keep_alive_after_direct?(request)
+
+          break
+        end
+
+        # Per-conn fairness gate (mirrors serve's logic).
+        skip_per_conn_fairness = @last_response_was_static_inline_blocking
+        unless @max_in_flight_per_conn.nil? || skip_per_conn_fairness || \
+               per_conn_admit!(@socket, peer_addr)
+          @metrics.decrement(:requests_in_flight)
+          dispatched_any = true
+          next
+        end
+
+        begin
+          status, headers, body = call_app(@app, request)
+        ensure
+          @metrics.decrement(:requests_in_flight)
+          per_conn_release! if @max_in_flight_per_conn && !skip_per_conn_fairness
+        end
+
+        # Rack hijack: app took the socket — stop processing.
+        if @hijacked
+          @logger.debug do
+            { message: 'rack hijack (hotpath)', method: request.method,
+              path: request.path, peer_addr: peer_addr }
+          end
+          body.close if body.respond_to?(:close)
+          break
+        end
+
+        keep_alive = should_keep_alive?(request, status, headers)
+        @writer.write(@socket, status, headers, body, keep_alive: keep_alive,
+                                                       dispatch_mode: @response_dispatch_mode)
+        @last_response_was_static_inline_blocking =
+          @response_dispatch_mode == :inline_blocking
+        @metrics.increment_status(status)
+        log_request(request, status, request_started_at) if @log_requests
+        observe_request_duration(request, status, request_started_at)
+        dispatched_any = true
+
+        # Stop looping if the response told the peer we're closing.
+        break unless keep_alive
+      end
+
+      if dispatched_any
+        :dispatched
+      elsif @inbuf.empty?
+        :eof
+      else
+        :need_more
+      end
+    rescue StandardError => e
+      @metrics.increment(:app_errors)
+      @logger.error do
+        { message: 'unhandled in drive_pending_requests', error: e.message,
+          error_class: e.class.name }
+      end
+      :error
     end
 
     # Plan #2 Task 2.3.4 — called by the accept fiber when the OP_RECV

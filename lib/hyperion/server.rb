@@ -985,7 +985,8 @@ module Hyperion
             conn = Connection.new(runtime: @explicit_runtime ? @runtime : nil,
                                   max_in_flight_per_conn: @max_in_flight_per_conn,
                                   route_table: @route_table,
-                                  io_uring_owned: true)
+                                  io_uring_owned: true,
+                                  app: @app)
             conn.instance_variable_set(:@socket, socket)
             @metrics.increment(:connections_accepted)
             @metrics.increment(:connections_active)

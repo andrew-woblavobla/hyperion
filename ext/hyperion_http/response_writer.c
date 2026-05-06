@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <string.h>
+#include <dlfcn.h>
 
 #include "response_writer.h"
 
@@ -35,6 +36,18 @@ static VALUE rb_mResponseWriter;
 static ID id_fileno;
 static ID id_each;
 static ID id_hyp_flush; /* :__hyperion_flush__ chunked-drain sentinel */
+
+/* Plan #2 seam: function-pointer for hyperion_io_uring's send-SQE
+ * submission. Resolved lazily on the first call to c_write_buffered_via_ring
+ * via dlsym(RTLD_DEFAULT, ...). NULL when the io_uring crate isn't loaded
+ * yet — the via-ring path short-circuits to direct write in that case.
+ *
+ * Order-of-loading note: Init_hyperion_response_writer runs when
+ * hyperion_http.bundle is required (early boot, before io_uring.rb loads
+ * the io_uring cdylib). Doing the dlsym here would always return NULL.
+ * Instead we re-try on the first call so the symbol is found AFTER
+ * lib/hyperion/io_uring.rb has called Fiddle.dlopen on the cdylib. */
+static int (*hyp_submit_send_fn)(void *, int, const void *, unsigned int) = NULL;
 
 /* Pre-baked frozen Ruby Strings for the 23 common reason phrases.
  * Built once at init; looked up by status code in c_write_buffered.
@@ -434,6 +447,107 @@ static VALUE c_write_chunked(VALUE self, VALUE io, VALUE rb_status,
     return SIZET2NUM(st.bytes_written);
 }
 
+/* Hyperion::Http::ResponseWriter.c_write_buffered_via_ring(io, status,
+ *                                                           headers, body,
+ *                                                           keep_alive,
+ *                                                           date_str,
+ *                                                           ring_ptr)
+ *                                                          -> Integer
+ *
+ * Plan #2 — io_uring-owned variant of c_write_buffered. Submits a send
+ * SQE via the Rust hyperion_io_uring crate instead of issuing write/writev
+ * directly.  `ring_ptr` is the HotpathRing raw pointer cast to an Integer
+ * by the Ruby caller (Connection layer).
+ *
+ * Falls back to direct write (c_write_buffered) when the io_uring crate
+ * isn't loaded (hyp_submit_send_fn == NULL after lazy-resolve attempt).
+ *
+ * iov lifetime caveat: the kernel reads iov data AFTER submit_send returns.
+ * The iov array is allocated via xmalloc and intentionally NOT freed here —
+ * the Ruby head + body Strings stay alive via GC roots; the iov array itself
+ * leaks one entry per response under sustained load.
+ *
+ * TODO(plan #2 task 2.5): replace xmalloc-leak with a per-conn iov arena
+ * that frees on send-CQE completion. Current behavior leaks one iov array
+ * per response under sustained load. */
+static VALUE c_write_buffered_via_ring(VALUE self, VALUE io, VALUE rb_status,
+                                        VALUE rb_headers, VALUE rb_body,
+                                        VALUE rb_keep_alive, VALUE rb_date,
+                                        VALUE rb_ring_ptr) {
+    /* Lazy-resolve the io_uring submit_send symbol on first call. After the
+     * first successful resolve, hyp_submit_send_fn is non-NULL and this
+     * branch is skipped on every subsequent call (~50 ns dlsym cost paid
+     * once per process, not per request). */
+    if (!hyp_submit_send_fn) {
+        hyp_submit_send_fn =
+            (int (*)(void *, int, const void *, unsigned int))
+            dlsym(RTLD_DEFAULT, "hyperion_io_uring_hotpath_submit_send");
+    }
+    if (!hyp_submit_send_fn) {
+        /* io_uring crate not loaded — fall back to direct write path. */
+        return c_write_buffered(self, io, rb_status, rb_headers, rb_body,
+                                rb_keep_alive, rb_date);
+    }
+
+    /* Resolve fd before taking raw C pointers into Ruby objects (rb_funcall
+     * may GC). */
+    int fd = NUM2INT(rb_funcall(io, id_fileno, 0));
+
+    Check_Type(rb_headers, T_HASH);
+    Check_Type(rb_body, T_ARRAY);
+
+    /* Sum body bytes and type-check chunks. */
+    long body_size = 0;
+    long body_len  = RARRAY_LEN(rb_body);
+    for (long i = 0; i < body_len; i++) {
+        VALUE chunk = RARRAY_AREF(rb_body, i);
+        Check_Type(chunk, T_STRING);
+        body_size += RSTRING_LEN(chunk);
+    }
+
+    int status = NUM2INT(rb_status);
+    VALUE rb_reason = hyp_lookup_reason(status);
+    VALUE head = hyperion_build_response_head(
+        rb_status, rb_reason, rb_headers,
+        LL2NUM(body_size), rb_keep_alive, rb_date
+    );
+
+    /* Allocate iov array via xmalloc (Ruby-tracked). The kernel reads from
+     * the iov pointers AFTER submit_send returns; the iovs + their backing
+     * memory (RSTRING_PTR into Ruby Strings) MUST stay alive until the send
+     * CQE is processed by the accept fiber.
+     *
+     * TODO(plan #2 task 2.5): replace xmalloc-leak with a per-conn iov arena
+     * that frees on send-CQE completion. Current behavior leaks one iov array
+     * per response under sustained load. */
+    long total_iov = 1 + body_len;
+    struct iovec *iov = ALLOC_N(struct iovec, total_iov);
+    iov[0].iov_base = RSTRING_PTR(head);
+    iov[0].iov_len  = (size_t)RSTRING_LEN(head);
+    for (long i = 0; i < body_len; i++) {
+        VALUE chunk = RARRAY_AREF(rb_body, i);
+        iov[i + 1].iov_base = RSTRING_PTR(chunk);
+        iov[i + 1].iov_len  = (size_t)RSTRING_LEN(chunk);
+    }
+
+    void *ring_ptr = (void *)NUM2SIZET(rb_ring_ptr);
+    int rc = hyp_submit_send_fn(ring_ptr, fd, iov, (unsigned int)total_iov);
+    if (rc < 0) {
+        xfree(iov);
+        rb_sys_fail("hotpath submit_send");
+    }
+
+    /* Keep head alive across the submit_send call so the GC does not reap
+     * the Ruby String whose RSTRING_PTR is in iov[0]. rb_body (the Array)
+     * is a GC root that pins all body chunks for us. */
+    RB_GC_GUARD(head);
+
+    /* Return bytes-to-be-written (speculative; the actual byte count is
+     * confirmed by the send CQE in the accept fiber — Task 2.5 wires
+     * CQE feedback for metrics reconciliation). */
+    return SIZET2NUM((size_t)RSTRING_LEN(head) + (size_t)body_size);
+}
+
 void Init_hyperion_response_writer(void) {
     rb_mHyperion = rb_const_get(rb_cObject, rb_intern("Hyperion"));
     /* Hyperion::Http may already exist (created by Init_hyperion_sendfile
@@ -477,6 +591,11 @@ void Init_hyperion_response_writer(void) {
                                c_write_buffered, 6);
     rb_define_singleton_method(rb_mResponseWriter, "c_write_chunked",
                                c_write_chunked, 6);
+    /* Plan #2 seam: io_uring send-SQE submission variant (7 args: the 6
+     * from c_write_buffered plus ring_ptr). Falls back to c_write_buffered
+     * when the io_uring crate is not loaded. */
+    rb_define_singleton_method(rb_mResponseWriter, "c_write_buffered_via_ring",
+                               c_write_buffered_via_ring, 7);
 
     /* WOULDBLOCK sentinel: Ruby caller checks for this value and falls
      * back to io.write when the kernel send buffer is full (EAGAIN). */
