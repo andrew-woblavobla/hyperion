@@ -244,6 +244,17 @@ module Hyperion
       @io_uring_policy          = io_uring
       @io_uring_active          = io_uring != :off && Hyperion::IOUring.resolve_policy!(io_uring)
       log_io_uring_state_once
+      # Plan #2 — hotpath gate. Independent of @io_uring_active: the
+      # hotpath owns multishot accept + multishot recv + send SQEs on a
+      # single unified ring, while the accept-only path uses a simpler
+      # ring that only drives accept SQEs. The two paths are mutually
+      # exclusive at runtime — HotpathRing takes priority when active.
+      # Workers don't share hotpath rings across fork; each child opens
+      # its own ring lazily on first use inside `run_accept_fiber`.
+      @io_uring_hotpath_policy  = io_uring_hotpath
+      @io_uring_hotpath_active  = io_uring_hotpath != :off &&
+                                   Hyperion::IOUring.resolve_hotpath_policy!(io_uring_hotpath)
+      log_io_uring_hotpath_state_once
       # 2.3-B: per-conn fairness cap (validated/finalized upstream by
       # `Config#finalize!`; constructor accepts the resolved value, not
       # a sentinel). nil = no cap (default). The cap propagates to
@@ -881,8 +892,15 @@ module Hyperion
     # epoll branch — io_uring accept is wired only for the plain TCP
     # listener; the SSL handshake still wants the userspace
     # `accept` + `SSL_accept` dance.
+    #
+    # Plan #2: when `io_uring_hotpath: :auto/:on` resolves to active, the
+    # hotpath ring takes priority — it owns multishot accept + multishot recv
+    # + send SQEs. The accept-only ring and the epoll path are mutually
+    # exclusive with it. TLS still uses the epoll branch regardless.
     def run_accept_fiber(task)
-      if @io_uring_active && !@tls
+      if @io_uring_hotpath_active && !@tls
+        run_accept_fiber_io_uring_hotpath(task)
+      elsif @io_uring_active && !@tls
         run_accept_fiber_io_uring(task)
       else
         run_accept_fiber_epoll(task)
@@ -933,6 +951,62 @@ module Hyperion
       end
     end
 
+    # Plan #2 — io_uring hotpath accept loop. Opens a per-fiber
+    # HotpathRing on first use (multishot accept + multishot recv +
+    # send SQEs on one unified ring). For this task the loop only
+    # submits the multishot accept SQE and drains accept completions;
+    # the per-connection recv wiring is added in Task 2.3.4.
+    #
+    # On failure it closes the hotpath ring and falls back to the epoll
+    # path, matching the accept-only ring's fallback contract.
+    def run_accept_fiber_io_uring_hotpath(task)
+      ring = Fiber.current[:hyperion_hotpath_ring] ||=
+               Hyperion::IOUring::HotpathRing.new
+      listener_fd = listening_io.fileno
+      ring.submit_accept_multishot(listener_fd)
+      until @stopped
+        ring.each_completion(min_complete: 1, timeout_ms: 100) do |c|
+          next unless c[:op_kind] == Hyperion::IOUring::HotpathRing::OP_ACCEPT
+          next if c[:result].negative?
+
+          client_fd = c[:result].to_i
+          socket = ::Socket.for_fd(client_fd)
+          socket.autoclose = true
+          apply_timeout(socket)
+          task.async { dispatch(socket) }
+        end
+      end
+    rescue IOError, Errno::EBADF
+      @stopped = true
+    rescue Hyperion::IOUring::Unsupported => e
+      runtime_logger.warn do
+        { message: 'io_uring hotpath unsupported at fiber open; falling back to epoll',
+          error: e.message }
+      end
+      run_accept_fiber_epoll(task)
+    rescue StandardError => e
+      runtime_logger.warn do
+        { message: 'io_uring hotpath accept fiber error; falling back to epoll',
+          error: e.message, error_class: e.class.name }
+      end
+      run_accept_fiber_epoll(task)
+    ensure
+      ring = Fiber.current[:hyperion_hotpath_ring]
+      if ring && !ring.closed?
+        ring.close
+        Fiber.current[:hyperion_hotpath_ring] = nil
+      end
+    end
+
+    # Plan #2 — test seam: returns the active HotpathRing on the current
+    # accept fiber, or nil if none. Used by io_uring_hotpath_fallback_engaged_spec
+    # to inject force_unhealthy! without exposing the ring through the
+    # public Server surface.
+    def hotpath_ring_for_test
+      Fiber.current[:hyperion_hotpath_ring]
+    end
+    private :hotpath_ring_for_test
+
     # Boot-time log line per worker capturing the resolved io_uring
     # state. Mirrors the `log_ktls_state_once` pattern from 2.2.0.
     # Single-shot via the class-level ivar so multi-worker boots
@@ -948,6 +1022,28 @@ module Hyperion
           policy: @io_uring_policy,
           active: @io_uring_active,
           supported: Hyperion::IOUring.supported?
+        }
+      end
+    rescue StandardError
+      nil
+    end
+
+    # Plan #2 — boot-time log for the hotpath gate. Single-shot via the
+    # class-level ivar so multi-worker boots don't fan into N identical
+    # lines. Mirrors the log_io_uring_state_once pattern.
+    def log_io_uring_hotpath_state_once
+      return if Hyperion::Server.instance_variable_get(:@io_uring_hotpath_state_logged)
+      return if @io_uring_hotpath_policy == :off
+
+      Hyperion::Server.instance_variable_set(:@io_uring_hotpath_state_logged, true)
+      runtime_logger.info do
+        {
+          message: 'io_uring hotpath state',
+          policy: @io_uring_hotpath_policy,
+          active: @io_uring_hotpath_active,
+          kernel_ok: Hyperion::IOUring.kernel_supports_io_uring?,
+          hotpath_supported: Hyperion::IOUring.respond_to?(:hotpath_supported?) &&
+                              Hyperion::IOUring.hotpath_supported?
         }
       end
     rescue StandardError
