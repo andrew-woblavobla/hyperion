@@ -47,6 +47,15 @@ module Hyperion
       # Default flips to :auto in 2.4 only after soak. Operators flip on
       # via `HYPERION_IO_URING={on,auto}` env var to A/B test.
       io_uring: :off,
+      # Plan #2 (perf roadmap) — io_uring hot path policy. Independent
+      # gate from the accept-only `io_uring:` above. Tri-state:
+      #   :off  — accept and read/write stay on the existing paths
+      #           (default; no behavior change in 2.18 minor cut).
+      #   :auto — engage when supported (Linux 5.19+ + buffer-ring
+      #           registration succeeds); quietly fall back otherwise.
+      #   :on   — demand it. Boot raises if unsupported.
+      # Override at runtime via `HYPERION_IO_URING_HOTPATH={off,auto,on}`.
+      io_uring_hotpath: :off,
       # 2.3-B: per-connection in-flight cap. nginx upstream keep-alive
       # pipelines many client requests through one upstream connection;
       # without this cap a single greedy upstream conn can hog the worker
