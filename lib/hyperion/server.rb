@@ -195,6 +195,7 @@ module Hyperion
                    tls_session_cache_size: TLS::DEFAULT_SESSION_CACHE_SIZE,
                    tls_ktls: :auto,
                    io_uring: :off,
+                   io_uring_hotpath: :off,
                    max_in_flight_per_conn: nil,
                    tls_handshake_rate_limit: :unlimited,
                    route_table: nil,

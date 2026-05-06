@@ -44,6 +44,7 @@ module Hyperion
       # known sharp edges (SQ inheritance, SQPOLL non-survival across
       # fork). The env var is the sanctioned way to opt in.
       apply_io_uring_env_override!(config)
+      apply_io_uring_hotpath_env_override!(config)
 
       # 2.3-B: env-var overrides for the per-conn fairness cap and the
       # TLS handshake CPU throttle. Same precedence rule as the other
@@ -186,6 +187,10 @@ module Hyperion
              'Run plain HTTP/1.1 connections under Async::Scheduler (required for hyperion-async-pg and other fiber-cooperative I/O; default off)') do |v|
           cli_opts[:async_io] = v
         end
+        o.on('--io-uring-hotpath POLICY',
+             'io_uring hot path policy (off|auto|on); default off; Linux 5.19+ only') do |v|
+          cli_opts[:io_uring_hotpath] = v.to_sym
+        end
         o.on('--max-body-bytes BYTES', Integer,
              'Maximum request body size in bytes (default 16777216 = 16 MiB)') do |n|
           cli_opts[:max_body_bytes] = n
@@ -321,6 +326,7 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
                           tls_session_cache_size: config.tls.session_cache_size,
                           tls_ktls: config.tls.ktls,
                           io_uring: config.io_uring,
+                          io_uring_hotpath: config.io_uring_hotpath,
                           max_in_flight_per_conn: config.max_in_flight_per_conn,
                           tls_handshake_rate_limit: config.tls.handshake_rate_limit,
                           preload_static_dirs: config.resolved_preload_static_dirs)
@@ -514,6 +520,23 @@ WARNING: argv is visible via `ps`; prefer --admin-token-file PATH for production
       end
     end
     private_class_method :apply_io_uring_env_override!
+
+    # Plan #2 — env override for the hotpath gate.
+    def self.apply_io_uring_hotpath_env_override!(config)
+      raw = ENV['HYPERION_IO_URING_HOTPATH']
+      return unless raw
+
+      case raw.downcase
+      when 'off', '0', 'false' then config.io_uring_hotpath = :off
+      when 'on',  '1', 'true'  then config.io_uring_hotpath = :on
+      when 'auto'              then config.io_uring_hotpath = :auto
+      else
+        Hyperion.logger.warn do
+          { message: 'HYPERION_IO_URING_HOTPATH ignored (must be off|on|auto)', value: raw }
+        end
+      end
+    end
+    private_class_method :apply_io_uring_hotpath_env_override!
 
     # 2.3-B: shared parser for `--max-in-flight-per-conn VALUE` and
     # `HYPERION_MAX_IN_FLIGHT_PER_CONN=VALUE`. Returns either a positive
