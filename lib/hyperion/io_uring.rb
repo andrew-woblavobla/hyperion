@@ -139,6 +139,110 @@ module Hyperion
       end
     end
 
+    # Plan #2 — io_uring hot path: multishot accept + multishot recv
+    # with kernel-managed buffer rings + send SQEs. One ring per
+    # worker; the accept fiber drains the unified completion queue.
+    class HotpathRing
+      DEFAULT_QUEUE_DEPTH = 1024
+      DEFAULT_N_BUFS      = 512
+      DEFAULT_BUF_SIZE    = 8192
+
+      # Layout matches the Rust `#[repr(C)] Completion` struct
+      # (hotpath.rs has a compile-time assert of size = 24):
+      #   u8 op_kind | i32 fd | i64 result | i32 buf_id | u32 flags
+      # padded to native alignment. Total: 24 bytes.
+      COMPLETION_BYTES = 24
+      MAX_BATCH        = 64
+
+      # Op-kind values must match Rust's `OpKind` enum in hotpath.rs.
+      OP_ACCEPT = 1
+      OP_RECV   = 2
+      OP_SEND   = 3
+      OP_CLOSE  = 4
+
+      def initialize(queue_depth: DEFAULT_QUEUE_DEPTH,
+                     n_bufs: DEFAULT_N_BUFS,
+                     buf_size: DEFAULT_BUF_SIZE)
+        raise Unsupported, 'io_uring hotpath not supported on this host' \
+          unless IOUring.hotpath_supported?
+
+        @ptr = IOUring.hotpath_ring_new(queue_depth, n_bufs, buf_size)
+        raise Unsupported, 'hotpath ring allocation failed' if @ptr.nil?
+
+        @completion_buf = Fiddle::Pointer.malloc(COMPLETION_BYTES * MAX_BATCH,
+                                                 Fiddle::RUBY_FREE)
+        @closed = false
+      end
+
+      def submit_accept_multishot(listener_fd)
+        rc = IOUring.hotpath_submit_accept(@ptr, listener_fd.to_i)
+        raise SystemCallError.new('hotpath submit_accept', -rc) if rc.negative?
+        nil
+      end
+
+      def submit_recv_multishot(fd)
+        rc = IOUring.hotpath_submit_recv(@ptr, fd.to_i)
+        raise SystemCallError.new('hotpath submit_recv', -rc) if rc.negative?
+        nil
+      end
+
+      def submit_send(fd, iov_ptr, iov_count)
+        rc = IOUring.hotpath_submit_send(@ptr, fd.to_i, iov_ptr, iov_count.to_i)
+        raise SystemCallError.new('hotpath submit_send', -rc) if rc.negative?
+        nil
+      end
+
+      # Drain up to MAX_BATCH completions. Yields each as a frozen
+      # Hash; returns the count yielded. Caller is responsible for
+      # `release_buffer(buf_id)` after consuming a recv buffer view.
+      #
+      # If wait_completions returns -1 (ring went unhealthy), this
+      # method returns 0 yielded and the caller must check `healthy?`
+      # to detect the state and fall back to accept4.
+      def each_completion(min_complete: 1, timeout_ms: 100)
+        n = IOUring.hotpath_wait(@ptr, min_complete, timeout_ms,
+                                 @completion_buf, MAX_BATCH)
+        return 0 if n.negative?
+
+        n.times do |i|
+          offset = i * COMPLETION_BYTES
+          op_kind = @completion_buf[offset, 1].unpack1('C')
+          fd      = @completion_buf[offset + 4, 4].unpack1('l<')
+          result  = @completion_buf[offset + 8, 8].unpack1('q<')
+          buf_id  = @completion_buf[offset + 16, 4].unpack1('l<')
+          flags   = @completion_buf[offset + 20, 4].unpack1('L<')
+          yield(op_kind: op_kind, fd: fd, result: result,
+                buf_id: buf_id, flags: flags)
+        end
+        n
+      end
+
+      def release_buffer(buf_id)
+        IOUring.hotpath_release_buf(@ptr, buf_id.to_i)
+      end
+
+      def force_unhealthy!
+        IOUring.hotpath_force_unhealthy(@ptr)
+      end
+
+      def healthy?
+        IOUring.hotpath_is_healthy(@ptr) == 1
+      end
+
+      def close
+        return if @closed
+        @closed = true
+        IOUring.hotpath_ring_free(@ptr) if @ptr && !@ptr.null?
+        @ptr = nil
+      end
+
+      def closed?
+        @closed
+      end
+
+      attr_reader :ptr
+    end
+
     class << self
       # Cached three-state result: nil = not-yet-probed, true/false = result.
       #
@@ -155,7 +259,27 @@ module Hyperion
       # specs that stub Etc.uname or RbConfig.
       def reset!
         @supported = nil
+        @hotpath_supported = nil
         @lib = nil
+      end
+
+      # Plan #2 — true when (a) accept-only `supported?` true, AND
+      # (b) the kernel actually accepts pbuf-ring registration (5.19+).
+      # NOTE: this does NOT probe RecvMulti (6.0+); the Ruby caller
+      # must treat the first recv CQE failure as a feature-unavailable
+      # signal — see hotpath.rs's hyperion_io_uring_hotpath_supported
+      # doc comment for the full kernel-version matrix.
+      def hotpath_supported?
+        return @hotpath_supported unless @hotpath_supported.nil?
+        @hotpath_supported = compute_hotpath_supported
+      end
+
+      def compute_hotpath_supported
+        return false unless supported?
+        return false unless @hotpath_supported_fn
+        @hotpath_supported_fn.call.zero?
+      rescue StandardError
+        false
       end
 
       # ---- Internal: feature gate ----
@@ -249,6 +373,51 @@ module Hyperion
                                          Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT,
                                          Fiddle::TYPE_VOIDP],
                                         Fiddle::TYPE_INT)
+
+        # Plan #2 — hotpath surface (5.19+ for PBUF_RING, 6.0+ for RecvMulti).
+        @hotpath_supported_fn = Fiddle::Function.new(
+          @lib['hyperion_io_uring_hotpath_supported'], [], Fiddle::TYPE_INT
+        )
+        @hotpath_ring_new_fn = Fiddle::Function.new(
+          @lib['hyperion_io_uring_hotpath_ring_new'],
+          [Fiddle::TYPE_INT, Fiddle::TYPE_SHORT, Fiddle::TYPE_INT],
+          Fiddle::TYPE_VOIDP
+        )
+        @hotpath_ring_free_fn = Fiddle::Function.new(
+          @lib['hyperion_io_uring_hotpath_ring_free'],
+          [Fiddle::TYPE_VOIDP], Fiddle::TYPE_VOID
+        )
+        @hotpath_submit_accept_fn = Fiddle::Function.new(
+          @lib['hyperion_io_uring_hotpath_submit_accept_multishot'],
+          [Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT], Fiddle::TYPE_INT
+        )
+        @hotpath_submit_recv_fn = Fiddle::Function.new(
+          @lib['hyperion_io_uring_hotpath_submit_recv_multishot'],
+          [Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT], Fiddle::TYPE_INT
+        )
+        @hotpath_submit_send_fn = Fiddle::Function.new(
+          @lib['hyperion_io_uring_hotpath_submit_send'],
+          [Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
+          Fiddle::TYPE_INT
+        )
+        @hotpath_wait_fn = Fiddle::Function.new(
+          @lib['hyperion_io_uring_hotpath_wait_completions'],
+          [Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT, Fiddle::TYPE_INT,
+           Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
+          Fiddle::TYPE_INT
+        )
+        @hotpath_release_buf_fn = Fiddle::Function.new(
+          @lib['hyperion_io_uring_hotpath_release_buffer'],
+          [Fiddle::TYPE_VOIDP, Fiddle::TYPE_SHORT], Fiddle::TYPE_VOID
+        )
+        @hotpath_force_unhealthy_fn = Fiddle::Function.new(
+          @lib['hyperion_io_uring_hotpath_force_unhealthy'],
+          [Fiddle::TYPE_VOIDP], Fiddle::TYPE_VOID
+        )
+        @hotpath_is_healthy_fn = Fiddle::Function.new(
+          @lib['hyperion_io_uring_hotpath_is_healthy'],
+          [Fiddle::TYPE_VOIDP], Fiddle::TYPE_INT
+        )
         @lib
       rescue Fiddle::DLError, StandardError => e
         warn "[hyperion] IOUring failed to load (#{e.class}: #{e.message}); falling back to epoll"
@@ -289,6 +458,41 @@ module Hyperion
       def ring_read(ptr, fd, buf, max, errno_buf)
         @read_fn.call(ptr, fd, buf, max, errno_buf)
       end
+
+      def hotpath_ring_new(qd, n_bufs, buf_size)
+        ptr = @hotpath_ring_new_fn.call(qd, n_bufs, buf_size)
+        ptr.null? ? nil : ptr
+      end
+
+      def hotpath_ring_free(ptr); @hotpath_ring_free_fn.call(ptr); end
+
+      def hotpath_submit_accept(ptr, fd)
+        @hotpath_submit_accept_fn.call(ptr, fd)
+      end
+
+      def hotpath_submit_recv(ptr, fd)
+        @hotpath_submit_recv_fn.call(ptr, fd)
+      end
+
+      def hotpath_submit_send(ptr, fd, iov, n)
+        @hotpath_submit_send_fn.call(ptr, fd, iov, n)
+      end
+
+      def hotpath_wait(ptr, mc, t, out, cap)
+        @hotpath_wait_fn.call(ptr, mc, t, out, cap)
+      end
+
+      def hotpath_release_buf(ptr, buf_id)
+        @hotpath_release_buf_fn.call(ptr, buf_id)
+      end
+
+      def hotpath_force_unhealthy(ptr)
+        @hotpath_force_unhealthy_fn.call(ptr)
+      end
+
+      def hotpath_is_healthy(ptr)
+        @hotpath_is_healthy_fn.call(ptr)
+      end
     end
 
     # ---- Server-side helpers ----
@@ -318,6 +522,28 @@ module Hyperion
         true
       else
         raise ArgumentError, "io_uring must be :off, :auto, or :on (got #{policy.inspect})"
+      end
+    end
+
+    # Plan #2 — resolve `:off | :auto | :on` for the hotpath gate.
+    # Mirrors `resolve_policy!` semantics: `:on` raises on unsupported,
+    # `:auto` quietly falls back, `:off` returns false.
+    def self.resolve_hotpath_policy!(policy)
+      case policy
+      when :off, nil, false
+        false
+      when :auto
+        hotpath_supported?
+      when :on, true
+        unless hotpath_supported?
+          raise Unsupported,
+                'io_uring hotpath required (io_uring_hotpath: :on) but unsupported on this host ' \
+                "(linux=#{linux?}, kernel_ok=#{kernel_supports_io_uring?}, " \
+                "hotpath_supported=#{hotpath_supported?})"
+        end
+        true
+      else
+        raise ArgumentError, "io_uring_hotpath must be :off, :auto, or :on (got #{policy.inspect})"
       end
     end
   end
