@@ -964,16 +964,63 @@ module Hyperion
                Hyperion::IOUring::HotpathRing.new
       listener_fd = listening_io.fileno
       ring.submit_accept_multishot(listener_fd)
+      # Plan #2 Task 2.3.4 — per-connection state map.
+      # Maps client_fd (Integer) → Connection.  Populated on OP_ACCEPT
+      # and cleared on OP_RECV result <= 0 (EOF / error).  Single-fiber
+      # — no mutex needed.
+      hotpath_connections = {}
       until @stopped
         ring.each_completion(min_complete: 1, timeout_ms: 100) do |c|
-          next unless c[:op_kind] == Hyperion::IOUring::HotpathRing::OP_ACCEPT
-          next if c[:result].negative?
+          case c[:op_kind]
+          when Hyperion::IOUring::HotpathRing::OP_ACCEPT
+            next if c[:result].negative?
 
-          client_fd = c[:result].to_i
-          socket = ::Socket.for_fd(client_fd)
-          socket.autoclose = true
-          apply_timeout(socket)
-          task.async { dispatch(socket) }
+            client_fd = c[:result].to_i
+            socket = ::Socket.for_fd(client_fd)
+            socket.autoclose = true
+            apply_timeout(socket)
+            # Build a Connection for the accepted fd. io_uring_owned: true
+            # arms the guard in read_chunk (should never be called for
+            # these connections) and signals close_for_eof callers.
+            conn = Connection.new(runtime: @explicit_runtime ? @runtime : nil,
+                                  max_in_flight_per_conn: @max_in_flight_per_conn,
+                                  route_table: @route_table,
+                                  io_uring_owned: true)
+            conn.instance_variable_set(:@socket, socket)
+            @metrics.increment(:connections_accepted)
+            @metrics.increment(:connections_active)
+            hotpath_connections[client_fd] = conn
+            # Post the first multishot-recv SQE for this fd.  From here
+            # on, the kernel delivers recv CQEs for every batch of bytes
+            # that arrives on this socket until EOF or cancel.
+            ring.submit_recv_multishot(client_fd)
+
+          when Hyperion::IOUring::HotpathRing::OP_RECV
+            fd     = c[:fd]
+            result = c[:result]
+            buf_id = c[:buf_id]
+
+            conn = hotpath_connections[fd]
+            next unless conn
+
+            if result <= 0
+              # 0 = peer EOF; negative = error.  Clean up and discard.
+              hotpath_connections.delete(fd)
+              conn.close_for_eof
+              begin
+                conn.socket&.close unless conn.socket&.closed?
+              rescue StandardError
+                nil
+              end
+            else
+              # Copy `result` bytes from the kernel buffer slot into a
+              # Ruby String (one allocation), then release the slot so
+              # the kernel can reuse it for the next recv.
+              bytes = ring.copy_buffer(buf_id, result)
+              ring.release_buffer(buf_id)
+              conn.feed_read_bytes(bytes)
+            end
+          end
         end
       end
     rescue IOError, Errno::EBADF

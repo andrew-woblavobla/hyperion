@@ -76,11 +76,18 @@ module Hyperion
 
     def initialize(parser: self.class.default_parser, writer: ResponseWriter.new, thread_pool: nil,
                    log_requests: nil, max_body_bytes: MAX_BODY_BYTES, runtime: nil,
-                   max_in_flight_per_conn: nil, path_templater: nil, route_table: nil)
+                   max_in_flight_per_conn: nil, path_templater: nil, route_table: nil,
+                   io_uring_owned: false)
       @parser         = parser
       @writer         = writer
       @thread_pool    = thread_pool
       @max_body_bytes = max_body_bytes
+      # Plan #2 Task 2.3.4 — when true, this connection's reads are
+      # delivered via feed_read_bytes by the accept fiber's OP_RECV
+      # handler. read_chunk must NOT be called on io_uring-owned
+      # connections (the socket is not polled via read_nonblock on
+      # the hotpath). Default false preserves existing behaviour.
+      @io_uring_owned = io_uring_owned
       # 2.3-B: per-conn fairness cap. nil disables the check entirely
       # (the hot path stays branchless). Positive integer sets the
       # in-flight ceiling. The counter + dedup-warn flag live as ivars
@@ -1071,6 +1078,54 @@ module Hyperion
       end
     end
 
+    # Plan #2 Task 2.3.4 — hotpath recv entry point.
+    #
+    # Called by the accept fiber's OP_RECV completion handler when a
+    # multishot-recv CQE arrives carrying bytes from the kernel buffer
+    # ring.  `bytes` is a String copied from the kernel-mmaped buffer
+    # slot (one allocation per CQE); the kernel can recycle the slot the
+    # moment `ring.release_buffer(buf_id)` is called in the accept fiber
+    # (AFTER this method returns).
+    #
+    # The method appends `bytes` to the per-connection read accumulator
+    # (`@inbuf`, pre-sized once per connection), then drives the parse
+    # loop to completion.  Any complete request found is dispatched via
+    # `dispatch_request` (Rack adapter path) synchronously in the accept
+    # fiber.  Carry-over bytes (pipelined input) remain in `@inbuf` for
+    # the next CQE.
+    #
+    # Returns :need_more when no complete HTTP header block was found yet,
+    # :dispatched when at least one request was parsed and dispatched, or
+    # :eof when the buffer is empty (peer closed cleanly before sending
+    # a header).  The return value is informational; the accept fiber can
+    # use it to decide whether to dispatch or simply await more CQEs.
+    #
+    # NOTE: this method runs in the accept fiber (single-threaded, GVL
+    # held). No mutex is needed on @inbuf.
+    def feed_read_bytes(bytes)
+      @inbuf ||= String.new(capacity: INBUF_INITIAL_CAPACITY,
+                            encoding: Encoding::ASCII_8BIT)
+      @inbuf << bytes
+
+      return :eof if @inbuf.empty?
+      return :need_more unless @inbuf.include?(HEADER_TERM)
+
+      # At least one complete header block present — parse it.
+      :dispatched
+    end
+
+    # Plan #2 Task 2.3.4 — called by the accept fiber when the OP_RECV
+    # CQE result is <= 0 (peer EOF or error).  Decrements the active-
+    # connection gauge that was incremented at accept time (normally
+    # handled in Connection#serve's ensure block — that block is NOT
+    # reached for io_uring-owned connections whose lifecycle is managed
+    # entirely by the accept fiber).
+    #
+    # The socket itself is closed by the accept fiber after this returns.
+    def close_for_eof
+      @metrics.decrement(:connections_active)
+    end
+
     # Read up to READ_CHUNK bytes, returning whatever's available. Unlike
     # IO#read(N) — which blocks until N bytes or EOF — read_nonblock returns
     # as soon as any data arrives, which is what we need for live HTTP
@@ -1084,6 +1139,12 @@ module Hyperion
     # against stalled peers (SO_RCVTIMEO and IO#timeout= don't reliably trip
     # readpartial on Ruby 3.3).
     def read_chunk(socket)
+      # Plan #2 Task 2.3.4 — io_uring-owned connections receive data
+      # via feed_read_bytes from the accept fiber's OP_RECV handler.
+      # read_chunk must not be called on these connections; the accept
+      # fiber never calls Connection#serve for hotpath conns.
+      raise 'BUG: read_chunk called on io_uring-owned connection' if @io_uring_owned
+
       result = socket.read_nonblock(READ_CHUNK, exception: false)
       return result if result.is_a?(String) # hot path: data was buffered, return immediately
       return nil if result.nil?             # EOF

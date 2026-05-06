@@ -221,6 +221,19 @@ module Hyperion
         IOUring.hotpath_release_buf(@ptr, buf_id.to_i)
       end
 
+      # Plan #2 Task 2.3.4 — copy `len` bytes from kernel buffer-ring
+      # slot `buf_id` into a freshly-allocated Ruby String.
+      #
+      # The caller MUST call `release_buffer(buf_id)` after this returns
+      # so the kernel can reuse the slot. One allocation per recv CQE —
+      # acceptable as a baseline; the zero-copy variant is deferred.
+      def copy_buffer(buf_id, len)
+        out = Fiddle::Pointer.malloc(len, Fiddle::RUBY_FREE)
+        rc = IOUring.hotpath_copy_buffer(@ptr, buf_id.to_i, len.to_i, out, len.to_i)
+        raise SystemCallError.new('hotpath copy_buffer', -rc) if rc.negative?
+        out.to_str(rc)
+      end
+
       def force_unhealthy!
         IOUring.hotpath_force_unhealthy(@ptr)
       end
@@ -418,6 +431,18 @@ module Hyperion
           @lib['hyperion_io_uring_hotpath_is_healthy'],
           [Fiddle::TYPE_VOIDP], Fiddle::TYPE_INT
         )
+        # Plan #2 Task 2.3.4 — one-copy buffer extraction: copies `len`
+        # bytes from kernel buffer-ring slot `buf_id` into a
+        # caller-supplied output buffer. Returns byte count or negative errno.
+        @hotpath_copy_buffer_fn = Fiddle::Function.new(
+          @lib['hyperion_io_uring_hotpath_copy_buffer'],
+          [Fiddle::TYPE_VOIDP,  # ptr
+           Fiddle::TYPE_SHORT,  # buf_id (u16)
+           Fiddle::TYPE_INT,    # len (u32)
+           Fiddle::TYPE_VOIDP,  # out_ptr
+           Fiddle::TYPE_INT],   # out_cap (u32)
+          Fiddle::TYPE_INT
+        )
         @lib
       rescue Fiddle::DLError, StandardError => e
         warn "[hyperion] IOUring failed to load (#{e.class}: #{e.message}); falling back to epoll"
@@ -492,6 +517,13 @@ module Hyperion
 
       def hotpath_is_healthy(ptr)
         @hotpath_is_healthy_fn.call(ptr)
+      end
+
+      # Plan #2 Task 2.3.4 — copy `len` bytes from kernel buffer-ring
+      # slot `buf_id` into the caller-supplied output buffer. Returns
+      # the number of bytes written, or a negative errno on failure.
+      def hotpath_copy_buffer(ptr, buf_id, len, out_ptr, out_cap)
+        @hotpath_copy_buffer_fn.call(ptr, buf_id, len, out_ptr, out_cap)
       end
     end
 

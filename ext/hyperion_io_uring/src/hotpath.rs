@@ -586,6 +586,50 @@ pub unsafe extern "C" fn hyperion_io_uring_hotpath_force_unhealthy(
     }));
 }
 
+/// Copy `len` bytes from buffer `buf_id` into the caller-supplied output
+/// buffer `out_ptr` (capacity `out_cap` bytes).  Returns the number of
+/// bytes written on success, or a negative errno on failure.
+///
+/// This is the "one-copy" recv-data path for Task 2.3.4: the kernel
+/// has filled the buffer-ring slot; we copy into Ruby's string buffer,
+/// then the caller calls `release_buffer` so the kernel can reuse the
+/// slot.  The copy is one `memcpy`-equivalent via `ptr::copy_nonoverlapping`.
+///
+/// Returns -22 (`-EINVAL`) on null/invalid arguments.
+#[no_mangle]
+pub unsafe extern "C" fn hyperion_io_uring_hotpath_copy_buffer(
+    ptr: *mut HotpathRing,
+    buf_id: u16,
+    len: u32,
+    out_ptr: *mut u8,
+    out_cap: u32,
+) -> c_int {
+    if ptr.is_null() || out_ptr.is_null() {
+        return -EINVAL;
+    }
+    catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if len > out_cap {
+            return -EINVAL;
+        }
+        // SAFETY: buf_id is valid (caller's responsibility per BufferRing::borrow
+        // contract — buf_id came from a CQE on this ring). len <= buf_size
+        // is guaranteed by the kernel (recv never writes more than buf_size).
+        // out_ptr is valid for out_cap >= len bytes (caller contract).
+        #[cfg(target_os = "linux")]
+        {
+            let view = (*ptr).buffer_ring.borrow(buf_id, len as usize);
+            std::ptr::copy_nonoverlapping(view.as_ptr(), out_ptr, len as usize);
+            len as c_int
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (buf_id, len, out_ptr, out_cap);
+            -38 // -ENOSYS
+        }
+    }))
+    .unwrap_or(-EINVAL)
+}
+
 /// Returns 1 if the ring is healthy, 0 otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn hyperion_io_uring_hotpath_is_healthy(
