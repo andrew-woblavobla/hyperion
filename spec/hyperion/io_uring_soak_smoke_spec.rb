@@ -231,4 +231,21 @@ RSpec.describe 'Hyperion::Http::PageCache io_uring soak smoke (2.13-E)' do
       expect([true, false]).to include(HAVE_PROC_SAMPLING)
     end
   end
+
+  # Plan #2 Task 2.5.4 — hotpath soak-smoke extension.
+  #
+  # The full hotpath soak (sustained io_uring multishot-recv + send SQE
+  # path under load) requires the bench host and a running Hyperion
+  # server wired to the HotpathRing accept fiber — that's the Task 2.5.5
+  # bench gate. This context block is the CI-side stub: it records the
+  # intent and pends until the integration harness is wired (see
+  # connection_io_uring_hotpath_spec.rb for the E2E byte-parity side).
+  context 'with io_uring_hotpath enabled', :perf,
+          if: defined?(Hyperion::IOUring) &&
+              Hyperion::IOUring.respond_to?(:hotpath_supported?) &&
+              Hyperion::IOUring.hotpath_supported? do
+    it 'sustains 1k requests with no drop on the hotpath (plan #2 §2.5.4 soak)' do
+      pending 'hotpath soak harness — pending Task 2.5.5 bench-gate integration'
+    end
+  end
 end
