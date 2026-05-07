@@ -241,6 +241,20 @@ setup_pg_bench_db() {
     fi
   fi
 
+  # SKIP_PG_MIGRATE=1 bypasses the rake step. Useful when:
+  #   * the DB is known to be up-to-date and you want to skip ~30s of
+  #     Rails boot per bench run, OR
+  #   * a stale Bundler/Rails state on the bench host hangs rake init
+  #     (observed under high concurrent-rake conditions; see
+  #     bench/run_all.sh history).
+  # The check below confirms the schema_migrations table exists; if it
+  # does, we trust the DB is set up. The AR rows will boot-fail if the
+  # users table is missing — fail-loud is correct.
+  if [ "${SKIP_PG_MIGRATE:-0}" = "1" ]; then
+    echo "[setup_pg_bench_db] SKIP_PG_MIGRATE=1 set; skipping rake db:migrate"
+    return 0
+  fi
+
   echo "[setup_pg_bench_db] migrating $dbname"
   # Use rake (not rails) — bench/rails_app/ has Rakefile but no bin/rails
   # binstub, and `rails` outside an app prints "rails new" help.
