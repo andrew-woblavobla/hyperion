@@ -1,0 +1,36 @@
+Run options: exclude {:perf=>true}
+
+Randomized with seed 26747
+
+io_uring hotpath send SQE
+  submits a send SQE and the bytes appear at the peer
+
+Connection over io_uring hotpath (E2E byte-parity)
+{"ts":"2026-05-07T09:35:01.221Z","level":"info","source":"hyperion","message":"io_uring hotpath state","policy":"on","active":true,"kernel_ok":true,"hotpath_supported":true}
+{"ts":"2026-05-07T09:35:01.275Z","level":"info","source":"hyperion","message":"request","method":"GET","path":"/","status":200,"duration_ms":0.31,"remote_addr":"127.0.0.1","http_version":"HTTP/1.1"}
+  response body matches between hotpath ON and hotpath OFF
+
+io_uring hotpath buffer exhaustion
+[buffer_exhaustion_spec] enobufs_count=4 recv_count=4 accepted=8
+  ring stays healthy under more-clients-than-buffers load and receives some data
+
+io_uring hotpath per-worker fallback (structural)
+{"ts":"2026-05-07T09:35:01.832Z","level":"info","source":"hyperion","message":"request","method":"GET","path":"/","status":200,"duration_ms":0.21,"remote_addr":"127.0.0.1","http_version":"HTTP/1.1"}
+  :io_uring_hotpath_fallback_engaged is 0 (never triggered) on a healthy boot
+  :io_uring_hotpath_fallback_engaged counter is accessible in the metrics snapshot
+{"ts":"2026-05-07T09:35:02.137Z","level":"info","source":"hyperion","message":"request","method":"GET","path":"/","status":200,"duration_ms":0.23,"remote_addr":"127.0.0.1","http_version":"HTTP/1.1"}
+  server boots and responds with io_uring_hotpath: :on
+
+Hyperion::Server#run_accept_fiber_io_uring_hotpath (fallback hook)
+  Server#initialize accepts io_uring_hotpath: :off without raising
+  defines run_accept_fiber_io_uring_hotpath as a private method
+
+Hyperion::Server @metrics ivar regression (row-19 BOOT-FAIL)
+  never reads an undefined @metrics ivar — uses runtime_metrics
+  has nil @metrics on a freshly-built Server (proves runtime_metrics is the canonical accessor)
+
+Finished in 0.98355 seconds (files took 0.38409 seconds to load)
+10 examples, 0 failures
+
+Randomized with seed 26747
+

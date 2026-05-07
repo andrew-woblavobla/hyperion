@@ -988,8 +988,14 @@ module Hyperion
                                   io_uring_owned: true,
                                   app: @app)
             conn.instance_variable_set(:@socket, socket)
-            @metrics.increment(:connections_accepted)
-            @metrics.increment(:connections_active)
+            # Server has no @metrics ivar — sibling accept paths bump
+            # these counters via runtime_metrics (record_dispatch et al.)
+            # or via Connection#serve, which we bypass here. Using @metrics
+            # here raised NoMethodError on the first ACCEPT completion and
+            # took down the --async-io + hotpath=on + 1w boot before
+            # wait_for_bind could land its first probe (row-19 BOOT-FAIL).
+            runtime_metrics.increment(:connections_accepted)
+            runtime_metrics.increment(:connections_active)
             hotpath_connections[client_fd] = conn
             # Post the first multishot-recv SQE for this fd.  From here
             # on, the kernel delivers recv CQEs for every batch of bytes
@@ -1062,20 +1068,34 @@ module Hyperion
         { message: 'io_uring hotpath unsupported at fiber open; falling back to epoll',
           error: e.message }
       end
+      close_hotpath_ring_for_fallback
       run_accept_fiber_epoll(task)
     rescue StandardError => e
       runtime_logger.warn do
         { message: 'io_uring hotpath accept fiber error; falling back to epoll',
           error: e.message, error_class: e.class.name }
       end
+      close_hotpath_ring_for_fallback
       run_accept_fiber_epoll(task)
     ensure
-      ring = Fiber[:hyperion_hotpath_ring]
-      if ring && !ring.closed?
-        ring.close
-        Fiber[:hyperion_hotpath_ring] = nil
-      end
+      close_hotpath_ring_for_fallback
     end
+
+    # Cancel the multishot-accept SQE armed on @listener_fd by closing
+    # the hotpath ring before the epoll fallback takes over. Without this,
+    # `accept_or_nil` in run_accept_fiber_epoll competes with a still-armed
+    # kernel-side multishot-accept consumer and inbound connections can be
+    # delivered to a dead CQ. Idempotent.
+    def close_hotpath_ring_for_fallback
+      ring = Fiber[:hyperion_hotpath_ring]
+      return unless ring && !ring.closed?
+
+      ring.close
+      Fiber[:hyperion_hotpath_ring] = nil
+    rescue StandardError
+      nil
+    end
+    private :close_hotpath_ring_for_fallback
 
     # Plan #2 — test seam: returns the active HotpathRing on the current
     # accept fiber, or nil if none. Used by io_uring_hotpath_fallback_engaged_spec

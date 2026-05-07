@@ -1,5 +1,80 @@
 # Changelog
 
+## 2.16.4 — 2026-05-07
+
+### io_uring hotpath accept fiber: row-19 BOOT-FAIL fix
+
+Bug fix only; no public API change. Restores the
+`--async-io + io_uring_hotpath=on + 1w` boot path on Linux 5.19+.
+
+- **`Hyperion::Server#run_accept_fiber_io_uring_hotpath`** used
+  `@metrics.increment(:connections_accepted)` /
+  `@metrics.increment(:connections_active)` on every accept
+  completion, but `Server` has no `@metrics` ivar — sibling write
+  paths route through `runtime_metrics` (which resolves to
+  `@runtime.metrics` or `Hyperion.metrics`). Reading the unset
+  ivar yielded `nil`, so the first `OP_ACCEPT` completion raised
+  `NoMethodError: undefined method 'increment' for nil`. The
+  `rescue StandardError` block caught it, logged
+  `"io_uring hotpath accept fiber error; falling back to epoll"`,
+  and bailed to the epoll path. The fault only manifested on the
+  `--async-io` boot shape because `start_async_loop` is the only
+  call path that drives the hotpath fiber — `start_raw_loop`
+  short-circuits to the C accept loop and bypasses the bug
+  entirely (which is why the hotpath-on synthetic rows kept
+  passing while the AR-CRUD `--async-io` row took down `wait_for_bind`
+  and registered as `BOOT-FAIL`). Replaced with `runtime_metrics`.
+
+- **`Hyperion::Connection#feed_read_bytes`** and
+  **`#close_for_eof`** were defined under `private` (line 536) but
+  called externally from the accept fiber per their own doc
+  comments. Each `OP_RECV` completion would have re-tripped the
+  fallback with `NoMethodError: private method 'feed_read_bytes'
+  called …`. Moved both to `public`.
+
+- **`Hyperion::Server#run_accept_fiber_io_uring_hotpath` rescue
+  ordering**: the `rescue` blocks called `run_accept_fiber_epoll(task)`
+  *before* the `ensure` closed the hotpath ring. While the fallback
+  ran, the multishot-accept SQE stayed armed against the listener
+  fd and competed with the fallback's `accept_or_nil` for incoming
+  connections — defeating the recovery. Extracted
+  `close_hotpath_ring_for_fallback` and call it before the fallback
+  invocation in every rescue path.
+
+- **`spec/hyperion/connection_io_uring_hotpath_spec.rb`** had a
+  `rescue StandardError => e ; pending "in-process boot is fragile"`
+  block that masked the `NoMethodError` above as a flake for the
+  bench gate to chase. Removed the `pending` rescue and added
+  `async_io: true` to `boot_server_thread` (without it the spec
+  exercised `start_raw_loop`, not the hotpath fiber it claimed to
+  test — which is exactly how the bug slipped past CI).
+
+- **`spec/hyperion/server_metrics_ivar_regression_spec.rb`** new —
+  cross-platform structural guard so a future re-introduction of
+  an `@metrics` ivar reference in `Server` trips on macOS / Linux
+  CI before reaching the bench gate.
+
+Bench evidence on the project's Linux 6.8 + io_uring 5.19+ host
+against PG 17 (canonical `--async-io` + `hyperion-async-pg`):
+
+| Trial | Requests/sec | p99 latency |
+|---:|---:|---:|
+| 1 | 468.46 | 237.95 ms |
+| 2 | 474.61 | 220.60 ms |
+| 3 | 492.93 | 234.79 ms |
+| **Median** | **474.61** | **234.79 ms** |
+
+Boot succeeded in 5 s (vs `BOOT-FAIL` after 45 s on 2026-05-07).
+Zero `io_uring hotpath accept fiber error` warn lines and zero
+`io_uring hotpath ring unhealthy` lines across the 60 s wrk window:
+the hotpath served every request end-to-end with no fallback
+engagement. p99 is ~2× better than the 2026-05-05 first pass
+(234 ms vs 497 ms) — the 2026-05-05 run used the epoll-style
+accept loop; this run exercises multishot-accept + multishot-recv
++ send-SQE on the unified ring as designed (shallower queues,
+trades some throughput for tail latency). CSV in
+`docs/BENCH_ROW19_HOTPATH_FIX_2026_05_07.csv`.
+
 ## 2.16.3 — 2026-05-05
 
 ### 2.16.3-A — Hot-path Ruby cost reduction (metrics + split_host cache)

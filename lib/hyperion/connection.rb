@@ -1121,6 +1121,7 @@ module Hyperion
       # At least one complete header block is present — drive parse + dispatch.
       drive_pending_requests
     end
+    public :feed_read_bytes
 
     # Plan #2 Task 2.4.1 — parse-and-dispatch loop for io_uring-owned
     # connections.  Called by feed_read_bytes after appending CQE bytes
@@ -1270,6 +1271,7 @@ module Hyperion
     def close_for_eof
       @metrics.decrement(:connections_active)
     end
+    public :close_for_eof
 
     # Read up to READ_CHUNK bytes, returning whatever's available. Unlike
     # IO#read(N) — which blocks until N bytes or EOF — read_nonblock returns

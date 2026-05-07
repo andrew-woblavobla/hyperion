@@ -32,6 +32,11 @@ RSpec.describe 'Connection over io_uring hotpath (E2E byte-parity)',
   # NOTE: we use `start` (which calls `listen` internally) rather than
   # `run(listener)` because the Server API changed across minor versions
   # and `start` is the stable public surface.
+  #
+  # `async_io: true` forces start_async_loop, which is the only path that
+  # actually drives run_accept_fiber_io_uring_hotpath. Without it the
+  # raw/C-loop path is taken and the hotpath fiber body never executes,
+  # which is exactly what hid the row-19 BOOT-FAIL regression.
   def boot_server_thread(io_uring_hotpath:)
     # Pick a free port by binding ephemerally, then let go.
     probe = TCPServer.new('127.0.0.1', 0)
@@ -43,11 +48,21 @@ RSpec.describe 'Connection over io_uring hotpath (E2E byte-parity)',
       port:             port,
       app:              app,
       thread_count:     0,
+      async_io:         true,
       io_uring_hotpath: io_uring_hotpath
     )
     thr = Thread.new { server.start }
-    # Give the accept loop a moment to bind.
-    sleep 0.3
+    # Poll the bound port instead of sleeping so a slow boot doesn't race
+    # the first request — same shape as bench/run_all.sh's wait_for_bind.
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5.0
+    until Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      begin
+        TCPSocket.open('127.0.0.1', port).close
+        break
+      rescue Errno::ECONNREFUSED
+        sleep 0.05
+      end
+    end
     [thr, port, server]
   end
 
@@ -59,12 +74,7 @@ RSpec.describe 'Connection over io_uring hotpath (E2E byte-parity)',
       body_off = Net::HTTP.get(URI("http://127.0.0.1:#{port_off}/"))
       body_on  = Net::HTTP.get(URI("http://127.0.0.1:#{port_on}/"))
       expect(body_on).to eq(body_off)
-    rescue StandardError => e
-      # In-process server boot is fragile when hotpath is first exercised
-      # in a spec-runner process (Fiber scheduler contention, etc.).
-      # Pend rather than hard-fail — the bench gate (Task 2.5.5) covers
-      # the same path on the bench host where timing is reliable.
-      pending "hotpath e2e wire-parity — in-process boot error: #{e.class}: #{e.message}"
+      expect(body_on).to eq('hello hotpath e2e')
     ensure
       begin
         srv_off&.stop

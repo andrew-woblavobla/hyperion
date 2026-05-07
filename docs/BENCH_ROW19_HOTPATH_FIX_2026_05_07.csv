@@ -1,0 +1,2 @@
+row,label,tool,rackup,rps_med,p99_med,trials,bar
+19,hyperion_rails_ar_1w_hotpath_on,wrk,bench/rails_ar.ru,474.61,234.79ms,468.46|474.61|492.93,pass
