@@ -924,7 +924,7 @@ module Hyperion
     # working off a `::Socket` object identical to what
     # `accept_nonblock` would have returned.
     def run_accept_fiber_io_uring(task)
-      ring = Fiber.current[:hyperion_io_uring] ||= Hyperion::IOUring::Ring.new(queue_depth: 256)
+      ring = Fiber[:hyperion_io_uring] ||= Hyperion::IOUring::Ring.new(queue_depth: 256)
       listener_fd = listening_io.fileno
       until @stopped
         client_fd = ring.accept(listener_fd)
@@ -944,10 +944,10 @@ module Hyperion
       end
       run_accept_fiber_epoll(task)
     ensure
-      ring = Fiber.current[:hyperion_io_uring]
+      ring = Fiber[:hyperion_io_uring]
       if ring && !ring.closed?
         ring.close
-        Fiber.current[:hyperion_io_uring] = nil
+        Fiber[:hyperion_io_uring] = nil
       end
     end
 
@@ -960,7 +960,7 @@ module Hyperion
     # On failure it closes the hotpath ring and falls back to the epoll
     # path, matching the accept-only ring's fallback contract.
     def run_accept_fiber_io_uring_hotpath(task)
-      ring = Fiber.current[:hyperion_hotpath_ring] ||=
+      ring = Fiber[:hyperion_hotpath_ring] ||=
                Hyperion::IOUring::HotpathRing.new
       listener_fd = listening_io.fileno
       ring.submit_accept_multishot(listener_fd)
@@ -1047,7 +1047,7 @@ module Hyperion
           rescue StandardError
             nil
           end
-          Fiber.current[:hyperion_hotpath_ring] = nil
+          Fiber[:hyperion_hotpath_ring] = nil
           break
         end
       end
@@ -1070,10 +1070,10 @@ module Hyperion
       end
       run_accept_fiber_epoll(task)
     ensure
-      ring = Fiber.current[:hyperion_hotpath_ring]
+      ring = Fiber[:hyperion_hotpath_ring]
       if ring && !ring.closed?
         ring.close
-        Fiber.current[:hyperion_hotpath_ring] = nil
+        Fiber[:hyperion_hotpath_ring] = nil
       end
     end
 
@@ -1082,7 +1082,7 @@ module Hyperion
     # to inject force_unhealthy! without exposing the ring through the
     # public Server surface.
     def hotpath_ring_for_test
-      Fiber.current[:hyperion_hotpath_ring]
+      Fiber[:hyperion_hotpath_ring]
     end
     private :hotpath_ring_for_test
 

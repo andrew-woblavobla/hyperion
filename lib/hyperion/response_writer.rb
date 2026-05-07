@@ -105,6 +105,27 @@ module Hyperion
     def write_buffered(io, status, headers, body, keep_alive:)
       if c_path_eligible?(io)
         date_str = cached_date
+
+        # Plan #2 — io_uring hotpath write-side: when the current
+        # accept fiber owns a HotpathRing AND the C ext exposes the
+        # via-ring entrypoint, route the response through a send SQE
+        # instead of issuing sendmsg(2) directly. The hotpath ring is
+        # set as a fiber-local by Server#run_accept_fiber_io_uring_hotpath
+        # (Task 2.3.3) and inherited by the dispatch fiber. Ring is
+        # nil for non-hotpath connections (TLS / accept-only ring /
+        # epoll path) — we fall through to direct-syscall write.
+        ring = Fiber[:hyperion_hotpath_ring]
+        if ring && !ring.closed? &&
+           ::Hyperion::Http::ResponseWriter.respond_to?(:c_write_buffered_via_ring)
+          bytes_out = ::Hyperion::Http::ResponseWriter.c_write_buffered_via_ring(
+            io, status, headers, Array(body), keep_alive, date_str, ring.ptr
+          )
+          Hyperion.metrics.increment(:bytes_written, bytes_out)
+          Hyperion.metrics.increment(:hotpath_writes_via_ring)
+          body.close if body.respond_to?(:close)
+          return
+        end
+
         bytes_out = ::Hyperion::Http::ResponseWriter.c_write_buffered(
           io, status, headers, Array(body), keep_alive, date_str
         )

@@ -39,7 +39,7 @@ module Hyperion
   #   * One ring per fiber that needs it (the accept fiber, optionally
   #     per-connection read fibers in a future phase).
   #   * Ring is opened lazily on first use:
-  #       Fiber.current[:hyperion_io_uring] ||=
+  #       Fiber[:hyperion_io_uring] ||=
   #         Hyperion::IOUring::Ring.new(queue_depth: 256)
   #   * Ring is closed when the fiber exits.
   #   * Workers don't share rings across fork — each child opens its own.
