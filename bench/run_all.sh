@@ -132,7 +132,15 @@ trap 'stop_port' EXIT INT TERM
 
 wait_for_bind() {
   local label="$1" url_path="${2:-/}"
-  for i in $(seq 1 12); do
+  # Rails 8 + AR + hyperion-async-pg cold-boot can run >20s on a loaded
+  # bench host, especially when /healthz is served via the Rails app
+  # (which requires the full middleware stack to be loaded before
+  # responding). Override with WAIT_FOR_BIND_S=N. Default 45s is enough
+  # for the slowest documented case (4w Rails AR-CRUD with cold PG
+  # connection-pool warm-up); 12s was previously enough only when the
+  # host wasn't competing with anything else.
+  local max="${WAIT_FOR_BIND_S:-45}"
+  for i in $(seq 1 "$max"); do
     sleep 1
     if curl -sS -o /dev/null --max-time 1 "http://$HOST:$PORT$url_path" 2>/dev/null; then
       echo "[$label] bound after ${i}s"
