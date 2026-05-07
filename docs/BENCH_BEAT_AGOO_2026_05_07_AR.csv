@@ -1,0 +1,9 @@
+row,label,tool,rackup,rps_med,p99_med,trials,bar
+
+
+19,hyperion_rails_ar_1w,wrk,bench/rails_ar.ru,BOOT-FAIL,BOOT-FAIL,,fail
+20,agoo_rails_ar_1w,wrk,bench/rails_ar.ru,540.77,317.31ms,553.71|555.62|543.70|540.77|549.58|532.57|498.89|507.63|502.90,ref
+
+
+27,hyperion_rails_ar_4w,wrk,bench/rails_ar.ru,2056.08,236.39ms,2056.08|2060.29|2045.03|2051.61|2097.41|2111.02|2069.81|2021.59|2039.28,pass
+28,agoo_rails_ar_4w,wrk,bench/rails_ar.ru,1535.71,203.99ms,1054.07|2149.93|1526.64|1555.92|1559.30|1559.94|1535.71|1454.14|1482.40,ref

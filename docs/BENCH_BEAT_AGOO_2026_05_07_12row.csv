@@ -1,0 +1,13 @@
+row,label,tool,rackup,rps_med,p99_med,trials,bar
+11,hyperion_rails_api_1w,wrk,bench/rails_api.ru,678.63,9.73ms,782.82|597.08|641.48|678.63|677.77|687.38|670.69|707.54|696.47,fail
+12,agoo_rails_api_1w,wrk,bench/rails_api.ru,842.91,143.32ms,747.89|767.34|868.37|780.15|842.91|847.93|823.28|852.12|886.41,ref
+15,hyperion_rails_erb_1w,wrk,bench/rails_erb.ru,476.43,13.19ms,463.25|470.52|476.43|482.77|476.03|497.87|514.35|432.58|481.45,fail
+16,agoo_rails_erb_1w,wrk,bench/rails_erb.ru,513.01,224.93ms,511.66|513.01|512.12|525.79|494.68|508.96|515.06|526.19|521.88,ref
+19,hyperion_rails_ar_1w,wrk,bench/rails_ar.ru,BOOT-FAIL,BOOT-FAIL,no-pg,fail
+20,agoo_rails_ar_1w,wrk,bench/rails_ar.ru,BOOT-FAIL,BOOT-FAIL,no-pg,ref
+23,hyperion_rails_api_4w,wrk,bench/rails_api.ru,2991.81,8.53ms,2993.71|2989.11|2978.52|3002.82|2936.31|2991.81|2990.78|3029.27|3030.16,fail
+24,agoo_rails_api_4w,wrk,bench/rails_api.ru,3466.04,40.37ms,1814.46|3466.04|3485.69|3487.77|3455.15|3527.01|3520.37|3430.14|3461.76,ref
+25,hyperion_rails_erb_4w,wrk,bench/rails_erb.ru,1872.34,13.41ms,1874.49|1840.41|1864.96|1869.89|1870.41|1873.62|1872.34|1878.85|1882.45,fail
+26,agoo_rails_erb_4w,wrk,bench/rails_erb.ru,2076.28,57.87ms,2090.15|2124.91|2063.36|2100.44|2061.73|2042.40|2076.28|2099.73|2074.53,ref
+27,hyperion_rails_ar_4w,wrk,bench/rails_ar.ru,BOOT-FAIL,BOOT-FAIL,no-pg,fail
+28,agoo_rails_ar_4w,wrk,bench/rails_ar.ru,BOOT-FAIL,BOOT-FAIL,no-pg,ref
