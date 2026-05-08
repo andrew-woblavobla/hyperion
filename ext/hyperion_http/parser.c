@@ -153,6 +153,117 @@ typedef struct {
 static VALUE rb_kEMPTY_STR;          /* frozen empty ASCII-8BIT String */
 static VALUE rb_kHTTP_1_1;           /* frozen "HTTP/1.1" String */
 
+/* Phase HotPath-1 (2.17.0) — intern table for the highest-frequency HTTP/1.1
+ * *value* tokens (not header names — those are interned via the
+ * PREINTERNED_HEADERS table above). On a typical wrk-shaped benchmark, the
+ * VALUE side of every header (Host, User-Agent, Accept, Connection,
+ * Accept-Encoding, etc.) is identical across every request on a keep-alive
+ * connection. Without interning, each request rb_str_new's a fresh String
+ * for every value — 6–10 allocations per request, all destined for the
+ * young GC. With interning, stash_pending_header's hash check returns the
+ * pre-frozen VALUE for known values; the freshly-allocated String becomes
+ * unreferenced garbage (collected at next minor GC) and the env Hash holds
+ * a single shared identity across all requests. Net wins: lower GC retention
+ * under burst, faster string compares downstream (identity), reduced
+ * promote-to-old-gen pressure on long-running workers.
+ *
+ * Layout: open-addressed table sized to 64 slots (power of 2; load factor
+ * <0.5 with 33 seeds). Probing capped at 8 to keep cache-friendly.
+ * Lookup is FNV-1a on the byte range; on hit we return the frozen VALUE,
+ * on miss we return Qundef and the caller falls through to the original
+ * (unmodified) String. The table is seeded once at extension init from a
+ * static literal list — no growth, no eviction, no thread synchronisation.
+ */
+#define HYP_VALUE_INTERN_TABLE_SIZE 64u  /* power of 2 */
+#define HYP_VALUE_INTERN_PROBE_MAX  8
+#define HYP_VALUE_INTERN_MAX_LEN    96u  /* skip lookup for values > this */
+
+typedef struct {
+    uint64_t fnv1a;
+    uint32_t len;
+    VALUE    str;
+} hyp_value_intern_entry_t;
+
+static hyp_value_intern_entry_t hyp_value_intern_tbl[HYP_VALUE_INTERN_TABLE_SIZE];
+
+static const char *const hyp_value_intern_seed[] = {
+    /* Connection */
+    "keep-alive", "close", "Keep-Alive", "Upgrade", "upgrade",
+    /* Accept-Encoding */
+    "gzip, deflate", "gzip, deflate, br", "gzip, deflate, br, zstd",
+    "identity", "gzip", "deflate", "br", "*",
+    /* Accept */
+    "*/*", "text/html", "application/json", "text/plain",
+    "application/x-www-form-urlencoded", "text/event-stream",
+    /* Accept-Language */
+    "en-US,en;q=0.9", "en-US", "en",
+    /* User-Agent — synthetic / bench clients */
+    "Mozilla/5.0 (compatible; wrk/4.2.0)",
+    "wrk/4.2.0",
+    "curl/8.4.0", "curl/8.5.0", "curl/8.6.0",
+    /* Host — local bench */
+    "localhost", "127.0.0.1", "0.0.0.0",
+    /* Cache-Control */
+    "no-cache", "no-store", "max-age=0",
+    /* Misc */
+    "trailers", "websocket", "h2c",
+};
+#define HYP_VALUE_INTERN_SEED_N \
+    (sizeof(hyp_value_intern_seed) / sizeof(hyp_value_intern_seed[0]))
+
+static inline uint64_t hyp_fnv1a(const char *bytes, uint32_t len) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (uint32_t i = 0; i < len; i++) {
+        h ^= (uint8_t)bytes[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static inline VALUE hyp_intern_lookup(const char *bytes, uint32_t len) {
+    if (len == 0 || len > HYP_VALUE_INTERN_MAX_LEN) return Qundef;
+    uint64_t h = hyp_fnv1a(bytes, len);
+    uint32_t mask = HYP_VALUE_INTERN_TABLE_SIZE - 1u;
+    uint32_t idx  = (uint32_t)h & mask;
+    for (int probe = 0; probe < HYP_VALUE_INTERN_PROBE_MAX; probe++) {
+        hyp_value_intern_entry_t *e =
+            &hyp_value_intern_tbl[(idx + (uint32_t)probe) & mask];
+        if (e->str == 0) return Qundef;
+        if (e->fnv1a == h && e->len == len &&
+            memcmp(RSTRING_PTR(e->str), bytes, len) == 0) {
+            return e->str;
+        }
+    }
+    return Qundef;
+}
+
+static void hyp_value_intern_seed_all(void) {
+    memset(hyp_value_intern_tbl, 0, sizeof(hyp_value_intern_tbl));
+    uint32_t mask = HYP_VALUE_INTERN_TABLE_SIZE - 1u;
+    for (size_t i = 0; i < HYP_VALUE_INTERN_SEED_N; i++) {
+        const char *s = hyp_value_intern_seed[i];
+        uint32_t len  = (uint32_t)strlen(s);
+        if (len == 0 || len > HYP_VALUE_INTERN_MAX_LEN) continue;
+        uint64_t h    = hyp_fnv1a(s, len);
+        uint32_t idx  = (uint32_t)h & mask;
+        for (int probe = 0; probe < HYP_VALUE_INTERN_PROBE_MAX; probe++) {
+            hyp_value_intern_entry_t *e =
+                &hyp_value_intern_tbl[(idx + (uint32_t)probe) & mask];
+            if (e->str == 0) {
+                /* Match the encoding of values produced by rb_str_new
+                 * (ASCII-8BIT) so identity comparisons downstream don't
+                 * fail on encoding mismatch. */
+                VALUE v = rb_obj_freeze(rb_str_new(s, (long)len));
+                rb_global_variable(&e->str);  /* GC root */
+                e->str   = v;
+                e->fnv1a = h;
+                e->len   = len;
+                break;
+            }
+        }
+    }
+}
+
 static void state_init(parser_state_t *s) {
     s->method                    = Qnil;
     s->path                      = Qnil;  /* allocated in on_url first call */
@@ -216,6 +327,15 @@ static void stash_pending_header(parser_state_t *s) {
             key = rb_funcall(s->current_header_name, id_downcase, 0);
         }
         VALUE val = NIL_P(s->current_header_value) ? rb_kEMPTY_STR : s->current_header_value;
+        /* Phase HotPath-1 (2.17.0): intern common header values so identical
+         * values across keep-alive requests share one frozen VALUE. The
+         * freshly-allocated `s->current_header_value` becomes garbage on
+         * intern hit. */
+        if (val != rb_kEMPTY_STR) {
+            long val_len = RSTRING_LEN(val);
+            VALUE interned = hyp_intern_lookup(RSTRING_PTR(val), (uint32_t)val_len);
+            if (interned != Qundef) val = interned;
+        }
         rb_hash_aset(s->headers, key, val);
         s->current_header_name  = Qnil;
         s->current_header_value = Qnil;
@@ -1669,6 +1789,13 @@ void Init_hyperion_http(void) {
     }
     rb_obj_freeze(rb_aHeaderTable);
     rb_define_const(rb_cCParser, "PREINTERNED_HEADERS", rb_aHeaderTable);
+
+    /* Phase HotPath-1 (2.17.0): seed the header-value intern table. See
+     * the long comment at the table declaration. Must run after the
+     * encoding registry is up (Init_hyperion_parser is called by
+     * Init_hyperion_http after rb_define_module) so rb_str_new finds
+     * ASCII-8BIT. */
+    hyp_value_intern_seed_all();
 
     /* 2.13-B — status-line, header-key, header-line caches used by
      * cbuild_response_head. The status-line table is fixed-size (no GC
