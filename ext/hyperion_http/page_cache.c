@@ -160,6 +160,15 @@ typedef struct hyp_page_s {
                              * (no on-disk file backing — never re-stat,
                              * never invalidate on missing file). */
     char    *content_type;  /* heap-owned, picked at insert time */
+    /* 2.17-A (Hot Path Task 2) — byte offset within `response_buf`
+     * of the first byte of a 29-byte HTTP `Date:` placeholder ('X' run).
+     * Zero means "no placeholder; do not splice". When non-zero, every
+     * snapshot site overwrites the 29 bytes at this offset in the
+     * stack/heap snapshot copy with the per-second-cached imf-fixdate
+     * string before the kernel write fires. The `response_buf` itself
+     * is never mutated (it is shared across concurrent reads under the
+     * page-cache rwlock). */
+    size_t   date_offset;
 } hyp_page_t;
 
 typedef struct hyp_page_slot_s {
@@ -252,6 +261,117 @@ static double hyp_pc_now(void) {
         return 0.0;
     }
     return (double)tv.tv_sec + (double)tv.tv_usec / 1.0e6;
+}
+
+/* ============================================================
+ * 2.17-A (Hot Path Task 2) — per-second-cached HTTP `Date:` header.
+ *
+ * The wire format is RFC 7231 imf-fixdate:
+ *   "Sun, 06 Nov 1994 08:49:37 GMT"
+ * Always exactly 29 bytes, ASCII, no trailing NUL written into the
+ * splice slot — the slot lives in the middle of a frozen response
+ * buffer and the surrounding bytes (CRLF + remaining headers + body)
+ * are already correct.
+ *
+ * Refresh strategy: lazy, tied to wall-clock seconds.  Every call to
+ * `hyp_pc_cached_date` checks whether the cached `time_t` matches
+ * `time(NULL)`; on miss, the cache is rebuilt from `gmtime_r` under a
+ * dedicated mutex (NOT `hyp_pc_lock` — splice happens AFTER the page
+ * lock has been released, so we mustn't reacquire the page lock for
+ * the date refresh).  Concurrent rebuilds race to write the same 29
+ * bytes; the result is bit-identical so the race is benign — readers
+ * either see the previous second's value (already-stale-by-one-second
+ * is RFC-acceptable) or the new one.
+ *
+ * The cached buffer is sized 32 to leave room for an aligned read on
+ * older toolchains that might over-read past `[28]`; we hand out only
+ * the first 29 bytes via `hyp_pc_cached_date_copy`. */
+#define HYP_PC_DATE_LEN 29
+
+static char            hyp_pc_cached_date[32];
+static time_t          hyp_pc_cached_date_sec = 0;
+static pthread_mutex_t hyp_pc_date_lock       = PTHREAD_MUTEX_INITIALIZER;
+
+/* Day-of-week and month tables match RFC 7231 §7.1.1.1 imf-fixdate. */
+static const char *const hyp_pc_dow[7] = {
+    "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
+};
+static const char *const hyp_pc_mon[12] = {
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+};
+
+/* Format `t` as RFC 7231 imf-fixdate into `dst` (29 bytes, no NUL).
+ * Hand-rolled to avoid `strftime`'s locale-dependent output (locale-
+ * aware libcs would spell the month / day in non-ASCII for some
+ * locales — RFC 7231 mandates English).  Branch-free except for the
+ * gmtime_r itself. */
+static void hyp_pc_format_imf_fixdate(time_t t, char *dst) {
+    struct tm tm;
+    if (gmtime_r(&t, &tm) == NULL) {
+        /* Fall back to a known-good zero date; should never happen
+         * for a sane wall clock. */
+        memcpy(dst, "Thu, 01 Jan 1970 00:00:00 GMT", HYP_PC_DATE_LEN);
+        return;
+    }
+    int year = tm.tm_year + 1900;
+    int dow  = tm.tm_wday  & 7;       /* defensive: mask to [0,7) */
+    int mon  = tm.tm_mon   % 12;      /* defensive */
+    if (dow >= 7) dow = 0;
+    if (mon < 0) mon = 0;
+
+    /* "Sun, 06 Nov 1994 08:49:37 GMT" */
+    memcpy(dst,      hyp_pc_dow[dow], 3);
+    dst[3]  = ',';
+    dst[4]  = ' ';
+    dst[5]  = (char)('0' + (tm.tm_mday / 10));
+    dst[6]  = (char)('0' + (tm.tm_mday % 10));
+    dst[7]  = ' ';
+    memcpy(dst + 8,  hyp_pc_mon[mon], 3);
+    dst[11] = ' ';
+    dst[12] = (char)('0' + ((year / 1000) % 10));
+    dst[13] = (char)('0' + ((year / 100)  % 10));
+    dst[14] = (char)('0' + ((year / 10)   % 10));
+    dst[15] = (char)('0' + (year          % 10));
+    dst[16] = ' ';
+    dst[17] = (char)('0' + (tm.tm_hour / 10));
+    dst[18] = (char)('0' + (tm.tm_hour % 10));
+    dst[19] = ':';
+    dst[20] = (char)('0' + (tm.tm_min  / 10));
+    dst[21] = (char)('0' + (tm.tm_min  % 10));
+    dst[22] = ':';
+    dst[23] = (char)('0' + (tm.tm_sec  / 10));
+    dst[24] = (char)('0' + (tm.tm_sec  % 10));
+    dst[25] = ' ';
+    dst[26] = 'G';
+    dst[27] = 'M';
+    dst[28] = 'T';
+}
+
+/* Copy the per-second-cached imf-fixdate into `dst` (29 bytes).
+ * Refreshes the cache iff the wall-clock second has advanced since the
+ * last refresh.  Safe to call without `hyp_pc_lock`. */
+static void hyp_pc_cached_date_copy(char *dst) {
+    time_t now = time(NULL);
+    pthread_mutex_lock(&hyp_pc_date_lock);
+    if (now != hyp_pc_cached_date_sec) {
+        hyp_pc_format_imf_fixdate(now, hyp_pc_cached_date);
+        hyp_pc_cached_date_sec = now;
+    }
+    memcpy(dst, hyp_pc_cached_date, HYP_PC_DATE_LEN);
+    pthread_mutex_unlock(&hyp_pc_date_lock);
+}
+
+/* Splice the per-second-cached imf-fixdate into `snapshot` at
+ * `date_offset`.  No-op when `date_offset == 0` (entry has no
+ * placeholder — pre-2.17 register_prebuilt callers).  Bounds-checks
+ * against `snap_len` so a corrupted header layout never overruns the
+ * snapshot buffer. */
+static inline void hyp_pc_splice_date(char *snapshot, size_t snap_len,
+                                      size_t date_offset) {
+    if (date_offset == 0) return;
+    if (date_offset + HYP_PC_DATE_LEN > snap_len) return;
+    hyp_pc_cached_date_copy(snapshot + date_offset);
 }
 
 /* FNV-1a 64-bit. Stable, cheap, branchless on the hot path; not a
@@ -694,6 +814,7 @@ static VALUE rb_pc_write_to(VALUE self, VALUE socket_io, VALUE rb_path) {
         return sym_missing_pc;
     }
     size_t resp_len = slot->page->response_len;
+    size_t date_off = slot->page->date_offset;
     char  *snapshot = (char *)malloc(resp_len);
     if (snapshot == NULL) {
         pthread_mutex_unlock(&hyp_pc_lock);
@@ -702,6 +823,11 @@ static VALUE rb_pc_write_to(VALUE self, VALUE socket_io, VALUE rb_path) {
     }
     memcpy(snapshot, slot->page->response_buf, resp_len);
     pthread_mutex_unlock(&hyp_pc_lock);
+    /* 2.17-A — overwrite the 29-byte Date placeholder in the snapshot
+     * (NEVER the page's frozen response_buf) with the per-second-cached
+     * imf-fixdate string. No-op when the entry was registered without
+     * a placeholder (date_off == 0). */
+    hyp_pc_splice_date(snapshot, resp_len, date_off);
 
     hyp_pc_write_args_t args;
     args.fd    = fd;
@@ -721,7 +847,7 @@ static VALUE rb_pc_write_to(VALUE self, VALUE socket_io, VALUE rb_path) {
     return SSIZET2NUM(args.total);
 }
 
-/* PageCache.register_prebuilt(path, response_bytes, body_len) -> Integer
+/* PageCache.register_prebuilt(path, response_bytes, body_len, date_offset = 0) -> Integer
  *
  * 2.10-F — register a fully prebuilt HTTP response under a route path
  * (e.g. `/health`).  Unlike `cache_file`, the entry has NO on-disk
@@ -730,16 +856,37 @@ static VALUE rb_pc_write_to(VALUE self, VALUE socket_io, VALUE rb_path) {
  * starts inside `response_bytes` so HEAD requests can write the
  * headers-only prefix.
  *
- * `response_bytes.bytesize` MUST be >= `body_len`.  Returns the
- * stored response byte count on success.
+ * 2.17-A (Hot Path Task 2) — `date_offset` is an OPTIONAL fourth
+ * argument: when non-zero, it is the byte offset within
+ * `response_bytes` of a 29-byte `XXX...` placeholder reserved for
+ * the HTTP `Date:` header.  The C splice helper overwrites those 29
+ * bytes in a per-write SCRATCH copy with the per-second-cached
+ * imf-fixdate string before each kernel write — the registered
+ * `response_bytes` is never mutated.  Pre-2.17 callers that pass
+ * three arguments (or pass 0 for the fourth) get the un-spliced
+ * behaviour they had before.
+ *
+ * `response_bytes.bytesize` MUST be >= `body_len`.  When
+ * `date_offset != 0` it must satisfy
+ * `date_offset + 29 <= response_bytes.bytesize` so the splice never
+ * runs off the end of the buffer.  Returns the stored response
+ * byte count on success.
  *
  * Used by `Hyperion::Server.handle_static` to fold the prebuilt
  * static-route response into the C fast path so the request hot
  * path is one hash lookup + one `write()` syscall, fully outside
  * Ruby method dispatch. */
-static VALUE rb_pc_register_prebuilt(VALUE self, VALUE rb_path,
-                                     VALUE rb_response, VALUE rb_body_len) {
+static VALUE rb_pc_register_prebuilt(int argc, VALUE *argv, VALUE self) {
     (void)self;
+    if (argc < 3 || argc > 4) {
+        rb_raise(rb_eArgError,
+                 "wrong number of arguments (given %d, expected 3..4)", argc);
+    }
+    VALUE rb_path     = argv[0];
+    VALUE rb_response = argv[1];
+    VALUE rb_body_len = argv[2];
+    VALUE rb_date_off = (argc == 4) ? argv[3] : INT2FIX(0);
+
     Check_Type(rb_path, T_STRING);
     Check_Type(rb_response, T_STRING);
 
@@ -760,6 +907,16 @@ static VALUE rb_pc_register_prebuilt(VALUE self, VALUE rb_path,
         rb_raise(rb_eArgError,
                  "body_len (%zu) must be <= response_bytes.bytesize (%zu)",
                  body_len, resp_len);
+    }
+    long date_off_signed = NUM2LONG(rb_date_off);
+    if (date_off_signed < 0) {
+        rb_raise(rb_eArgError, "date_offset must be >= 0");
+    }
+    size_t date_off = (size_t)date_off_signed;
+    if (date_off != 0 && date_off + HYP_PC_DATE_LEN > resp_len) {
+        rb_raise(rb_eArgError,
+                 "date_offset (%zu) + 29 must be <= response_bytes.bytesize (%zu)",
+                 date_off, resp_len);
     }
 
     hyp_page_t *page = (hyp_page_t *)calloc(1, sizeof(*page));
@@ -802,6 +959,7 @@ static VALUE rb_pc_register_prebuilt(VALUE self, VALUE rb_path,
     page->last_check   = hyp_pc_now();
     page->immutable    = 1;
     page->prebuilt     = 1;
+    page->date_offset  = date_off;
 
     uint64_t h = hyp_pc_hash(path, path_len);
     pthread_mutex_lock(&hyp_pc_lock);
@@ -887,6 +1045,7 @@ static VALUE rb_pc_serve_request(VALUE self, VALUE socket_io,
     size_t write_len = (kind == HYP_PC_METHOD_HEAD)
                            ? slot->page->headers_len
                            : slot->page->response_len;
+    size_t date_off  = slot->page->date_offset;
     char  *snapshot  = (char *)malloc(write_len);
     if (snapshot == NULL) {
         pthread_mutex_unlock(&hyp_pc_lock);
@@ -895,6 +1054,11 @@ static VALUE rb_pc_serve_request(VALUE self, VALUE socket_io,
     }
     memcpy(snapshot, slot->page->response_buf, write_len);
     pthread_mutex_unlock(&hyp_pc_lock);
+    /* 2.17-A — splice the per-second-cached imf-fixdate into the
+     * snapshot's Date placeholder (when the entry has one).  HEAD
+     * write_len equals headers_len, so a Date placeholder placed
+     * inside the headers span is still in range. */
+    hyp_pc_splice_date(snapshot, write_len, date_off);
 
     hyp_pc_write_args_t args;
     args.fd    = fd;
@@ -1920,6 +2084,7 @@ static long hyp_cl_serve_connection(int client_fd, int *handed_off) {
             size_t write_len = (kind == HYP_PC_METHOD_HEAD)
                                    ? slot->page->headers_len
                                    : slot->page->response_len;
+            size_t date_off  = slot->page->date_offset;
             char *snapshot = (char *)malloc(write_len);
             if (snapshot == NULL) {
                 pthread_mutex_unlock(&hyp_pc_lock);
@@ -1930,6 +2095,10 @@ static long hyp_cl_serve_connection(int client_fd, int *handed_off) {
             }
             memcpy(snapshot, slot->page->response_buf, write_len);
             pthread_mutex_unlock(&hyp_pc_lock);
+            /* 2.17-A — splice the per-second-cached imf-fixdate into
+             * the snapshot's Date placeholder before the kernel write.
+             * No-op for entries registered without a placeholder. */
+            hyp_pc_splice_date(snapshot, write_len, date_off);
 
             hyp_pc_write_args_t wargs;
             wargs.fd    = client_fd;
@@ -2484,6 +2653,7 @@ char *pc_internal_snapshot_response(const char *path, size_t path_len,
     size_t write_len = (kind == PC_INTERNAL_METHOD_HEAD)
                            ? slot->page->headers_len
                            : slot->page->response_len;
+    size_t date_off  = slot->page->date_offset;
     char *snapshot = (char *)malloc(write_len);
     if (snapshot == NULL) {
         pthread_mutex_unlock(&hyp_pc_lock);
@@ -2491,6 +2661,11 @@ char *pc_internal_snapshot_response(const char *path, size_t path_len,
     }
     memcpy(snapshot, slot->page->response_buf, write_len);
     pthread_mutex_unlock(&hyp_pc_lock);
+    /* 2.17-A — splice the per-second-cached imf-fixdate into the
+     * Date placeholder before handing the snapshot to io_uring (the
+     * kernel reads the bytes asynchronously, so the splice MUST land
+     * before the SQE is submitted). */
+    hyp_pc_splice_date(snapshot, write_len, date_off);
     *out_len = write_len;
     return snapshot;
 }
@@ -2576,8 +2751,10 @@ void Init_hyperion_page_cache(void) {
                                rb_pc_auto_threshold, 0);
     rb_define_singleton_method(rb_mHyperionHttpPageCache, "max_key_len",
                                rb_pc_max_key_len, 0);
+    /* 2.17-A — variable arity: 3-arg legacy form, 4-arg form adds
+     * `date_offset` for the imf-fixdate splice slot. */
     rb_define_singleton_method(rb_mHyperionHttpPageCache, "register_prebuilt",
-                               rb_pc_register_prebuilt, 3);
+                               rb_pc_register_prebuilt, -1);
     rb_define_singleton_method(rb_mHyperionHttpPageCache, "serve_request",
                                rb_pc_serve_request, 3);
     /* 2.12-C — connection lifecycle in C. */

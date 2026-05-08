@@ -670,20 +670,46 @@ module Hyperion
 
     # 2.10-F — call into the C ext when available, else fall back to
     # the 2.10-D Ruby `socket.write` path.  Returns bytes written.
+    #
+    # 2.17-A — when the C ext is unavailable (JRuby / TruffleRuby /
+    # build failure) AND the entry carries the new keep-alive prebuilt
+    # bytes, splice the per-second-cached httpdate into a per-write
+    # scratch String and write THAT — so the wire output shape is
+    # identical to the C-loop path even on the slow Ruby fallback.
+    # The frozen `prebuilt_keepalive_bytes` itself is never mutated;
+    # `String#dup` copies it onto the heap so `[]=` is safe.
     def serve_static_entry(socket, request, entry)
       if defined?(::Hyperion::Http::PageCache) &&
          ::Hyperion::Http::PageCache.respond_to?(:serve_request)
         result = ::Hyperion::Http::PageCache.serve_request(socket, request.method, entry.path)
         return result.last if result.is_a?(Array) && result.first == :ok
       end
-      # Fallback: Ruby write of the full buffer (or headers-only on HEAD).
-      bytes = if request.method == 'HEAD' && entry.headers_bytesize < entry.buffer.bytesize
-                entry.buffer.byteslice(0, entry.headers_bytesize)
-              else
-                entry.buffer
-              end
-      socket.write(bytes)
+      socket.write(static_entry_fallback_bytes(request, entry))
     end
+
+    # 2.17-A — build the wire bytes for the Ruby fallback path. When
+    # the entry carries `prebuilt_keepalive_bytes` + `prebuilt_date_offset`
+    # (registered post-2.17), use those bytes with the date spliced in.
+    # Otherwise fall through to the legacy `entry.buffer` (lowercase
+    # headers, no Date) — this path keeps pre-2.17 callers that
+    # constructed StaticEntry directly working unchanged.
+    def static_entry_fallback_bytes(request, entry)
+      if entry.prebuilt_keepalive_bytes && entry.prebuilt_date_offset.to_i.positive?
+        bytes = entry.prebuilt_keepalive_bytes.dup
+        bytes[entry.prebuilt_date_offset, 29] = Time.now.httpdate
+        return bytes if request.method != 'HEAD'
+
+        head_end = bytes.index("\r\n\r\n")
+        return head_end ? bytes.byteslice(0, head_end + 4) : bytes
+      end
+
+      if request.method == 'HEAD' && entry.headers_bytesize < entry.buffer.bytesize
+        entry.buffer.byteslice(0, entry.headers_bytesize)
+      else
+        entry.buffer
+      end
+    end
+    private :static_entry_fallback_bytes
 
     # 2.10-D — write a direct-route response.  Returns the status
     # code that was written (so `dispatch_direct!` can bump the

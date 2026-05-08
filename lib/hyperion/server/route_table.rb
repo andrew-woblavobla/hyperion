@@ -59,7 +59,28 @@ module Hyperion
       # on HEAD too, which is RFC-correct (HEAD MAY include the body
       # so long as Content-Length matches; the spec only forbids the
       # SERVER from sending body bytes the client didn't ask for).
-      StaticEntry = Struct.new(:method, :path, :buffer, :headers_len) do
+      #
+      # 2.17-A (Hot Path Task 2) adds two more fields so the C-loop
+      # writer can mem-splice a per-second-cached HTTP `Date:` header
+      # into a pre-built keep-alive response without rebuilding it
+      # from scratch:
+      #   * `prebuilt_keepalive_bytes` — frozen ASCII-8BIT String of
+      #     the full HTTP/1.1 wire response (status line + Server +
+      #     Content-Type + Content-Length + Connection: keep-alive +
+      #     Date placeholder + body) with a 29-byte 'X' run reserved
+      #     at `prebuilt_date_offset`.  The placeholder is overwritten
+      #     in a per-write scratch buffer (NEVER in this frozen
+      #     String) by the C splice helper before the syscall fires.
+      #   * `prebuilt_date_offset` — Integer byte offset of the first
+      #     placeholder byte within `prebuilt_keepalive_bytes`.  Zero
+      #     means "no Date placeholder; do not splice".  29 bytes is
+      #     the canonical RFC 7231 imf-fixdate length.
+      # Existing callers that construct StaticEntry with 3 or 4 args
+      # see nil for these new fields and the C side falls through to
+      # the un-spliced fast path it has used since 2.10-F.
+      StaticEntry = Struct.new(:method, :path, :buffer, :headers_len,
+                                :prebuilt_keepalive_bytes,
+                                :prebuilt_date_offset) do
         # Returns the pre-built response bytes ready for one
         # `socket.write` call.  Always frozen.
         def response_bytes

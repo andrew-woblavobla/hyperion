@@ -220,9 +220,13 @@ RSpec.describe 'Hyperion::Server.handle (direct route registration)' do
       Thread.new { server.run_one }
       response = request(port, 'GET', '/hello')
 
+      # 2.17-A — the C-loop writer serves the keep-alive prebuilt bytes
+      # (capital-cased headers + Server + Connection + Date placeholder
+      # spliced with the per-second-cached imf-fixdate).
       expect(response).to include('HTTP/1.1 200 OK')
-      expect(response).to include('content-type: text/plain')
-      expect(response).to include('content-length: 12')
+      expect(response).to include('Content-Type: text/plain')
+      expect(response).to include('Content-Length: 12')
+      expect(response).to match(/Date: \w{3}, \d{2} \w{3} \d{4} \d{2}:\d{2}:\d{2} GMT\r\n/)
       expect(response).to end_with("hello world\n")
     ensure
       server&.stop
@@ -279,9 +283,10 @@ RSpec.describe 'Hyperion::Server.handle (direct route registration)' do
 
       # Headers must come through; the body bytes MUST NOT be on the
       # wire (HEAD strips the body).
+      # 2.17-A — capital-cased headers from the keep-alive prebuilt bytes.
       expect(response).to include('HTTP/1.1 200 OK')
-      expect(response).to include('content-type: text/plain')
-      expect(response).to include("content-length: #{body.bytesize}")
+      expect(response).to include('Content-Type: text/plain')
+      expect(response).to include("Content-Length: #{body.bytesize}")
       expect(response).not_to include('this is the body')
     ensure
       server&.stop

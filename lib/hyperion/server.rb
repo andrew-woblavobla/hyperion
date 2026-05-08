@@ -136,10 +136,23 @@ module Hyperion
       head.force_encoding(Encoding::ASCII_8BIT)
       buffer = (head + body).freeze
 
+      # 2.17-A (Hot Path Task 2) — pre-build the keep-alive wire bytes
+      # with a 29-byte Date placeholder so the C-loop writer can splice
+      # the per-second-cached httpdate string in without rebuilding the
+      # head from scratch every request.  Returned as `[bytes, offset]`
+      # — `offset` is the byte index of the first placeholder byte.
+      prebuilt_ka_bytes, date_offset =
+        build_static_wire_bytes(body, content_type: content_type, server_string: 'Hyperion')
+
       method_key = method_sym.to_s.upcase.to_sym
       # 2.10-F — record the headers prefix length on the StaticEntry
       # struct so HEAD-method writes can serve a headers-only prefix.
-      entry = RouteTable::StaticEntry.new(method_key, path.dup.freeze, buffer, head.bytesize).freeze
+      # 2.17-A — also stash the keep-alive prebuilt bytes + Date offset
+      # so the C splice helper (or the Ruby fallback in
+      # Connection#serve_static_entry) can stamp the cached date in
+      # before each write.
+      entry = RouteTable::StaticEntry.new(method_key, path.dup.freeze, buffer, head.bytesize,
+                                           prebuilt_ka_bytes, date_offset).freeze
       # 2.10-F — register the entry DIRECTLY (StaticEntry responds to
       # `#call`) instead of wrapping it in a closure, so the dispatch
       # path can branch on `is_a?(StaticEntry)` BEFORE invoking the
@@ -152,16 +165,57 @@ module Hyperion
       # MUST also answer HEAD with the same headers).  No-op on a
       # POST/PUT/etc. registration — those don't get a HEAD twin.
       route_table.register(:HEAD, path, entry) if method_key == :GET
-      # 2.10-F — fold the prebuilt response into the C-side PageCache so
-      # `PageCache.serve_request` can write it without ever crossing
-      # back into Ruby.  Best-effort: if the C ext isn't available
-      # (JRuby / TruffleRuby), the dispatcher silently falls back to
-      # the Ruby `socket.write` path that's been there since 2.10-D.
+      # 2.17-A — fold the keep-alive prebuilt bytes (with Date placeholder)
+      # into the C-side PageCache so `PageCache.serve_request` and the
+      # C accept loop both serve the new shape.  The 4-arg
+      # `register_prebuilt` form (introduced in 2.17-A) records the
+      # Date offset on the C-side `hyp_page_t` so every snapshot
+      # site splices the cached date before writing.  Best-effort:
+      # the C ext may be absent on JRuby / TruffleRuby — the
+      # dispatcher silently falls back to the Ruby `socket.write`
+      # path that's been there since 2.10-D.
       if defined?(::Hyperion::Http::PageCache) && ::Hyperion::Http::PageCache.respond_to?(:register_prebuilt)
-        ::Hyperion::Http::PageCache.register_prebuilt(path, buffer, body.bytesize)
+        ::Hyperion::Http::PageCache.register_prebuilt(path, prebuilt_ka_bytes, body.bytesize, date_offset)
       end
       entry
     end
+
+    # 2.17-A (Hot Path Task 2) — assemble the prebuilt keep-alive
+    # wire bytes for a static route registered via `handle_static`.
+    # Returns `[frozen_bytes, date_offset]`:
+    #   * `frozen_bytes` — ASCII-8BIT, frozen String of the full
+    #     HTTP/1.1 response (status line + Server + Content-Type +
+    #     Content-Length + Connection: keep-alive + Date placeholder
+    #     + CRLFCRLF + body).  The Date placeholder is a 29-byte 'X'
+    #     run that the C splice helper overwrites in a per-write
+    #     scratch buffer (the frozen String itself is NEVER mutated).
+    #   * `date_offset` — Integer index of the first placeholder
+    #     byte within `frozen_bytes`.  29 bytes is the canonical RFC
+    #     7231 imf-fixdate length (`Sun, 06 Nov 1994 08:49:37 GMT`).
+    #
+    # Header order is fixed on purpose — the C splice helper relies
+    # on the offset being stable across requests; placing Date last
+    # keeps the offset arithmetic trivial regardless of body length
+    # variations between routes.  Headers are capitalized in the
+    # canonical RFC 7230 §3.2 form (case-insensitive but
+    # conventionally capitalized) so the wire output matches what
+    # CDN / proxy logs expect.
+    def self.build_static_wire_bytes(body, content_type:, server_string:)
+      placeholder = 'X' * 29
+      head_prefix = +"HTTP/1.1 200 OK\r\n" \
+                     "Server: #{server_string}\r\n" \
+                     "Content-Type: #{content_type}\r\n" \
+                     "Content-Length: #{body.bytesize}\r\n" \
+                     "Connection: keep-alive\r\n" \
+                     "Date: "
+      head_prefix.force_encoding(Encoding::ASCII_8BIT)
+      date_offset = head_prefix.bytesize
+      head = head_prefix + placeholder + "\r\n\r\n"
+      head.force_encoding(Encoding::ASCII_8BIT)
+      bytes = (head + body).b.freeze
+      [bytes, date_offset]
+    end
+    private_class_method :build_static_wire_bytes
 
     # 1.7.0 added kwargs (all default to current behaviour):
     #   * `runtime:`             — `Hyperion::Runtime` instance (default
