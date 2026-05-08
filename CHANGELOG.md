@@ -1,5 +1,85 @@
 # Changelog
 
+## 2.17.0 — 2026-05-08
+
+### Hot-path bucket: parser value intern + RFC-compliant handle_static prebuilt
+
+Two hot-path optimisations land together. Both are correctness-positive
+(no behavioural change for compliant clients; the second one moves
+`handle_static` from non-RFC-compliant headers to RFC-compliant ones).
+
+#### Parser header-value intern table
+
+`Hyperion::CParser` (`ext/hyperion_http/parser.c`) gains a 64-slot,
+33-seed open-addressed FNV-1a intern table for the highest-frequency
+HTTP/1.1 header *values* (Connection: keep-alive, Accept-Encoding combos,
+common User-Agent strings, localhost / 127.0.0.1, etc.). On every
+`stash_pending_header` call, the materialised value String is hashed and
+probed against the table; on hit, the freshly-allocated `rb_str_new`
+String becomes garbage and the env Hash holds the pre-frozen interned
+VALUE. Net effect: lower GC retention under burst, faster downstream
+identity-based string compares, reduced promote-to-old-gen pressure on
+long-running workers.
+
+- `bench/hello_handle_block.ru` (Row 3): **8727 → 9008 rps median** in
+  isolation (+3.2%), within noise but trending positive.
+- Static path (Row 1) is parser-bypass — intern doesn't apply.
+
+#### `Server.handle_static` — prebuilt wire bytes with Date splice
+
+`handle_static` previously emitted lowercase headers and **no Date
+header**, in violation of RFC 7231 §7.1.1.2 ("An origin server with a
+clock MUST generate a Date header field in all 2xx, 3xx, and 4xx
+responses"). 2.17.0 fixes that:
+
+- The full HTTP/1.1 wire response is built ONCE at registration
+  (status line + `Server: Hyperion` + `Content-Type` + `Content-Length`
+  + `Connection: keep-alive` + 29-byte `Date:` placeholder + body),
+  frozen, and stored on the `StaticEntry` struct alongside the legacy
+  `buffer` field (preserved for back-compat).
+- A new per-second-cached imf-fixdate cache lives in
+  `ext/hyperion_http/page_cache.c` (hand-rolled formatter — `strftime`
+  is locale-dependent and RFC 7231 mandates ASCII English month/day
+  names). Every snapshot site memcpy's the frozen response into a
+  per-write scratch buffer and splices the 29-byte cached date into
+  the placeholder slot AFTER releasing the page lock. The frozen
+  Ruby String is never mutated.
+- `PageCache.register_prebuilt` grows from arity 3 to arity -1 (3 or 4
+  args; the optional 4th is `date_offset`). Pre-2.17 callers (3 args
+  or 4-with-zero) fall through to the unchanged un-spliced fast path.
+- `Connection#serve_static_entry`'s Ruby fallback (used when the C ext
+  is absent — JRuby / TruffleRuby / build failure) mirrors the C path:
+  `prebuilt_keepalive_bytes.dup` + `[]= Time.now.httpdate`.
+
+Bench (3-trial median on `openclaw-vm`, Linux 6.8 / Ruby 3.3.3):
+
+| Row | Workload                                | 2.16.4 | 2.17.0 | Δ |
+|----:|-----------------------------------------|-------:|-------:|--:|
+| 1   | `handle_static` + io_uring (peak)       | 133211 | 127377 | -4.4% (Δ ≈ 80 extra RFC-mandated bytes per response; trial spread 122k–146k = ~19%) |
+| 3   | `Server.handle` block (dynamic)         |   8727 |   9458 | **+8.4%** |
+
+The Row 1 delta is the cost of writing the new mandatory Date / Server /
+Connection bytes. Trade is throughput-for-compliance — Hyperion's pre-2.17
+`handle_static` wasn't a valid HTTP/1.1 origin server.
+
+Captured artefacts:
+- `docs/BENCH_HOTPATH_2026_05_08_before.csv`
+- `docs/BENCH_HOTPATH_2026_05_08_after.csv`
+
+#### Tests
+
+- New: `spec/hyperion/parser_value_intern_spec.rb` (4 examples — intern
+  hits, miss fallback, encoding preservation, wrk User-Agent identity).
+- New: `spec/hyperion/handle_static_prebuilt_spec.rb` (7 examples —
+  wire shape, Date offset, custom content-type, back-compat with
+  legacy `buffer`, end-to-end real-socket request).
+- Modified: `spec/hyperion/direct_route_spec.rb` (two wire-output
+  assertions updated for the new capital-cased headers + Date).
+
+`bin/check` clean (mode=quick, 81 examples, 0 failures); full suite
+1266 examples, 0 failures, 16 pre-existing Linux-only / liburing
+pending on macOS.
+
 ## 2.16.4 — 2026-05-07
 
 ### io_uring hotpath accept fiber: row-19 BOOT-FAIL fix

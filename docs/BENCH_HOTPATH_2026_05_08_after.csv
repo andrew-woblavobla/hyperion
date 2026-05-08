@@ -1,0 +1,3 @@
+row,label,tool,rackup,rps_med,p99_med,trials,note
+1,hyperion_handle_static_iouring,wrk,bench/hello_static.ru,127377.27,1.04ms,146371.55|127377.27|122855.65,2.17.0 with parser intern + handle_static prebuilt (Date / Server / Connection RFC 7231 compliance)
+3,hyperion_handle_block,wrk,bench/hello_handle_block.ru,9458.88,177.00us,9176.10|9710.52|9458.88,2.17.0 with parser intern + handle_static prebuilt
